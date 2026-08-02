@@ -2657,7 +2657,7 @@ fn extract_loaded_user_slot(body: &[u8]) -> Option<u32> {
     device_slot.checked_sub(1)
 }
 
-fn unique_preset_slot_by_name(presets: &[PresetEntry], name: &str) -> Option<u32> {
+pub(crate) fn unique_preset_slot_by_name(presets: &[PresetEntry], name: &str) -> Option<u32> {
     let mut matches = presets.iter().filter(|p| p.name == name);
     let slot = matches.next()?.slot;
     matches.next().is_none().then_some(slot)
@@ -2771,7 +2771,7 @@ fn active_graph_guarded(v: &serde_json::Value, text: &str) -> Option<ActiveGraph
 /// CONSTANT `8` — even for a preset with zero FS scenes (HW-observed: Cello, 0 scenes,
 /// base SceneLoaded sceneSlot=8; Guitar dump `lastLoadedScene: 8` while on base). NOT
 /// `scene_count + 1` — that old theory is refuted by the Cello observation.
-pub(crate) const BASE_SCENE_SLOT: u32 = 8;
+pub const BASE_SCENE_SLOT: u32 = 8;
 
 /// The live scene metadata harvested from ONE `currentPresetDataChanged` push
 /// (TMS[2] → [3], LZ4) — the same field-3 body as [`decode_current_preset_data`], but
@@ -2787,6 +2787,9 @@ pub(crate) const BASE_SCENE_SLOT: u32 = 8;
 /// healthy dense-heartbeat session the payload carries all three (HW-verified: a 17 KB live field-3 truncates only inside the FINAL scene's `uuid`,
 /// after every `sceneName`).
 pub(crate) struct CurrentPresetLive {
+    /// `info.displayName` — the preset's own name (the partial truncates near the
+    /// END of the document, so the leading `info` block survives in practice).
+    pub display_name: Option<String>,
     pub scene_names: Option<Vec<String>>,
     pub last_loaded_scene: Option<u32>,
     pub ftsw: Option<serde_json::Value>,
@@ -2831,7 +2834,12 @@ fn decode_preset_live_text(text: &str) -> Option<CurrentPresetLive> {
         .and_then(|n| n.as_u64())
         .map(|n| n as u32);
     let graph = active_graph_guarded(&v, text);
+    let display_name = v
+        .pointer("/info/displayName")
+        .and_then(|n| n.as_str())
+        .map(str::to_owned);
     Some(CurrentPresetLive {
+        display_name,
         scene_names,
         last_loaded_scene,
         ftsw: v.get("ftsw").cloned(),
@@ -3617,7 +3625,10 @@ mod tests {
         // Field-9 plaintext partial shaped like the HW reads (probe --slotread-x):
         // device-truncated INSIDE the final scene's `uuid`, after every sceneName.
         let json = br#"{"info":{"displayName":"Guitar"},"audioGraph":{"guitarNodes":{}},"scenes":[{"sceneName":"Dist","uuid":"aaa"},{"sceneName":"Celestial","uuid":"bbb"},{"sceneName":"Swell","uuid":"cc"#;
-        let names = scene_names_from_slot_json(json).expect("tolerant parse");
+        let live = decode_plain_preset_live(json).expect("tolerant parse");
+        // `info` leads the document, so the name survives any tail truncation.
+        assert_eq!(live.display_name.as_deref(), Some("Guitar"));
+        let names = live.scene_names.expect("scene names");
         // The unwind cuts at the last comma INSIDE the truncated scene object —
         // after its sceneName — so ALL names survive, the final uuid doesn't
         // (matches HW: slot 1 = 17264 B, 8/8 names present, cut mid-uuid).
@@ -4708,6 +4719,7 @@ mod tests {
             )
         );
         assert_eq!(live.last_loaded_scene, Some(super::BASE_SCENE_SLOT));
+        assert_eq!(live.display_name.as_deref(), Some("Guitar"));
         let map = crate::footswitch::scene_fs_map(&live.ftsw.expect("ftsw"));
         // Active assignments only (Lofi slot 4 + Swell slot 6 are isActive:false).
         assert_eq!(map.get(&0), Some(&5)); // Arpeges → switch 5 (FS6)

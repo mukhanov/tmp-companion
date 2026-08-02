@@ -20,6 +20,70 @@ pub fn probe_connect_and_list() -> Result<Vec<PresetEntry>, String> {
     s.list_my_presets()
 }
 
+/// READ-ONLY: the device's ACTIVE preset — its name (from the live field-3
+/// partial) plus its My Presets list index — so a measurement run can record what
+/// was selected before it loads anything and hand the index back to
+/// `--load-preset` afterwards. The active preset is reported by NAME only, so the
+/// index resolves via the list; a duplicated or non-My-Presets name (factory
+/// bank) yields `idx -` and the restore caller must skip rather than guess.
+pub fn probe_active_preset() -> Result<String, String> {
+    let mut s = Session::connect()?;
+    // The field-22 info push is NOT served on a bare probe session (HW-checked:
+    // explicit request + pump returns nothing), so read the name from the live
+    // field-3 partial instead — the same dense-heartbeat capture
+    // `--dump-currentpresetdata` uses. Capture FIRST: the fresh field-3 push rides
+    // the post-handshake window, and a list read before it loses the payload
+    // (HW-checked). The partial routinely truncates mid-scenes, so a STRICT parse
+    // fails — the TOLERANT parse (`decode_plain_preset_live`, the same seam the
+    // scene reads use on these truncated documents) recovers `info.displayName`.
+    let raw = s.capture_full_preset_json(None, 2000)?;
+    let list = s.list_my_presets()?;
+    let name = session::decode_plain_preset_live(&raw)
+        .and_then(|live| live.display_name)
+        .ok_or_else(|| "no displayName in the live field-3 partial".to_string())?;
+    let matches = list.iter().filter(|e| e.name == name).count();
+    let idx = session::unique_preset_slot_by_name(&list, &name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    Ok(format!("idx\t{idx}\nname\t{name}\nmatches\t{matches}\n"))
+}
+
+/// Plain `LoadPreset` on a My Presets list index — what a footswitch tap does; no
+/// writes, no save. Exists so a measurement run can RESTORE the selection it
+/// displaced. Refuses an empty slot (loading one is untested device state).
+///
+/// The guard read and the load run on SEPARATE connections: a `LoadPreset` sent
+/// after a list read on the same session is silently ignored (HW-checked — the
+/// same post-handshake-window fragility `probe_active_preset` documents for
+/// field-3), so the load uses the amp-recipe shape: fresh lean connect, load
+/// immediately, settle, drop.
+pub fn probe_load_preset(list_index: u32) -> Result<String, String> {
+    let name = {
+        let mut s = Session::connect()?;
+        let list = s.list_my_presets()?;
+        let entry = list
+            .iter()
+            .find(|e| e.slot == list_index)
+            .ok_or_else(|| format!("list index {list_index} not in My Presets"))?;
+        if session::is_empty_slot_name(&entry.name) {
+            return Err(format!(
+                "list index {list_index} is an empty slot — refusing to load it"
+            ));
+        }
+        entry.name.clone()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    let mut s = Session::connect_lean()?;
+    s.load_preset(list_index)?;
+    std::thread::sleep(std::time::Duration::from_millis(
+        leveller::settle_after_load_ms(),
+    ));
+    Ok(format!(
+        "[probe --load-preset] loaded idx {list_index} (device slot {})  {name}\n",
+        list_index + 1,
+    ))
+}
+
 /// HW PROBE (WRITE): set the global `sceneChangeBehavior` (SettingsMessage field 83).
 ///
 /// Rides TMS 3, the same branch `reampModeActive` (field 30) proves is served for

@@ -89,10 +89,15 @@
 //!                                  (stimulus via TMP_LEVELLER_STIMULUS)
 //!   probe --measure-current <topology> [sceneSlot] [calibrationLUFS]
 //!                                  measure current live state without changing levels
-//!   probe --measure-scene <slot> <sceneSlot> <topology> [calibrationLUFS]
+//!   probe --measure-scene <slot> <sceneSlot|base> <topology> [calibrationLUFS]
 //!                                  load preset+scene, then measure without changing levels
 //!                                  (slot = 0-BASED list index, same convention as
-//!                                  --levelpreset — NOT the 1-based device userSlot)
+//!                                  --levelpreset — NOT the 1-based device userSlot;
+//!                                  stimulus via TMP_LEVELLER_STIMULUS, else bundled)
+//!   probe --active-preset          READ-ONLY: the selected preset's name + My Presets
+//!                                  list index (records selection before a run)
+//!   probe --load-preset <listIdx>  plain LoadPreset (0-based) — restore the selection
+//!                                  a run displaced; no writes, no save
 //!   probe --capture-input [secs]   GATE 1: report USB-Out per-channel levels while
 //!                                  you play (identifies the dry-instrument channel)
 //!   probe --agc-test <slot>        GATE 2: full vs half re-amp inject on a CLEAN
@@ -1140,6 +1145,41 @@ fn main() {
         }
     }
 
+    if args.iter().any(|a| a == "--active-preset") {
+        // READ-ONLY: the currently selected preset's name + My Presets list index
+        // (idx `-` when the name is duplicated or not in My Presets — the restore
+        // caller must skip, not guess).
+        match tmp_companion_lib::probe_active_preset() {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--load-preset") {
+        // --load-preset <listIdx>  — plain LoadPreset (0-based list index): restore
+        // the selection a measurement run displaced. No writes, no save.
+        let Some(idx) = args.get(i + 1).and_then(|s| s.parse::<u32>().ok()) else {
+            eprintln!("usage: probe --load-preset <listIdx>");
+            std::process::exit(2);
+        };
+        match tmp_companion_lib::probe_load_preset(idx) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if args.iter().any(|a| a == "--listall") {
         // Read-only: print every My Presets slot + name (full list, not just the
         // first 20). For auditing device state after a run.
@@ -1949,11 +1989,14 @@ fn main() {
         // 1-based device userSlot). Loads the preset in its own connection, then
         // scene+reamp in a fresh one.
         let slot = args.get(i + 1).and_then(|s| s.parse::<u32>().ok());
-        let scene_slot = args.get(i + 2).and_then(|s| s.parse::<u32>().ok());
+        let scene_slot = args.get(i + 2).and_then(|s| match s.as_str() {
+            "base" => Some(tmp_companion_lib::BASE_SCENE_SLOT),
+            n => n.parse::<u32>().ok(),
+        });
         let topology = args.get(i + 3).cloned().unwrap_or_default();
         if slot.is_none() || scene_slot.is_none() || topology.is_empty() {
             eprintln!(
-                "usage: probe --measure-scene <slot(0-based list index)> <sceneSlot> <topology_id> [calibrationLUFS]"
+                "usage: probe --measure-scene <slot(0-based list index)> <sceneSlot|base> <topology_id> [calibrationLUFS]"
             );
             std::process::exit(2);
         }

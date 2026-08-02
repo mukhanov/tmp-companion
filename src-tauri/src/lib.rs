@@ -93,6 +93,7 @@ pub use saved_blocks::*;
 
 pub use session::PresetEntry;
 use session::Session;
+pub use session::BASE_SCENE_SLOT;
 pub use session::{ActiveGraph, GraphNode, Stage};
 
 #[macro_use]

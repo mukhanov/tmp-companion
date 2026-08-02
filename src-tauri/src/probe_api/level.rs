@@ -7,6 +7,7 @@ use super::slot_write::load_then_discover_blocks;
 use super::stimulus::probe_stimulus_path;
 use super::stimulus::read_stimulus_48k;
 use super::stimulus::read_stimulus_calibrated;
+use super::stimulus::stimulus_path_or_override;
 use crate::audio;
 use crate::leveller;
 use crate::lufs;
@@ -205,13 +206,15 @@ pub fn probe_reamp_multi_engage(topology_id: &str, cycles: u32) -> Result<String
 /// capture with everything derived from it): a failed inject reads as the device's
 /// stationary output floor, so the headline is stamped FLOOR/SILENT when the capture
 /// fails `probe_reamp_state`'s engaged criterion instead of being retried.
+/// Stimulus: `TMP_LEVELLER_STIMULUS` when set (same override every other probe
+/// measurement honors — `probe_channels` precedent), else the topology's bundled sample.
 pub fn probe_measure_current_lufs(
     topology_id: &str,
     slot: Option<u32>,
     scene_slot: Option<u32>,
     calibration_lufs: Option<f32>,
 ) -> Result<String, String> {
-    let stim_path = probe_stimulus_path(topology_id)?;
+    let stim_path = stimulus_path_or_override(topology_id)?;
     let stim = read_stimulus_calibrated(&stim_path, calibration_lufs)?;
     // Repro instrumentation: ONE capture, everything derived from it — the headline
     // (loudest channel, matching production's pick) PLUS every channel's loudness,
@@ -556,10 +559,7 @@ pub fn probe_level_block(
 /// Loads + re-amps only; never writes/saves/clears. Stimulus = humbucker sample
 /// (override with `TMP_LEVELLER_STIMULUS`).
 pub fn probe_channels(slot: u32) -> Result<String, String> {
-    let stim_path = match std::env::var("TMP_LEVELLER_STIMULUS") {
-        Ok(p) => p,
-        Err(_) => probe_stimulus_path("guitar-humbucker")?,
-    };
+    let stim_path = stimulus_path_or_override("guitar-humbucker")?;
     let stim = read_stimulus_48k(&stim_path)?;
     let cap = leveller::capture_full(slot, &stim, 0.5)?;
     let lufs_at = |c: usize| -> Option<f64> {

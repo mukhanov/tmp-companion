@@ -673,6 +673,21 @@ pub(crate) fn read_stimulus_calibrated(
     read_stimulus_calibrated_with_shortfall(path, calibration_lufs).map(|(stim, _)| stim)
 }
 
+/// Env var naming a stimulus WAV that overrides the bundled samples — the
+/// override every probe measurement honors.
+pub(crate) const STIMULUS_ENV: &str = "TMP_LEVELLER_STIMULUS";
+
+/// The or-bundled stimulus policy: [`STIMULUS_ENV`] when set, else the
+/// topology's bundled sample. (The leveling paths use the REQUIRED policy —
+/// env var or error — inline; this helper is only for the diagnostic seams
+/// that fall back to a bundled sample.)
+pub(crate) fn stimulus_path_or_override(topology_id: &str) -> Result<String, String> {
+    match std::env::var(STIMULUS_ENV) {
+        Ok(p) => Ok(p),
+        Err(_) => probe_stimulus_path(topology_id),
+    }
+}
+
 pub(crate) fn probe_stimulus_path(topology_id: &str) -> Result<String, String> {
     // An alias id is not a WAV stem — resolve to the parent topology's id first.
     let topology_id = crate::topologies::canonical_id(topology_id);

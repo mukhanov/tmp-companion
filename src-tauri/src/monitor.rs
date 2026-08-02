@@ -1277,6 +1277,7 @@ mod tests {
         let applied = apply_startup_live(
             &mut c,
             session::CurrentPresetLive {
+                display_name: None,
                 scene_names: Some(vec!["Clean".into(), "Lead".into()]),
                 last_loaded_scene: None,
                 ftsw: None,
@@ -1304,6 +1305,7 @@ mod tests {
         let applied = apply_startup_live(
             &mut c,
             session::CurrentPresetLive {
+                display_name: None,
                 scene_names: Some(vec!["Clean".into()]),
                 last_loaded_scene: Some(session::BASE_SCENE_SLOT),
                 ftsw: None,
@@ -1322,6 +1324,7 @@ mod tests {
         let applied = apply_startup_live(
             &mut c,
             session::CurrentPresetLive {
+                display_name: None,
                 scene_names: Some(vec!["Clean".into(), "Lead".into()]),
                 last_loaded_scene: Some(0),
                 ftsw: None,
@@ -1343,6 +1346,7 @@ mod tests {
         let applied = apply_startup_live(
             &mut c,
             session::CurrentPresetLive {
+                display_name: None,
                 scene_names: Some(vec![]),
                 last_loaded_scene: None,
                 ftsw: None,
