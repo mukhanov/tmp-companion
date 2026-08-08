@@ -377,6 +377,77 @@ fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
     );
 }
 
+/// VERIFY-ONLY footswitch row (the row a user gave NO leveling handle): it must MEASURE the
+/// engaged-vs-disengaged delta and WRITE NOTHING. Slot 405's Plumes switch is the fixture
+/// with a real delta — engaged the pedal's own knob drives the saturated-amp curve
+/// (`saturated_pedal_lufs` at its authored 0.5), disengaged the preset falls through to the
+/// flat base C — so a verify row that silently degraded into a solve, or one whose engaged
+/// capture read as off-branch silence, both fail here.
+#[test]
+fn verify_only_footswitch_row_measures_a_delta_and_writes_nothing() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    let spec = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let p24 = spec
+        .iter()
+        .find(|p| p.list_index == 405)
+        .expect("405 present");
+    let preset: serde_json::Value = serde_json::from_str(&p24.preset_json).expect("405 json");
+    let ftsw = preset["ftsw"].clone();
+
+    // Caller contract (same as `measure_footswitch`): the preset is already current.
+    {
+        let mut s = crate::session::Session::connect_lean().expect("connect");
+        s.load_preset(405).expect("load 405");
+    }
+    // Switch 5 = the Plumes on-off; its block is OFF in base, so engaging it turns the pedal
+    // on and the saturated-amp curve takes over from the flat C.
+    let states = crate::footswitch::switch_states(&ftsw, &preset, 5);
+    let r = crate::leveller::verify_footswitch(5, &states, &stim, -23.0, 0.5)
+        .expect("verify the Plumes switch");
+
+    let delta = r
+        .on_off_delta_lu
+        .expect("a verify row always carries a delta");
+    // Engaged: the pedal curve at its authored 0.5. Disengaged: the flat base C (-21).
+    let expected = crate::sim_device::saturated_pedal_lufs(0.5).unwrap() - (-21.0);
+    assert!(
+        (delta - expected).abs() < 0.3,
+        "engaged-vs-disengaged delta should be ~{expected:.2} LU, got {delta:.2} ({r:?})"
+    );
+    assert!(!r.saved, "a verify row never saves");
+    assert_eq!(r.method, "verify");
+    // WROTE NOTHING: not one float `changeParameter` on the pedal's own knob. (The bypass
+    // force-list is not a knob write — it is the isolation both captures need, and it lives
+    // only in the throwaway capture connections' working copy.)
+    let wrote_knob = sim.events().iter().any(|e| {
+        matches!(
+            e,
+            crate::sim_device::SimEvent::ChangeParameter { param, .. } if param == "level"
+        )
+    });
+    assert!(
+        !wrote_knob,
+        "a verify row must not write the block's knob: {:?}",
+        sim.events()
+    );
+}
+
 /// The SCENE-leveling physics for slot 403 through the REAL `level_scenes_apply_batched`
 /// command over mock IPC — the same path the offline UI drives, minus the per-scene Channel
 /// stream the HTTP bridge no-ops (so the UI can't render these outcomes offline; this gate
@@ -1299,5 +1370,185 @@ fn fresh_load_barrier_time_gate_proceeds_on_an_unharvestable_witness() {
         (sim.preset_level() - 0.32).abs() < 1e-3,
         "the pending save must still be uncommitted, got {}",
         sim.preset_level()
+    );
+}
+
+/// D2 gate: `SceneTargetMode::Offset` must PRESERVE each scene's authored loudness
+/// relationship rather than flatten every scene onto one number — and the outcome must
+/// report the EFFECTIVE target it solved against, not the requested one (reporting the
+/// request would make every offset row read as missed by exactly the offset, and would
+/// decide `clamped` on the wrong number).
+///
+/// Slot 404's authored scene ceilings are -17 (scene 0) and -15 (scene 1)
+/// (`scenario-loudness.json`), so against scene 0 as the batch reference scene 1 sits +2 LU
+/// louder: a run at -23 must aim -23 for the reference and -21 for scene 1. (Scene 2 is
+/// deliberately out of this batch — it does not converge offline in MATCH mode either, a
+/// pre-existing sim/fixture quirk this gate must not inherit.)
+#[test]
+fn scene_offset_mode_preserves_each_scenes_distance_and_reports_the_effective_target() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    let scene_slots = vec![0u32, 1];
+    let candidates =
+        crate::probe_api::level::load_and_filter_amp_candidates(404).expect("404 amp candidates");
+    let (docs, _restore) =
+        crate::probe_api::scene_jobs::prepass_scene_docs(404, &scene_slots).expect("prepass");
+    let saved = crate::read_saved_preset(404);
+    let mut jobs = crate::build_scene_jobs(&scene_slots, &candidates, &docs, -23.0, saved.as_ref())
+        .expect("scene jobs");
+    for j in jobs.iter_mut() {
+        j.target_mode = crate::leveller::SceneTargetMode::Offset;
+    }
+    let outcomes = crate::leveller::level_scenes_oneshot(
+        404,
+        &jobs,
+        &stim,
+        false,
+        None,
+        saved.as_ref(),
+        |_, _| {},
+        || false,
+    )
+    .expect("offset run");
+
+    let at = |slot: u32| {
+        outcomes
+            .iter()
+            .find(|o| o.scene_slot == slot)
+            .unwrap_or_else(|| panic!("scene {slot} outcome"))
+    };
+    for (slot, want_target, want_offset) in [
+        // The REFERENCE row: its own offset is 0 by definition, so it lands on the plain
+        // target — an offset batch's first sound levels exactly like a match batch's.
+        (0u32, -23.0, 0.0),
+        (1, -21.0, 2.0),
+    ] {
+        let o = at(slot);
+        assert!(
+            o.failure.is_none(),
+            "scene {slot} must solve: {:?}",
+            o.failure
+        );
+        assert!(
+            (o.target_lufs - want_target).abs() < 0.3,
+            "scene {slot} must be solved against {want_target} (its authored distance from the \
+             reference), got {:.2}",
+            o.target_lufs
+        );
+        let applied = o.target_offset_lu.expect("an offset row reports its shift");
+        assert!(
+            (applied - want_offset).abs() < 0.3,
+            "scene {slot} applied offset should be {want_offset:+.1} LU, got {applied:+.2}"
+        );
+        // And it actually GOT there — the offset feeds the solve, it is not just a label.
+        let achieved = o.final_lufs.expect("a solved scene reports its loudness");
+        assert!(
+            (achieved - want_target).abs() < 0.5,
+            "scene {slot} achieved {achieved:.2}, wanted {want_target} — {o:?}"
+        );
+    }
+}
+
+/// D3 gate: a scene row given the USER'S OWN handle is solved by the generic param secant
+/// (`solve_param_secant`) instead of the amp joint-k, and still lands on target through the
+/// Scene-Edit-aware write path. The handle here is the Hiwatt's `outputLevel` in scene 0 —
+/// the one control the offline capture model responds to — so the assertion is about the
+/// SEAM, not the knob: joint-k's closed-form solve is bypassed entirely (the row carries a
+/// `handle`, so `level_scenes_oneshot` dispatches to `handle_one_scene`), and the search has
+/// to find the value from the param's own range with no `20·log10(k)` shortcut.
+#[test]
+fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    const AMP: &str = "ACD_HiwattDR103CanMod";
+    // Scene 0's own authored value for the handle (its overlay carries 0.96).
+    const AUTHORED: f32 = 0.96;
+    let saved = crate::read_saved_preset(404);
+    // The runner's caller contract: the preset is already current.
+    {
+        let mut s = crate::session::Session::connect_lean().expect("connect");
+        s.load_preset(404).expect("load 404");
+    }
+    let handle = crate::leveller::FsParamTarget::new(AMP, "outputLevel", AUTHORED);
+    let (lo, hi) = handle.bounds();
+    let job = crate::leveller::SceneJob {
+        scene_slot: 0,
+        target_lufs: -23.0,
+        knobs: vec![crate::leveller::KnobTarget {
+            knob: crate::leveller::LevelKnob::Block {
+                group_id: "G1".into(),
+                node_id: AMP.into(),
+                parameter_id: "outputLevel".into(),
+                scene_slot: Some(0),
+            },
+            lo,
+            hi,
+            current: AUTHORED,
+        }],
+        skip: None,
+        rebalanceable: false,
+        target_mode: crate::leveller::SceneTargetMode::Match,
+        handle: Some(handle),
+    };
+    let outcomes = crate::leveller::level_scenes_oneshot(
+        404,
+        &[job],
+        &stim,
+        false,
+        None,
+        saved.as_ref(),
+        |_, _| {},
+        || false,
+    )
+    .expect("handle run");
+
+    let o = &outcomes[0];
+    assert!(o.failure.is_none(), "the handle row must solve: {o:?}");
+    assert!(!o.clamped, "the handle reaches target: {o:?}");
+    let achieved = o.final_lufs.expect("a solved row reports its loudness");
+    assert!(
+        (achieved - (-23.0)).abs() < 0.5,
+        "handle solve should land on target, got {achieved:.2} ({o:?})"
+    );
+    let solved = o.final_level.expect("a solved row reports its value");
+    assert!(
+        solved > lo && solved < AUTHORED,
+        "the solve had to come DOWN from the authored {AUTHORED} and stay in range, got {solved}"
+    );
+    // The seam actually ran: joint-k is ONE write (its solve is closed-form), the param
+    // secant needs several real captures to find the same point.
+    assert!(
+        o.writes > 2,
+        "a searched solve writes once per capture plus the final apply: {o:?}"
     );
 }

@@ -430,7 +430,9 @@ pub(crate) fn load_then_discover_blocks(slot: u32) -> Result<Vec<session::LevelB
             let text = String::from_utf8_lossy(&raw);
             let value = session::tolerant_parse_json(&text)
                 .ok_or_else(|| format!("{first_err}; fallback field-3 JSON did not parse"))?;
-            let blocks = session::extract_level_blocks(&value);
+            // Same picker gate as `current_preset_blocks` above — this is the last fallback
+            // of the SAME enumeration, so it must not offer a different control set.
+            let blocks = session::extract_level_candidates(&value);
             if blocks.is_empty() {
                 Err(format!(
                     "{first_err}; fallback field-3 JSON had no level blocks"

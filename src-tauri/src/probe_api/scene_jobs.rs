@@ -346,27 +346,77 @@ pub(crate) fn build_scene_jobs(
     target_lufs: f64,
     saved_fallback: Option<&serde_json::Value>,
 ) -> Result<Vec<leveller::SceneJob>, String> {
-    if !candidates
-        .iter()
-        .any(|c| is_amp_output_level_param(&c.parameter_id))
-    {
-        return Err("per-scene leveling needs an amp outputLevel control".to_string());
+    build_scene_jobs_with_handles(
+        scene_slots,
+        candidates,
+        docs,
+        target_lufs,
+        saved_fallback,
+        &[],
+    )
+}
+
+/// A row's USER-CHOSEN leveling control, as the wire job named it: the block param the solve
+/// should sweep INSTEAD of the active amp's `outputLevel`. Its class, bounds and per-scene
+/// current value are resolved by [`build_scene_jobs_with_handles`] off the SAVED preset + that
+/// scene's doc, so the caller ships coordinates only.
+pub(crate) struct SceneHandleSpec<'a> {
+    pub group_id: &'a str,
+    pub node_id: &'a str,
+    pub parameter_id: &'a str,
+}
+
+/// [`build_scene_jobs`] with the per-row handles threaded in — `handles` is sparse, keyed by
+/// wire scene slot, and a row it names is built from THAT control instead of the scene's amp.
+///
+/// Why the handle belongs HERE and not in a patch-up pass afterwards: the amp prerequisites
+/// (an `outputLevel` candidate, a readable routing template) are inputs the handle rows do not
+/// need — the user already named the knob. Failing them preset-wide errored rows that never
+/// touched the amp classifier. So the prerequisite is evaluated ONCE and consulted only by the
+/// rows that need it; a failure becomes THOSE rows' `skip`, and the handle rows level on.
+///
+/// The one exception keeps the amp-only contract intact: with NO handles at all (every probe
+/// seam, the redistribution runner, a batch where nobody named a control) a prerequisite
+/// failure is still the BATCH's `Err`, not N identical per-row skips.
+pub(crate) fn build_scene_jobs_with_handles(
+    scene_slots: &[u32],
+    candidates: &[LevelBlockArg],
+    docs: &[(u32, Option<serde_json::Value>)],
+    target_lufs: f64,
+    saved_fallback: Option<&serde_json::Value>,
+    handles: &[(u32, SceneHandleSpec)],
+) -> Result<Vec<leveller::SceneJob>, String> {
+    // The AMP-`outputLevel` classifier's preset-wide inputs, resolved once. `Err` = no row can
+    // take the amp path (its reason is what those rows report).
+    let amp_prereq: Result<session::ActiveGraph, String> = (|| {
+        if !candidates
+            .iter()
+            .any(|c| is_amp_output_level_param(&c.parameter_id))
+        {
+            return Err("per-scene leveling needs an amp outputLevel control".to_string());
+        }
+        let structure = structure_graph(docs)
+            .or_else(|| {
+                saved_fallback
+                    .map(|v| session::extract_active_graph(v, None))
+                    .filter(|g| session::is_known_routing_template(g.template.as_deref()))
+            })
+            .ok_or_else(|| {
+                "no complete routing read (template missing from every scene doc) — \
+                 can't classify scene routing safely"
+                    .to_string()
+            })?;
+        // Preset-wide un-levelable routing (unknown template / mic / split-output) stops the
+        // amp path for the whole preset. Per-SCENE issues below become skip jobs so one bad
+        // scene doesn't abort the batch.
+        check_levelable_routing(&structure)?;
+        Ok(structure)
+    })();
+    if handles.is_empty() {
+        if let Err(e) = &amp_prereq {
+            return Err(e.clone());
+        }
     }
-    let structure = structure_graph(docs)
-        .or_else(|| {
-            saved_fallback
-                .map(|v| session::extract_active_graph(v, None))
-                .filter(|g| session::is_known_routing_template(g.template.as_deref()))
-        })
-        .ok_or_else(|| {
-            "no complete routing read (template missing from every scene doc) — \
-         can't classify scene routing safely"
-                .to_string()
-        })?;
-    // Preset-wide un-levelable routing (unknown template / mic / split-output) is a hard
-    // error — the whole preset can't be scene-leveled. Per-SCENE issues below become skip
-    // jobs so one bad scene doesn't abort the batch.
-    check_levelable_routing(&structure)?;
     let jobs = scene_slots
         .iter()
         .map(|scene| {
@@ -380,7 +430,14 @@ pub(crate) fn build_scene_jobs(
             } else {
                 Some(*scene)
             };
-            match classify_scene_knobs(&structure, &doc, candidates) {
+            if let Some((_, h)) = handles.iter().find(|(s2, _)| s2 == scene) {
+                return handle_scene_job(*scene, scene_slot, target_lufs, h, &doc, saved_fallback);
+            }
+            let classified = match &amp_prereq {
+                Ok(structure) => classify_scene_knobs(structure, &doc, candidates),
+                Err(reason) => Err(reason.clone()),
+            };
+            match classified {
                 Ok((triples, kind)) => {
                     let knobs = triples
                         .into_iter()
@@ -408,19 +465,92 @@ pub(crate) fn build_scene_jobs(
                         knobs,
                         skip: None,
                         rebalanceable,
+                        // The amp-`outputLevel` default; the app command overrides
+                        // `target_mode` per wire job.
+                        target_mode: leveller::SceneTargetMode::Match,
+                        handle: None,
                     }
                 }
-                Err(reason) => leveller::SceneJob {
-                    scene_slot: *scene,
-                    target_lufs,
-                    knobs: Vec::new(),
-                    skip: Some(reason),
-                    rebalanceable: false,
-                },
+                Err(reason) => skip_scene_job(*scene, target_lufs, reason),
             }
         })
         .collect();
     Ok(jobs)
+}
+
+/// A scene the batch reports as a failed outcome and moves past — never an abort.
+fn skip_scene_job(scene: u32, target_lufs: f64, reason: String) -> leveller::SceneJob {
+    leveller::SceneJob {
+        scene_slot: scene,
+        target_lufs,
+        knobs: Vec::new(),
+        skip: Some(reason),
+        rebalanceable: false,
+        target_mode: leveller::SceneTargetMode::Match,
+        handle: None,
+    }
+}
+
+/// One scene's job built on the USER'S OWN control. Classified off the SAVED preset (an
+/// unrecognised param refuses HERE, before any device work) with the value AUTHORED IN THIS
+/// SCENE as both the solve's starting point and the wet-floor anchor — the scene's own
+/// overlaid value when it has one (the prepass doc already carries the overlay merged onto
+/// base), never base's.
+///
+/// A per-row problem becomes that row's `skip`, exactly like the amp path's "no active guitar
+/// amp": one unclassifiable handle must not cost the other scenes their run.
+fn handle_scene_job(
+    scene: u32,
+    scene_slot: Option<u32>,
+    target_lufs: f64,
+    h: &SceneHandleSpec,
+    doc: &serde_json::Value,
+    saved: Option<&serde_json::Value>,
+) -> leveller::SceneJob {
+    let node_param = |v: &serde_json::Value| {
+        crate::commands::level_footswitch::node_param_f64(v, h.node_id, h.parameter_id)
+    };
+    let Some(preset) = saved else {
+        return skip_scene_job(
+            scene,
+            target_lufs,
+            format!(
+                "could not read the saved preset to classify {} on {} — leveling an \
+                 unclassified parameter could change the sound instead of its loudness",
+                h.parameter_id, h.node_id
+            ),
+        );
+    };
+    let current = node_param(doc)
+        .or_else(|| node_param(preset))
+        .unwrap_or(0.0) as f32;
+    let target =
+        match leveller::FsParamTarget::classified(preset, h.node_id, h.parameter_id, current) {
+            Ok(t) => t,
+            Err(refusal) => return skip_scene_job(scene, target_lufs, refusal),
+        };
+    let (lo, hi) = target.bounds();
+    leveller::SceneJob {
+        scene_slot: scene,
+        target_lufs,
+        knobs: vec![leveller::KnobTarget {
+            knob: leveller::LevelKnob::Block {
+                group_id: h.group_id.to_string(),
+                node_id: h.node_id.to_string(),
+                parameter_id: h.parameter_id.to_string(),
+                scene_slot,
+            },
+            lo,
+            hi,
+            current,
+        }],
+        skip: None,
+        // A user-chosen handle is one control, not a lane pair: joint-k's mix-preserving
+        // rebalance has nothing to act on.
+        rebalanceable: false,
+        target_mode: leveller::SceneTargetMode::Match,
+        handle: Some(target),
+    }
 }
 
 /// The ONE field-8 saved-preset read a leveling run gets, THE source for everything the
@@ -687,28 +817,49 @@ pub(crate) fn scene_overlay<'a>(
     scene: u32,
     node: &str,
 ) -> SceneOverlay<'a> {
+    // String-keyed wrapper: resolve the roster triple, then defer to the resolved-roster
+    // variant. Callers that ALREADY hold `(group, node_id, fender_id)` — the per-scene
+    // pickers, which walk `audiograph::roster` once for the whole preset — call
+    // [`scene_overlay_for`] directly instead of paying a fresh whole-graph roster walk per
+    // (scene, node) pair.
+    let Some((group, node_id, fender_id)) = crate::audiograph::roster_entry(preset, node) else {
+        // No roster hit is only meaningful once the scene body itself is readable: a base
+        // slot or a truncated `scenes` tail must still answer `Unknown`, not `Absent`.
+        return scene_body(preset, scene).map_or(SceneOverlay::Unknown, |_| SceneOverlay::Absent);
+    };
+    scene_overlay_for(preset, scene, (&group, &node_id, &fender_id))
+}
+
+/// The scene's raw body (`scenes[scene]`), or `None` for a base slot / a truncated read.
+fn scene_body(preset: &serde_json::Value, scene: u32) -> Option<&serde_json::Value> {
     if scene >= session::BASE_SCENE_SLOT {
-        return SceneOverlay::Unknown;
+        return None;
     }
-    let Some(body) = preset
+    preset
         .get("scenes")
         .and_then(|s| s.as_array())
         .and_then(|a| a.get(scene as usize))
         .filter(|s| s.is_object())
-    else {
+}
+
+/// [`scene_overlay`] for a caller that already holds the node's resolved roster triple
+/// `(group, node_id, fender_id)` — same answer, without re-walking the whole base graph per
+/// lookup. The pickers resolve the roster ONCE per preset and then ask per (scene, node).
+pub(crate) fn scene_overlay_for<'a>(
+    preset: &'a serde_json::Value,
+    scene: u32,
+    (group, node_id, fender_id): (&str, &str, &str),
+) -> SceneOverlay<'a> {
+    let Some(body) = scene_body(preset, scene) else {
         return SceneOverlay::Unknown;
     };
     // The overlay is keyed by FenderId with a nodeId fallback (exactly like
-    // `overlay_scene_onto_graph`), so resolve both ids — and the node's group — from the
-    // base graph roster.
-    let Some((group, node_id, fender_id)) = crate::audiograph::roster_entry(preset, node) else {
-        return SceneOverlay::Absent;
-    };
+    // `overlay_scene_onto_graph`); the node's group picks the graph.
     // Group ids are disjoint across the two graphs (G1..G7 guitar / M1..M4 mic), so the
     // group key alone picks the right one.
     let entry = ["guitarNodes", "micNodes"].iter().find_map(|graph| {
-        let nodes = body.get(graph)?.get(&group)?;
-        nodes.get(&fender_id).or_else(|| nodes.get(&node_id))
+        let nodes = body.get(graph)?.get(group)?;
+        nodes.get(fender_id).or_else(|| nodes.get(node_id))
     });
     match entry {
         None => SceneOverlay::Absent,
@@ -729,6 +880,52 @@ pub(crate) fn scene_overlay<'a>(
             // An overlay entry whose body isn't a param object is a cut read, not "no overlay".
             None => SceneOverlay::Unknown,
         },
+    }
+}
+
+/// Where a scene-context knob write on one node would LAND, and what the writer must send to
+/// put it there. The ONE write-landing policy — every lane that writes a knob under a scene
+/// (`leveller::set_knobs`, the Doctor's prescription apply) reads it here, so the four
+/// [`SceneOverlay`] states can never be answered two ways.
+pub(crate) enum SceneWriteVerdict {
+    /// The node's Scene Edit flag is already ON ([`SceneOverlay::Full`]) — write with the
+    /// enable DROPPED. The flag state alone decides the landing, so the write lands on the
+    /// overlay even for a param the overlay does not yet carry, and re-enabling would RESEED
+    /// the overlay from base (HW 3-cell matrix, fw 1.8.45).
+    WriteDirect,
+    /// No overlay for this node in this scene ([`SceneOverlay::Absent`]) — the enable is what
+    /// MATERIALISES one, so `set_node_scene_edit(node, true)` is REQUIRED before the write;
+    /// without it the write leaks to base. Nothing to reseed away here.
+    NeedsEnable,
+    /// Neither write shape is safe. `String` is the user-facing reason:
+    /// [`SceneOverlay::BypassOnly`] (the scene SHARES this node's knobs with base — the
+    /// enable-dropped write lands on BASE, the enable reseeds) or [`SceneOverlay::Unknown`]
+    /// (a truncated field-8 read / a base slot — presence unanswerable).
+    Refuse(String),
+}
+
+/// The write-landing verdict for `node` in `scene` of the SAVED (field-8) `preset` — pure, no
+/// device I/O, decided before any write so an unanswerable overlay state refuses with the
+/// preset untouched. The refusal strings are user-facing and live here, next to the states
+/// they describe, so the leveling and Doctor lanes tell the player the same story.
+pub(crate) fn scene_write_verdict(
+    preset: &serde_json::Value,
+    scene: u32,
+    node: &str,
+) -> SceneWriteVerdict {
+    match scene_overlay(preset, scene, node) {
+        SceneOverlay::Full(_) => SceneWriteVerdict::WriteDirect,
+        SceneOverlay::Absent => SceneWriteVerdict::NeedsEnable,
+        SceneOverlay::BypassOnly(_) => SceneWriteVerdict::Refuse(format!(
+            "scene {scene} shares {node}'s knobs with the base preset (Scene Edit off for that \
+             block) — a scene write would change every sharing scene; level Base instead"
+        )),
+        SceneOverlay::Unknown => SceneWriteVerdict::Refuse(format!(
+            "refusing to write {node} in scene {scene} — the saved preset does not say whether \
+             that node already has a scene overlay (truncated field-8 read), and both write \
+             shapes corrupt it (enable reseeds an existing overlay from base; omitting it leaks \
+             the write to base)"
+        )),
     }
 }
 
@@ -1018,6 +1215,9 @@ pub(crate) fn prepass_scene_docs_via(
     prepass_scene_docs(slot, scene_slots)
 }
 
+// `pub(crate)` so sibling test modules can reuse this module's fixture builders
+// (`commands::doctor_tests` shares `with_scene0_overlay` — the shape `scene_overlay`
+// itself is pinned against) instead of re-typing the preset JSON.
 #[cfg(test)]
 #[path = "scene_jobs_tests.rs"]
-mod scene_jobs_tests;
+pub(crate) mod scene_jobs_tests;

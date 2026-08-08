@@ -74,6 +74,31 @@ fn is_levelable_param(fender_id: &str, key: &str, val: &Value) -> bool {
             != crate::param_class::ParamClass::Other
 }
 
+/// ONE node's leveling-candidate params, in stable (sorted-key) order — the candidate
+/// builder shared by the footswitch picker ([`enumerate_block_footswitches`]) and the SCENE
+/// handle picker (`commands::level_scenes::list_scene_level_handles`), so the two pickers
+/// can never offer different controls for the same block. The gate is
+/// [`is_levelable_param`]: the classifier table, nothing else.
+pub fn level_candidates_for_node(
+    group_id: &str,
+    node_id: &str,
+    fender_id: &str,
+    params: &serde_json::Map<String, Value>,
+) -> Vec<LevelParamCandidate> {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .filter(|k| is_levelable_param(fender_id, k, &params[*k]))
+        .map(|k| LevelParamCandidate {
+            group_id: group_id.to_string(),
+            node_id: node_id.to_string(),
+            fender_id: fender_id.to_string(),
+            parameter_id: k.clone(),
+            current: params[k].as_f64().unwrap_or(0.0),
+        })
+        .collect()
+}
+
 /// Enumerate the preset's BLOCK-ACTING footswitches (`func:"on-off"` / `func:"param"`),
 /// resolving each acted-on block's `FenderId` + its leveling-candidate parameters from the
 /// `audioGraph`. Switches with only scene/MIDI/amp-control/looper functions are skipped.
@@ -192,20 +217,11 @@ pub fn enumerate_block_footswitches(ftsw: &Value, preset: &Value) -> Vec<Footswi
             std::collections::HashSet::new();
         for (g, nid) in &acted {
             if let Some((fid, params)) = nodes.get(nid) {
-                let mut keys: Vec<&String> = params.keys().collect();
-                keys.sort();
-                for k in keys {
-                    let v = &params[k];
-                    if is_levelable_param(fid, k, v) && seen.insert((nid.clone(), k.clone())) {
-                        level_params.push(LevelParamCandidate {
-                            group_id: g.clone(),
-                            node_id: nid.clone(),
-                            fender_id: fid.clone(),
-                            parameter_id: k.clone(),
-                            current: v.as_f64().unwrap_or(0.0),
-                        });
-                    }
-                }
+                level_params.extend(
+                    level_candidates_for_node(g, nid, fid, params)
+                        .into_iter()
+                        .filter(|c| seen.insert((nid.clone(), c.parameter_id.clone()))),
+                );
             }
         }
         out.push(FootswitchInfo {
@@ -316,6 +332,82 @@ pub fn engaged_bypass_for_switch(
         }
     }
     out
+}
+
+/// The two device states a VERIFY-only row measures — what the preset sounds like with
+/// `switch` ENGAGED versus DISENGAGED, as the writes each state needs. Symmetric BY
+/// CONSTRUCTION: both force-lists start from the same sibling isolation
+/// ([`siblings_off_excluding`]), so the ONLY difference between the two captures is this
+/// switch's own effect and the measured delta is that effect alone — a "natural state"
+/// disengaged capture would instead fold in whatever the other switches happened to be
+/// doing. `params` carries the switch's `param` functions so a PURE-param switch (no
+/// on-off) still has a measurable engaged state: engaging one jumps its param to `valueA`,
+/// which no bypass list can express.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SwitchStates {
+    /// `(group, node, bypass)` forcing the ENGAGED state: siblings off + this switch's own
+    /// on-off nodes at their engaged bypass ([`engaged_bypass_for_switch`]).
+    pub engaged_bypass: Vec<(String, String, bool)>,
+    /// The same list with this switch's own nodes FLIPPED — the disengaged state.
+    pub disengaged_bypass: Vec<(String, String, bool)>,
+    /// One `param` function each: `(group, node, param, valueA, valueB)` — the engaged and
+    /// disengaged values. A function missing either value is skipped (nothing to write).
+    pub params: Vec<(String, String, String, f32, f32)>,
+}
+
+impl SwitchStates {
+    /// Does engaging this switch change NOTHING measurable — no on-off node flips and no
+    /// param function to jump? Then the two captures would be byte-identical by
+    /// construction and the delta a guaranteed 0.0, so the caller refuses BEFORE paying two
+    /// ~10 s re-amp captures for a known answer. (Only reachable for a switch whose
+    /// block-acting functions are all `param` ones with no `valueA`/`valueB` — the
+    /// enumerator already drops switches with no block-acting function at all.)
+    pub fn changes_nothing(&self) -> bool {
+        self.params.is_empty() && self.engaged_bypass == self.disengaged_bypass
+    }
+}
+
+/// Derive [`SwitchStates`] for `switch` from the SAVED (field-8) preset. PURE — no device
+/// I/O. `preset` supplies each on-off block's saved bypass (the `isActive`-aware engaged
+/// state, see [`engaged_bypass_for_switch`]).
+pub fn switch_states(ftsw: &Value, preset: &Value, switch: u32) -> SwitchStates {
+    let siblings = siblings_off_excluding(ftsw, switch);
+    let own = engaged_bypass_for_switch(ftsw, preset, switch);
+    let mut engaged_bypass = siblings.clone();
+    engaged_bypass.extend(own.iter().cloned());
+    let mut disengaged_bypass = siblings;
+    disengaged_bypass.extend(own.iter().map(|(g, n, b)| (g.clone(), n.clone(), !b)));
+    let params = ftsw
+        .as_array()
+        .and_then(|a| a.get(switch as usize))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|a| a.get("func").and_then(Value::as_str) == Some("param"))
+        .filter_map(|a| {
+            let nid = a
+                .get("nodeId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let param = a
+                .get("parameterId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let g = a.get("groupId").and_then(Value::as_str).unwrap_or_default();
+            Some((
+                g.to_string(),
+                nid.to_string(),
+                param.to_string(),
+                a.get("valueA").and_then(Value::as_f64)? as f32,
+                a.get("valueB").and_then(Value::as_f64)? as f32,
+            ))
+        })
+        .collect();
+    SwitchStates {
+        engaged_bypass,
+        disengaged_bypass,
+        params,
+    }
 }
 
 /// One switch's `func:"on-off"` `(groupId, nodeId)` pairs (empty nodeIds skipped).
@@ -693,6 +785,80 @@ mod tests {
             serde_json::json!({ "exp1": { "func": "volume" }, "toe": serde_json::Value::Null });
         apply_exp(&mut p, exp.clone()).unwrap();
         assert_eq!(p["exp"], exp);
+    }
+
+    // A VERIFY row's two states must differ ONLY by this switch's own effect: the sibling
+    // isolation is identical on both sides, and switch 0's own node flips. Otherwise the
+    // reported delta would fold in whatever the other switches happened to be doing.
+    #[test]
+    fn switch_states_differ_only_by_the_switchs_own_nodes() {
+        let ftsw = serde_json::json!([
+            [{ "func": "on-off", "isActive": false, "nodes": [{ "groupId": "G1", "nodeId": "drive" }] }],
+            [{ "func": "on-off", "isActive": false, "nodes": [{ "groupId": "G1", "nodeId": "delay" }] }],
+        ]);
+        let preset = serde_json::json!({
+            "audioGraph": { "guitarNodes": { "G1": [
+                { "nodeId": "drive", "dspUnitParameters": { "bypass": true } },
+                { "nodeId": "delay", "dspUnitParameters": { "bypass": true } }
+            ] } }
+        });
+        let st = switch_states(&ftsw, &preset, 0);
+        // Sibling `delay` is forced OFF on BOTH sides…
+        assert!(st
+            .engaged_bypass
+            .contains(&("G1".into(), "delay".into(), true)));
+        assert!(st
+            .disengaged_bypass
+            .contains(&("G1".into(), "delay".into(), true)));
+        // …and only `drive` flips: engaged ON (bypass false, it is off in base and this
+        // switch enables it), disengaged back OFF.
+        assert!(st
+            .engaged_bypass
+            .contains(&("G1".into(), "drive".into(), false)));
+        assert!(st
+            .disengaged_bypass
+            .contains(&("G1".into(), "drive".into(), true)));
+        assert!(st.params.is_empty());
+        assert!(!st.changes_nothing());
+    }
+
+    // A PURE-param switch has no bypass difference at all — its engaged state is the param
+    // jumping to `valueA`, which only `params` can express. A function missing either value
+    // is dropped, and a switch left with nothing at all refuses before any capture.
+    #[test]
+    fn switch_states_carry_param_functions_and_refuse_a_no_op_switch() {
+        let ftsw = serde_json::json!([
+            [
+                { "func": "param", "groupId": "G1", "nodeId": "amp", "parameterId": "outputLevel",
+                  "valueA": 0.8, "valueB": 0.4 },
+                { "func": "param", "groupId": "G1", "nodeId": "amp", "parameterId": "gain",
+                  "valueA": 0.9 }
+            ],
+            [{ "func": "param", "groupId": "G1", "nodeId": "amp", "parameterId": "gain", "valueA": 0.9 }],
+        ]);
+        let preset = serde_json::json!({ "audioGraph": { "guitarNodes": { "G1": [
+            { "nodeId": "amp", "dspUnitParameters": { "outputLevel": 0.4 } }
+        ] } } });
+        let st = switch_states(&ftsw, &preset, 0);
+        assert_eq!(
+            st.params,
+            vec![(
+                "G1".to_string(),
+                "amp".to_string(),
+                "outputLevel".to_string(),
+                0.8,
+                0.4
+            )],
+            "the valueB-less `gain` function has no disengaged value to write"
+        );
+        assert_eq!(
+            st.engaged_bypass, st.disengaged_bypass,
+            "no on-off function → no bypass difference"
+        );
+        assert!(!st.changes_nothing(), "the param jump IS the engaged state");
+        // Switch 1's only function is the valueB-less one → nothing measurable at all.
+        let none = switch_states(&ftsw, &preset, 1);
+        assert!(none.changes_nothing());
     }
 
     // The re-run idempotency anchor: the stored valueA of an existing param function.

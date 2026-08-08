@@ -587,6 +587,8 @@ pub fn probe_level_footswitch(
         lev_node_id: lev_node.to_string(),
         lev_parameter_id: lev_param.to_string(),
         target_lufs,
+        // probe: solve-and-write, never the verify-only row.
+        mode: crate::commands::level_footswitch::FsJobMode::Level,
         // probe: no UI row label to preserve.
         display_label: None,
     };
@@ -716,6 +718,7 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
                 lev_node_id: p.node_id.clone(),
                 lev_parameter_id: p.parameter_id.clone(),
                 target_lufs: -24.0,
+                mode: crate::commands::level_footswitch::FsJobMode::Level,
                 display_label: None,
             })
         })

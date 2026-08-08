@@ -8,11 +8,31 @@
 //! `defaults` and `blockOverrides` classifies as [`ParamClass::Other`] — silence
 //! is the safe default, not an inferred class.
 //!
-//! Scope (honest): today the FOOTSWITCH lane (`footswitch::is_levelable_param`,
-//! `leveller::FsParamTarget`) consumes this table. The preset block-knob lane
-//! (`commands/level_preset.rs`) still infers ranges by value-sniffing
-//! (`scene_bench::knob_bounds`) and carries no class gate — two range mechanisms
-//! can answer differently for the same param until that lane migrates here.
+//! Scope (honest): every USER-CHOSEN-PARAM lane consumes this table, in BOTH
+//! directions — what the user is OFFERED and what the solve ACCEPTS.
+//!
+//! * The PICKERS all enumerate through `footswitch::level_candidates_for_node`
+//!   (which gates on `footswitch::is_levelable_param` → `classify`): the footswitch
+//!   picker (`footswitch::enumerate_block_footswitches`), the scene HANDLE picker
+//!   (`commands/level_scenes.rs`), and — since the substring-rule retirement — the
+//!   preset block-knob picker (`session::extract_level_candidates`, behind
+//!   `list_level_blocks`). A control offered in one place is offered in all of them.
+//! * The SOLVES all refuse through `leveller::FsParamTarget` — one wording from
+//!   `refuse_if_not_a_level_control`, one range from `ParamInfo.range` — in the FS
+//!   solve, the preset block-knob lane (`commands/level_preset.rs`) and the
+//!   per-scene handle solve.
+//!
+//! The legacy name-substring rule (`session::is_level_param`) is no longer a picker
+//! gate. It survives only inside `session::extract_level_blocks`, a VALUE LOOKUP
+//! whose callers each narrow to one known control (the amp's `outputLevel`) or print
+//! a probe diagnostic — nothing there decides what a user may choose.
+//!
+//! What is deliberately OUTSIDE the table: the amp `outputLevel` joint-k path
+//! (`scene_jobs::build_scene_jobs`, `probe_api/level.rs`, the legacy
+//! `level_scenes_apply`). That solve is the closed-form `k = 10^((target−measured)/20)`,
+//! which is only valid for an amplitude control multiplying the whole summed output —
+//! `solve_joint_k_at` hard-errors outside `0..1` — so it keeps `scene_bench::knob_bounds`
+//! and `LEVEL_MIN`/`LEVEL_MAX`. `knob_bounds` therefore stays; it is not a leftover.
 //!
 //! Two proven traps drove the `blockOverrides` shape:
 //! - `level` on `ACD_TMRumbleV3` is an amp KNOB, not a level control — sweeping
@@ -57,8 +77,12 @@ use serde::Deserialize;
 use crate::is_amp_model_id;
 use crate::probe_api::scene_jobs::resolve_base_id;
 
-/// How a block parameter may be used by the leveling picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a block parameter may be used by the leveling picker. Serializes to the JSON
+/// table's own spelling (`level_linear` / `level_db` / `wet_mix` / `other`), so a wire
+/// payload carrying a class — the scene handle picker's candidate rows — ships the enum
+/// itself rather than a hand-rolled match that could drift from the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParamClass {
     /// Linear amplitude control (`captured_LUFS = 20*log10(v) + C`).
     LevelLinear,

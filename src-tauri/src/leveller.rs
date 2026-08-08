@@ -26,7 +26,10 @@ use serde::Serialize;
 use crate::audio;
 use crate::lufs;
 use crate::session::Session;
-use crate::{read_saved_preset, scene_overlay, settle_abortable, settle_or_cancel, SceneOverlay};
+use crate::{
+    read_saved_preset, scene_overlay, scene_write_verdict, settle_abortable, settle_or_cancel,
+    SceneOverlay, SceneWriteVerdict,
+};
 
 // Post-load DSP settle before a capture. Was a conservative 1200; HW-bisected to 400
 // on fw 1.8.45 (dry slot 11 + wet delay slot 5): measured C, presetLevel, and verify
@@ -201,6 +204,12 @@ pub struct LevelResult {
     /// = re-read and confirmed; `None` = not checked (no save, nothing written, the
     /// re-read failed, or a path without the verify).
     pub persist_mismatch: Option<bool>,
+    /// Scene rows in [`SceneTargetMode::Offset`] ONLY: how far this scene's effective
+    /// target was shifted from the requested one to preserve its authored loudness
+    /// relationship (LU). `target_lufs` above is ALREADY the shifted value; this says by
+    /// how much, which the frontend cannot derive (its own requested number was shifted
+    /// again by the playback compensation before the run). `None` everywhere else.
+    pub target_offset_lu: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1653,6 +1662,7 @@ pub fn level_preset(
                     previous_level: None,
                     true_peak_dbtp: None,
                     persist_mismatch: None,
+                    target_offset_lu: None,
                 });
             }
             Err(e) => return Err(e),
@@ -1697,6 +1707,7 @@ pub fn level_preset(
                         final_level,
                     )),
                     persist_mismatch: None,
+                    target_offset_lu: None,
                 });
             }
         }
@@ -1741,6 +1752,7 @@ pub fn level_preset(
                 final_level,
             )),
             persist_mismatch: None,
+            target_offset_lu: None,
         })
     })();
     restore_after_unsaved_error(slot, opts.save, result)
@@ -1839,6 +1851,7 @@ pub fn level_setlist(
             previous_level: None,
             true_peak_dbtp: None,
             persist_mismatch: None,
+            target_offset_lu: None,
         });
     }
 
@@ -2108,6 +2121,10 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
 ///   threaded (`probe_api::scene_jobs::read_saved_preset`) — is the only source
 ///   that can tell the two apart: after `overlay_scene_onto_graph` a base value is
 ///   indistinguishable from an overlaid one, so the live docs can't answer it.
+///   The decision itself is NOT taken here: it is
+///   `scene_jobs::scene_write_verdict`, the ONE write-landing policy this lane
+///   shares with the Doctor's prescription apply, so a `BypassOnly` node can't be
+///   refused in one lane and written in the other.
 ///   `SceneOverlay::Unknown` (truncated read) or no `saved` at all ⇒ REFUSE the
 ///   batch before any device write; both write shapes corrupt from there. So does
 ///   `SceneOverlay::BypassOnly` — an overlay carrying only the bypass family means
@@ -2207,33 +2224,25 @@ fn set_knobs(
                     continue;
                 }
                 seen.push(key);
-                match saved.map(|sv| scene_overlay(sv, scene, node_id)) {
-                    Some(SceneOverlay::Full(_)) => {}
-                    Some(SceneOverlay::Absent) => needs_enable.push(key),
-                    // The node's Scene Edit flag is OFF: this scene SHARES the node's knobs
-                    // with base, so the enable-dropped write would land on BASE and change
-                    // every scene that shares them (HW-verified fw 1.8.45), while the enable
-                    // would reseed. Refuse — with the sharing named, because unlike
-                    // `Unknown` this is an actionable preset fact, not a bad read.
-                    Some(SceneOverlay::BypassOnly(_)) => {
-                        return Err(format!(
-                            "set_knobs: scene {scene} shares {group_id}/{node_id}'s knobs with \
-                             the base preset (Scene Edit off for that block) — a scene write \
-                             would change every sharing scene; level Base instead"
-                        ));
-                    }
-                    Some(SceneOverlay::Unknown) | None => {
-                        return Err(format!(
-                            "set_knobs: refusing to write {group_id}/{node_id} in scene {scene} — \
-                             the saved preset does not say whether that node already has a scene \
-                             overlay ({}), and both write shapes corrupt it (enable reseeds an \
-                             existing overlay from base; omitting it leaks the write to base)",
-                            if saved.is_some() {
-                                "truncated field-8 read"
-                            } else {
-                                "no saved-preset read"
-                            }
-                        ));
+                // ONE write-landing policy for every scene-writing lane
+                // (`scene_jobs::scene_write_verdict`, shared with the Doctor's apply) — the
+                // four overlay states can never be answered two ways. The no-saved-read case
+                // stays local: the verdict is a function OF a saved document, so having none
+                // is this caller's own gap, and it keeps its own wording.
+                let Some(sv) = saved else {
+                    return Err(format!(
+                        "set_knobs: refusing to write {group_id}/{node_id} in scene {scene} — \
+                         the saved preset does not say whether that node already has a scene \
+                         overlay (no saved-preset read), and both write shapes corrupt it \
+                         (enable reseeds an existing overlay from base; omitting it leaks the \
+                         write to base)"
+                    ));
+                };
+                match scene_write_verdict(sv, scene, node_id) {
+                    SceneWriteVerdict::WriteDirect => {}
+                    SceneWriteVerdict::NeedsEnable => needs_enable.push(key),
+                    SceneWriteVerdict::Refuse(reason) => {
+                        return Err(format!("set_knobs: {reason}"))
                     }
                 }
             }
@@ -2429,9 +2438,13 @@ fn measure_knob_at(
 #[derive(Debug, Clone, Serialize)]
 pub struct FootswitchLevelResult {
     pub switch: u32,
-    /// Engaged loudness at the low reference seed (context).
+    /// Engaged loudness at the low reference seed (context). On a VERIFY row there is no
+    /// seed and no sweep: it is the engaged capture's own loudness.
     pub measured_lufs: f64,
-    /// Solved switch-ON value written as the `param` function's `valueA`.
+    /// Solved switch-ON value written as the `param` function's `valueA`. On a VERIFY row
+    /// NOTHING is written, so this echoes the param's AUTHORED value (0.0 when the row
+    /// carried no handle at all) — read `saved`/`on_off_delta_lu`, never this, to tell the
+    /// two row kinds apart.
     pub final_value: f32,
     pub target_lufs: f64,
     /// Achieved engaged loudness at `final_value`.
@@ -2469,6 +2482,51 @@ pub struct FootswitchLevelResult {
     /// pre-save-revert shape (field-8 is read-your-writes and would echo stale-saved bytes
     /// right back); that coverage is the registry barrier (`ensure_fresh_load`) alone.
     pub persist_mismatch: Option<bool>,
+    /// VERIFY rows ONLY (`Some`): engaged loudness MINUS disengaged loudness (LU) — how much
+    /// this switch changes the sound, measured and reported with nothing written. `None` on
+    /// every LEVEL row, which is also the discriminator: a verify row always carries a
+    /// delta, never a write (`saved: false`, `final_value` unchanged). Positive = engaging
+    /// makes the preset louder.
+    pub on_off_delta_lu: Option<f64>,
+}
+
+impl FootswitchLevelResult {
+    /// A VERIFY row: the switch measured ENGAGED (`on`) and DISENGAGED (`off`), nothing
+    /// solved and nothing written. The wire struct is shared with the solved rows, so every
+    /// SOLVE-shaped field here is a documented non-value rather than a result — stated once,
+    /// in this constructor, instead of re-asserted at the call site:
+    /// no search ran (`clamped`/`unconverged`/`wet_floor` false, `clamp_reason` None), no
+    /// write happened (`saved` false, `verify_lufs`/`persist_mismatch` None), and
+    /// `final_value` echoes the param's AUTHORED value because there is no solved one.
+    /// `on_off_delta_lu` is the row's real payload AND its discriminator: only a verify row
+    /// ever carries it.
+    fn verify_row(
+        switch: u32,
+        target_lufs: f64,
+        authored: f32,
+        on: &lufs::Loudness,
+        off: &lufs::Loudness,
+    ) -> Self {
+        Self {
+            switch,
+            measured_lufs: on.integrated_lufs,
+            final_value: authored,
+            target_lufs,
+            predicted_lufs: on.integrated_lufs,
+            clamped: false,
+            unconverged: false,
+            clamp_reason: None,
+            wet_floor: false,
+            saved: false,
+            verify_lufs: None,
+            // The two isolated captures this row paid for.
+            iterations: 2,
+            dynamic_spread_lu: Some(on.spread_lu()),
+            method: "verify".into(),
+            persist_mismatch: None,
+            on_off_delta_lu: Some(on.integrated_lufs - off.integrated_lufs),
+        }
+    }
 }
 
 /// How to write the leveling `param` function — resolved by the caller (edit an existing
@@ -2526,8 +2584,14 @@ pub(crate) const WET_FLOOR_FRACTION: f32 = 0.25;
 /// * [`crate::param_class::ParamClass::WetMix`] ⇒ the solved value is floored at
 ///   [`WET_FLOOR_FRACTION`] × `authored`.
 ///
-/// The SCENE lane's amp `outputLevel` is untouched by any of this — it keeps
-/// `scene_bench::knob_bounds` and `LEVEL_MIN`/`LEVEL_MAX`.
+/// Shared by every USER-CHOSEN-PARAM lane, not just footswitches (the name is historical):
+/// the preset block-knob lane (`commands/level_preset.rs`) and the scene HANDLE lane
+/// ([`SceneJob::handle`], `commands/level_scenes.rs`) build one too, so the refusal wording,
+/// the bounds and the wet floor are identical wherever a user names a control.
+///
+/// The amp `outputLevel` JOINT-K path is untouched by any of this — it is the closed-form
+/// amplitude solve (`solve_joint_k_at`), not a search, and keeps `scene_bench::knob_bounds`
+/// and `LEVEL_MIN`/`LEVEL_MAX`.
 #[derive(Debug, Clone)]
 pub struct FsParamTarget {
     /// The block's FenderId — the classifier's override key, and named in the refusal.
@@ -2572,17 +2636,60 @@ impl FsParamTarget {
         t
     }
 
+    /// The classifier's override key for `node_id`: the base graph's FenderId, falling back
+    /// to the node id when the graph carries none. One resolution rule for every constructor
+    /// below — `ACD_Boost.gain` (raw dB) and `ACD_TMRumbleV3.level` (barred) are keyed on it,
+    /// so a lane that resolved it differently would classify the same control two ways.
+    fn fender_id_of(preset: &serde_json::Value, node_id: &str) -> String {
+        crate::audiograph::roster_entry(preset, node_id)
+            .map(|(_, _, fid)| fid)
+            .unwrap_or_else(|| node_id.to_string())
+    }
+
     /// Resolve straight off the SAVED (field-8) preset: the node's FenderId (falling back to
     /// the node id when the graph carries none) and its authored value for `param`. The one
     /// constructor every production call site uses — each already holds the preset that the
     /// batch's single field-8 read produced.
     pub fn from_preset(preset: &serde_json::Value, node_id: &str, param: &str) -> Self {
-        let fender_id = crate::audiograph::roster_entry(preset, node_id)
-            .map(|(_, _, fid)| fid)
-            .unwrap_or_else(|| node_id.to_string());
         let authored = crate::commands::level_footswitch::node_param_f64(preset, node_id, param)
             .unwrap_or(0.0) as f32;
-        Self::new(&fender_id, param, authored)
+        Self::new(&Self::fender_id_of(preset, node_id), param, authored)
+    }
+
+    /// [`Self::from_preset`] with an explicit wet-floor anchor and the CLASS GATE folded in:
+    /// resolve the FenderId off `preset`, classify, and return the shared refusal as an `Err`
+    /// instead of an admissible target. The one entry point for a lane that takes a
+    /// USER-NAMED control — the preset block-knob lane and the scene HANDLE lane both hold
+    /// their own `authored` value (the picker's displayed value / the scene's own overlaid
+    /// one, never base's), and both must refuse BEFORE any device work, so the
+    /// resolve→classify→refuse sequence lives here once rather than at each call site.
+    pub fn classified(
+        preset: &serde_json::Value,
+        node_id: &str,
+        param: &str,
+        authored: f32,
+    ) -> Result<Self, String> {
+        let target = Self::new(&Self::fender_id_of(preset, node_id), param, authored);
+        match target.refuse_if_not_a_level_control() {
+            Some(refusal) => Err(refusal),
+            None => Ok(target),
+        }
+    }
+
+    /// The refusal EVERY lane shares when the classifier doesn't recognise this target as a
+    /// level or wet/mix control — `None` when it is admissible. One wording so the
+    /// footswitch solve, the preset block-knob lane and the scene handle lane can't drift
+    /// (and so a user who hits it in two places reads the same sentence). Always checked
+    /// BEFORE any device work: sweeping a non-level control changes the sound the player
+    /// wrote, not its loudness.
+    pub fn refuse_if_not_a_level_control(&self) -> Option<String> {
+        (self.info.class == crate::param_class::ParamClass::Other).then(|| {
+            format!(
+                "{} on {} is not a level control — leveling it would change the effect, not \
+                 the volume",
+                self.param, self.block
+            )
+        })
     }
 
     /// The param's usable `(lo, hi)`. For a wet/mix param the LOW bound IS the wet floor
@@ -2590,7 +2697,7 @@ impl FsParamTarget {
     /// bracket extremes, secant clamp, the pinned-at-a-bound verdict — can never even PROBE
     /// a value that would gut the effect, and every reported loudness is a real reading of a
     /// writable value.
-    fn bounds(&self) -> (f32, f32) {
+    pub fn bounds(&self) -> (f32, f32) {
         let (lo, hi) = self.info.range;
         (self.wet_floor().map_or(lo, |f| lo.max(f)), hi)
     }
@@ -2727,6 +2834,96 @@ pub(crate) fn measure_fs_at(
     engage_measure_disengage(&mut s, stimulus)
 }
 
+/// ONE fresh-connection capture of ONE footswitch STATE (engaged or disengaged) for a
+/// VERIFY row — the no-write twin of [`measure_fs_at`]. Same `arm_measurement` order and
+/// for the same reasons: BASE recall first (a preset loads into its saved
+/// `lastLoadedScene`, HW — without the recall the pair would describe whatever scene the
+/// preset happens to save), then the state's param writes, then the isolation bypasses LAST
+/// (the recall re-asserts that scene's own bypass state, so the full list is re-sent on
+/// EVERY capture), then ONE engage. `params` is `(group, node, param, value)` — the switch's
+/// `param` functions at this state's `valueA`/`valueB`. Every write lands on the throwaway
+/// connection's working copy; the command's reload discards them.
+fn measure_fs_state(
+    bypass: &[(String, String, bool)],
+    params: &[(String, String, String, f32)],
+    stimulus: &[f32],
+) -> Result<lufs::Loudness, String> {
+    let mut s = Session::connect_lean()?;
+    recall_base(&mut s)?;
+    for (g, n, p, v) in params {
+        s.change_parameter(g, n, p, *v)?;
+    }
+    for (g, n, byp) in bypass {
+        s.change_parameter_bool(g, n, "bypass", *byp)?;
+    }
+    settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    engage_measure_disengage(&mut s, stimulus)
+}
+
+/// VERIFY-ONLY footswitch row: measure the switch DISENGAGED and ENGAGED and report the
+/// delta, WRITING NOTHING. The row a user has not given a leveling handle to — intent is
+/// theirs, so the leveler observes instead of guessing which knob "should" carry the
+/// switch's loudness.
+///
+/// Two ISOLATED fresh-connection captures (never a second engage on a held connection —
+/// `danger.md`), disengaged FIRST: that is the preset's own sound, so it doubles as the
+/// routing probe exactly like `solve_footswitch`'s first seed.
+///
+/// SILENCE on EITHER side is a per-row `Err`, not a result. A verify row writes nothing, so
+/// nothing downstream needs the row to survive, and an `Err` keeps two contracts intact:
+/// `clamp_reason` stays pinned to "no signal on USB 1/2" (a genuinely MUTING switch would
+/// otherwise be reported as a routing failure — engaged silence is real data here, the same
+/// judgement `fs_silent_geometry` makes for the solve), and no advisory-only wire field has
+/// to be invented for a state the row can't report a delta for anyway.
+///
+/// `authored` is echoed as `final_value` (nothing was written); `method` labels the row.
+pub fn verify_footswitch(
+    switch: u32,
+    states: &crate::footswitch::SwitchStates,
+    stimulus: &[f32],
+    target_lufs: f64,
+    authored: f32,
+) -> Result<FootswitchLevelResult, String> {
+    if states.changes_nothing() {
+        return Err(
+            "this footswitch toggles no block and changes no parameter — there is nothing to \
+             measure"
+                .to_string(),
+        );
+    }
+    // Guaranteed re-amp OFF on a fresh connection before every early return: the capture's
+    // in-session disengage can be dropped, stranding the unit input-muted (`danger.md`).
+    let reamp_off = || {
+        let _ = Session::connect_lean().map(|mut s| s.set_reamp_mode(false));
+    };
+    let at = |bypass: &[(String, String, bool)], engaged: bool| {
+        let params: Vec<(String, String, String, f32)> = states
+            .params
+            .iter()
+            .map(|(g, n, p, a, b)| {
+                (
+                    g.clone(),
+                    n.clone(),
+                    p.clone(),
+                    if engaged { *a } else { *b },
+                )
+            })
+            .collect();
+        require_live(|| measure_fs_state(bypass, &params, stimulus), stimulus)
+    };
+    let off = at(&states.disengaged_bypass, false).inspect_err(|_| reamp_off())?;
+    crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
+    let on = at(&states.engaged_bypass, true).inspect_err(|_| reamp_off())?;
+    reamp_off();
+    Ok(FootswitchLevelResult::verify_row(
+        switch,
+        target_lufs,
+        authored,
+        &on,
+        &off,
+    ))
+}
+
 /// Verdict on a solved footswitch value: `(clamped, unconverged)` — the footswitch mirror of
 /// the scene path's "report from the FINAL point" rule (`jointk_one_scene`), which likewise
 /// drops the open-loop's initial want. Three outcomes, not one flag: at target → neither;
@@ -2828,22 +3025,110 @@ fn solve_footswitch(
     param: &FsParamTarget,
     mut measure: impl FnMut(&[(String, String, bool)], f32) -> Result<lufs::Loudness, String>,
 ) -> Result<FootswitchLevelResult, String> {
+    let solved = solve_param_secant(
+        stimulus,
+        target_lufs,
+        current_value,
+        param,
+        FS_CORRECT_MAX,
+        |v| measure(engaged_bypass, v),
+    )?;
+    Ok(solved.into_fs_result(switch, target_lufs, method))
+}
+
+/// What the param-space secant ACTUALLY found — the solve's own vocabulary, with no wire
+/// shape attached. [`solve_param_secant`] used to return a [`FootswitchLevelResult`], which
+/// forced its non-footswitch caller (the scene HANDLE lane) to hand it a fake `switch` and an
+/// empty engaged-bypass list and then throw six report-only fields away. Each caller now maps
+/// this into its own shape: [`solve_footswitch`] via [`ParamSolve::into_fs_result`], the scene
+/// lane into a [`SceneSolve`].
+struct ParamSolve {
+    /// The value to write — the best point the search reached, always inside the param's
+    /// [`FsParamTarget::bounds`] (the wet floor included), so it is always writable.
+    final_value: f32,
+    /// Loudness at the first REFERENCE point: the low seed's capture, the idempotency
+    /// probe's, or the routing-clamp sentinel. Context for the report, never the achieved
+    /// value.
+    measured_lufs: f64,
+    /// Achieved loudness AT `final_value` — a real capture, not a model prediction.
+    predicted_lufs: f64,
+    /// The knob RAN OUT (pinned at the bound blocking the needed direction) or has no
+    /// authority over loudness at all. A re-run cannot help.
+    clamped: bool,
+    /// Off target with knob room left — the bounded secant spent its budget on a
+    /// compressed/noisy response. A re-run CAN improve it.
+    unconverged: bool,
+    /// `Some` ONLY for the first seed's routing probe ("no signal on USB 1/2"); every later
+    /// silence is the knob's own quiet extreme, which is data.
+    clamp_reason: Option<String>,
+    /// The clamp pinned at the WET FLOOR specifically — the row wants a "verify by ear"
+    /// advisory. Rides only with `clamped`.
+    wet_floor: bool,
+    /// Dynamics spread (LU) of the capture behind `predicted_lufs`; `None` when no real
+    /// capture backs it (the routing clamp).
+    spread_lu: Option<f64>,
+    /// Real device captures this solve paid for.
+    iterations: u32,
+}
+
+impl ParamSolve {
+    /// Map onto the FOOTSWITCH wire shape. `switch` and `method` are report-only tags the
+    /// solve has no opinion about, and the persistence fields (`saved`, `verify_lufs`,
+    /// `persist_mismatch`) belong to the write path that runs after this. `on_off_delta_lu`
+    /// is the VERIFY row's discriminator and is never set on a solved row.
+    fn into_fs_result(self, switch: u32, target_lufs: f64, method: &str) -> FootswitchLevelResult {
+        FootswitchLevelResult {
+            switch,
+            measured_lufs: self.measured_lufs,
+            final_value: self.final_value,
+            target_lufs,
+            predicted_lufs: self.predicted_lufs,
+            clamped: self.clamped,
+            unconverged: self.unconverged,
+            clamp_reason: self.clamp_reason,
+            wet_floor: self.wet_floor,
+            saved: false,
+            verify_lufs: None,
+            iterations: self.iterations,
+            dynamic_spread_lu: self.spread_lu,
+            method: method.into(),
+            persist_mismatch: None,
+            on_off_delta_lu: None,
+        }
+    }
+}
+
+/// [`solve_footswitch`]'s loop with the CAPTURE BUDGET as an argument — the seam the scene
+/// handle lane reuses. Every correction iterate is a fresh-connect re-amp capture (~10 s),
+/// and the two lanes' cost profiles differ: a footswitch batch pays it per switch
+/// ([`FS_CORRECT_MAX`]), a scene batch per scene and up to 9 of them
+/// ([`SCENE_HANDLE_CORRECT_MAX`]). Nothing else about the solve differs, so the budget is
+/// the ONLY thing threaded — inheriting the footswitch cap silently would have re-inflated
+/// per-scene cost toward the legacy 80–93 s regime the scene lane's own
+/// `MEASURE_CORRECT_MAX` was set to avoid.
+///
+/// `measure(v)` captures at knob value `v`; whatever isolation that needs (a footswitch's
+/// engaged-bypass list, a scene recall) is the CALLER's closure to carry — the solve itself
+/// has no footswitch concepts left in it.
+fn solve_param_secant(
+    stimulus: &[f32],
+    target_lufs: f64,
+    current_value: Option<f32>,
+    param: &FsParamTarget,
+    correct_max: u32,
+    mut measure_at: impl FnMut(f32) -> Result<lufs::Loudness, String>,
+) -> Result<ParamSolve, String> {
     // ENTRY GUARD, before any device work: a param the classifier doesn't recognise as a
     // level or wet/mix control is not a volume control. Sweeping it would change the sound
     // the player wrote, not its loudness — refuse instead of "levelling" it. Surfaces as a
     // clean per-switch `status: "error"` item (the batched command's `Err` arm).
-    if param.info.class == crate::param_class::ParamClass::Other {
-        return Err(format!(
-            "{} on {} is not a level control — leveling it would change the effect, not the \
-             volume",
-            param.param, param.block
-        ));
+    if let Some(refusal) = param.refuse_if_not_a_level_control() {
+        return Err(refusal);
     }
     // The wet floor anchors on the ENGAGED value when the switch already has one (see
     // `anchored`'s doc); applied here, not at call sites, so it cannot be forgotten.
     let param = &param.anchored(current_value);
     let (bound_lo, bound_hi) = param.bounds();
-    let mut measure_at = |v: f32| measure(engaged_bypass, v);
 
     // Guaranteed re-amp OFF on a fresh connection — the measurement's last disengage can be
     // dropped, stranding the unit input-muted. (Not the write-confirm fix; just hygiene.)
@@ -2863,22 +3148,16 @@ fn solve_footswitch(
                 // Skip signal: `final_value` == the caller's current value verbatim, so the
                 // caller detects the no-op by `final_value == current` and writes nothing
                 // (the footswitch mirror of the scene lane's off-wire `writes: 0`).
-                return Ok(FootswitchLevelResult {
-                    switch,
-                    measured_lufs: l.integrated_lufs,
+                return Ok(ParamSolve {
                     final_value: cur,
-                    target_lufs,
+                    measured_lufs: l.integrated_lufs,
                     predicted_lufs: l.integrated_lufs,
                     clamped: false,
                     unconverged: false,
                     clamp_reason: None,
                     wet_floor: false,
-                    saved: false,
-                    verify_lufs: None,
+                    spread_lu: Some(l.spread_lu()),
                     iterations: 1,
-                    dynamic_spread_lu: Some(l.spread_lu()),
-                    method: method.into(),
-                    persist_mismatch: None,
                 });
             }
             // In-tolerance-but-not-a-skip falls through to the seed pass; a probe error
@@ -2910,22 +3189,16 @@ fn solve_footswitch(
         Ok(l) => l,
         Err(e) if e.contains(NO_SIGNAL_CAPTURED) => {
             reamp_off();
-            return Ok(FootswitchLevelResult {
-                switch,
-                measured_lufs: MUTE_FLOOR_SILENT_LUFS,
+            return Ok(ParamSolve {
                 final_value: v_lo,
-                target_lufs,
+                measured_lufs: MUTE_FLOOR_SILENT_LUFS,
                 predicted_lufs: MUTE_FLOOR_SILENT_LUFS,
                 clamped: true,
                 unconverged: false,
                 clamp_reason: Some("no signal on USB 1/2".into()),
                 wet_floor: false,
-                saved: false,
-                verify_lufs: None,
+                spread_lu: None,
                 iterations: 1,
-                dynamic_spread_lu: None,
-                method: method.into(),
-                persist_mismatch: None,
             });
         }
         Err(e) => return Err(e),
@@ -3028,7 +3301,7 @@ fn solve_footswitch(
                 // −1 / +1: which side of the target the previous bracket-mode iterate
                 // landed on (0 until the pair straddles).
                 let mut last_side = 0i8;
-                for _ in 0..FS_CORRECT_MAX {
+                for _ in 0..correct_max {
                     let straddles = (p0.1 - target_lufs) * (p1.1 - target_lufs) < 0.0;
                     let Some(raw) = fs_secant_next(p0, p1, target_lufs) else {
                         // NOT a no-authority verdict: this loop is only entered after
@@ -3099,26 +3372,20 @@ fn solve_footswitch(
     } else {
         classify_fs_outcome(best_v, best_lufs, target_lufs, (bound_lo, bound_hi))
     };
-    Ok(FootswitchLevelResult {
-        switch,
-        measured_lufs: l_lo.integrated_lufs,
+    Ok(ParamSolve {
         // The wet floor needs no epilogue: `bounds()` folds it into `bound_lo`, so the
         // secant never probed below it, `best_v` is always writable, and `predicted_lufs`
         // is a real reading OF the written value. A wet solve pinned at the floor arrives
         // here as an ordinary at-a-bound clamp; only the advisory flag below names it.
         final_value: best_v,
-        target_lufs,
+        measured_lufs: l_lo.integrated_lufs,
         predicted_lufs: best_lufs,
         clamped,
         unconverged,
         clamp_reason: None,
         wet_floor: clamped && param.pinned_at_wet_floor(best_v),
-        saved: false,
-        verify_lufs: None,
+        spread_lu: Some(best_spread),
         iterations,
-        dynamic_spread_lu: Some(best_spread),
-        method: method.into(),
-        persist_mismatch: None,
     })
 }
 
@@ -3595,6 +3862,11 @@ pub struct BatchedSceneOutcome {
     /// pre-wipe and must not be trusted; `Some(false)` = re-read and confirmed. `None` =
     /// not checked (the scene wrote nothing, the run didn't save, or the re-read failed).
     pub persist_mismatch: Option<bool>,
+    /// [`SceneTargetMode::Offset`] rows ONLY: how far this scene's effective target was
+    /// shifted from the requested one to preserve its authored relationship (LU;
+    /// `target_lufs` above is ALREADY the shifted one). `None` on a `Match` row;
+    /// `Some(0.0)` on the reference row itself, whose offset is 0 by definition.
+    pub target_offset_lu: Option<f64>,
 }
 
 /// One amp knob to drive within a scene: the control, its bounds, and its current
@@ -3605,6 +3877,32 @@ pub struct KnobTarget {
     pub lo: f32,
     pub hi: f32,
     pub current: f32,
+}
+
+/// What a scene row's `target_lufs` MEANS. Deserialized straight off the wire job
+/// (`"match"` / `"offset"`), so the wizard's two intents can't drift into two backend
+/// concepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneTargetMode {
+    /// Every scene is solved to the job target — today's behavior and the serde default,
+    /// so an existing caller's payload keeps its meaning with no `targetMode` key at all.
+    #[default]
+    Match,
+    /// Preserve the scene's AUTHORED loudness RELATIONSHIP: solve it to
+    /// `target + (its as-is loudness − the batch reference's as-is loudness)`, so a scene
+    /// the player wrote 4 LU above the reference stays 4 LU above it after the run.
+    ///
+    /// THE REFERENCE (chosen for cost — it must add ZERO captures): the FIRST job in the
+    /// batch that yields a real as-is measurement. Every scene is already measured as-is
+    /// once as the first step of its own solve, so the first one's reading is free; the
+    /// alternatives are not — "the loudest scene" can only be known after measuring them
+    /// all, which is a whole extra pass, and "the preset's base sound" costs a capture
+    /// whenever base isn't in the batch. The reference row itself therefore lands on the
+    /// plain target (offset 0), and the batch order the caller sends IS the choice of
+    /// reference. A row whose as-is measurement fails is skipped as a reference exactly as
+    /// it is skipped as a result, so the next row takes over.
+    Offset,
 }
 
 /// A pre-resolved per-scene leveling job. A scene carries a **set** of amp knobs:
@@ -3630,6 +3928,19 @@ pub struct SceneJob {
     /// output) — the rebalance flow may adjust the lanes' mix. False for series, single
     /// amp, and split-OUTPUT scenes (separate physical outs have no shared mix).
     pub rebalanceable: bool,
+    /// How to read `target_lufs` — see [`SceneTargetMode`]. Honored by
+    /// [`level_scenes_oneshot`] only; the rebalance and redistribution runners always
+    /// re-level every sound to its own target (`Match`), since their whole job is to
+    /// re-establish an absolute target after a gain-budget change.
+    pub target_mode: SceneTargetMode,
+    /// The USER'S OWN leveling handle for this scene, when they chose one: the CLASSIFIED
+    /// block param `knobs[0]` addresses. `None` = the amp-`outputLevel` joint-k path (every
+    /// existing caller), which keeps joint-k, the amplitude-bounds requirement, and the
+    /// rebalance flow. `Some` switches the scene onto the generic param-space secant
+    /// ([`solve_footswitch`]'s loop) with THIS param's class, range and wet floor — and
+    /// `knobs` then holds exactly one [`KnobTarget`] for it, so the persist-verify and
+    /// deferred-save machinery need no special case.
+    pub handle: Option<FsParamTarget>,
 }
 
 impl SceneJob {
@@ -3788,6 +4099,7 @@ pub fn level_scenes_live_batched(
                     clamp_reason: None,
                     verify_by_ear: false,
                     persist_mismatch: None,
+                    target_offset_lu: None,
                 },
                 Err(e) if e == CANCELLED => return Err(e),
                 Err(e) => BatchedSceneOutcome {
@@ -3804,6 +4116,7 @@ pub fn level_scenes_live_batched(
                     clamp_reason: None,
                     verify_by_ear: false,
                     persist_mismatch: None,
+                    target_offset_lu: None,
                 },
             };
             on_scene(job.scene_slot, Some(&outcome));
@@ -3842,6 +4155,16 @@ pub fn level_scenes_live_batched(
 /// cancel, so already-reported scenes are never silently lost); `restore_scene`
 /// is recalled first so the save stamps the preset's original active scene. A
 /// per-scene failure becomes a failed outcome, never aborting the run.
+///
+/// TWO per-row variations ride this runner, both defaulted OFF so an existing caller's
+/// batch is byte-identical:
+/// * [`SceneJob::handle`] — the user named their OWN control for that scene, so it is
+///   solved by [`handle_one_scene`] (the generic param secant) instead of the amp joint-k.
+///   The amp `outputLevel` remains the ONLY control this lane touches when no handle is
+///   given; a handle is an explicit, per-row user choice.
+/// * [`SceneJob::target_mode`] — `Offset` preserves the scene's authored loudness
+///   relationship instead of flattening every scene onto one number. The batch's reference
+///   is the first row that measures (see [`SceneTargetMode::Offset`]).
 #[allow(clippy::too_many_arguments)]
 pub fn level_scenes_oneshot(
     slot: u32,
@@ -3860,7 +4183,39 @@ pub fn level_scenes_oneshot(
         restore_scene,
         on_scene,
         cancelled,
-        |job| jointk_one_scene(slot, job, stimulus, job.target_lufs, save, true, saved),
+        // The batch's `Offset` REFERENCE: the first row that yields a real as-is
+        // measurement (see `SceneTargetMode::Offset` — the only choice that costs no extra
+        // capture). A row whose measurement fails leaves it unset, so the next row takes
+        // over; the reference row itself sees `None` and lands on the plain target.
+        {
+            let mut reference: Option<f64> = None;
+            move |job: &SceneJob| {
+                let solved = match &job.handle {
+                    Some(handle) => handle_one_scene(
+                        slot,
+                        job,
+                        handle,
+                        stimulus,
+                        job.target_lufs,
+                        save,
+                        saved,
+                        reference,
+                    ),
+                    None => jointk_one_scene(
+                        slot,
+                        job,
+                        stimulus,
+                        job.target_lufs,
+                        save,
+                        true,
+                        saved,
+                        reference,
+                    ),
+                }?;
+                reference.get_or_insert(solved.asis);
+                Ok(solved)
+            }
+        },
     )
 }
 
@@ -3930,7 +4285,18 @@ pub fn redistribute_clamped_headroom(
             outcomes.push(o);
             continue;
         }
-        let result = jointk_one_scene(slot, job, stimulus, job.target_lufs, true, true, saved);
+        // Absolute re-level (see `SceneSolve::eff_target`): a gain-budget change exists to
+        // restore each sound's own target, so no offset reference is threaded here.
+        let result = jointk_one_scene(
+            slot,
+            job,
+            stimulus,
+            job.target_lufs,
+            true,
+            true,
+            saved,
+            None,
+        );
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
         let o = match result {
             Ok(s) => {
@@ -4088,7 +4454,19 @@ fn run_scene_jobs(
                         }
                     }));
                 }
-                solved_scene_outcome(job.scene_slot, eff_target, s, t0.elapsed().as_millis())
+                // Stamp the EFFECTIVE target the solve aimed at, not the requested one: an
+                // offset row solved against `requested + (asis − reference)`, so reporting
+                // the request would make every offset row read as missed BY the offset and
+                // would decide `clamped` on the wrong number. `target_offset_lu` carries
+                // the shift itself — the frontend cannot derive it, since the requested
+                // target it sent was also shifted by the playback compensation. It rides on
+                // the solve (`effective_scene_target` computed it) and is stamped
+                // unconditionally: a lane that didn't offset reports `None` itself.
+                let target_offset_lu = s.target_offset_lu;
+                let mut outcome =
+                    solved_scene_outcome(job.scene_slot, s.eff_target, s, t0.elapsed().as_millis());
+                outcome.target_offset_lu = target_offset_lu;
+                outcome
             }
             Err(e) if e == CANCELLED => {
                 stopped = true;
@@ -4420,6 +4798,21 @@ struct SceneSolve {
     clamp_reason: Option<String>,
     /// Rebalance "verify by ear" flag; `false` for the plain joint-k path.
     verify_by_ear: bool,
+    /// The target this solve ACTUALLY aimed at — the job target for `Match`, the
+    /// offset-shifted one for [`SceneTargetMode::Offset`]. `run_scene_jobs` stamps THIS on
+    /// the outcome: reporting the requested target next to an offset-solved result would
+    /// make every offset row read as missed-by-the-offset (and `clamped` decide on the
+    /// wrong number).
+    eff_target: f64,
+    /// How far `eff_target` was SHIFTED from the requested one, straight from
+    /// [`effective_scene_target`] — `None` on a `Match` row, `Some(0.0)` on the reference row
+    /// itself. Carried rather than recovered by subtraction: `run_scene_jobs` stamps it
+    /// as-is, so the target mode is read in exactly one place.
+    target_offset_lu: Option<f64>,
+    /// The scene's AS-IS loudness at its authored knob value — the measurement every solve
+    /// starts from, harvested here so the batch can adopt the first one as the
+    /// [`SceneTargetMode::Offset`] reference without paying a capture for it.
+    asis: f64,
 }
 
 /// Max secant CORRECTIONS after the first apply, shared by every re-amp-measured solve
@@ -4497,6 +4890,110 @@ fn scene_at_target(measured: f64, target: f64, clamped: bool) -> bool {
     !clamped && (measured - target).abs() <= KNOB_TOL_LU
 }
 
+/// The target a scene is ACTUALLY solved against. [`SceneTargetMode::Match`] (and every
+/// pre-reference row, whose `reference_asis` is still `None`) takes the requested target
+/// verbatim; [`SceneTargetMode::Offset`] shifts it by this scene's authored distance from
+/// the reference sound, `asis − reference_asis`, so the relationship the player wrote is
+/// preserved instead of flattened. Both numbers are already in offset-adjusted CAPTURE
+/// space (the command added the playback compensation to `requested` before the job was
+/// stamped, and `asis` is a measurement) — the Fletcher–Munson offset must NOT be applied a
+/// second time here. Pure, so the arithmetic is unit-testable without a device.
+///
+/// Returns `(effective target, the shift applied)` — the shift as a VALUE, not a fact the
+/// runner has to rediscover by subtracting the two targets. This is the ONE place the target
+/// MODE is read: [`SceneSolve::target_offset_lu`] carries the answer up to `run_scene_jobs`,
+/// which stamps it unconditionally. `None` = a `Match` row (not offset-moded at all);
+/// `Some(0.0)` = an offset row that IS the reference, which keeps the two distinguishable on
+/// the wire.
+pub(crate) fn effective_scene_target(
+    mode: SceneTargetMode,
+    requested: f64,
+    asis: f64,
+    reference_asis: Option<f64>,
+) -> (f64, Option<f64>) {
+    match (mode, reference_asis) {
+        (SceneTargetMode::Offset, Some(reference)) => {
+            let shift = asis - reference;
+            (requested + shift, Some(shift))
+        }
+        // An offset row with no reference YET is the batch's reference: its own shift is 0 by
+        // definition and it lands on the plain target, exactly like a match row's — but it
+        // still REPORTS as offset-moded.
+        (SceneTargetMode::Offset, None) => (requested, Some(0.0)),
+        (SceneTargetMode::Match, _) => (requested, None),
+    }
+}
+
+/// What every per-scene solve opens with, whatever it then solves ON: the scene's as-is
+/// reading and the target that reading resolves.
+struct Prologue {
+    /// AS-IS loudness at the scene's authored knob values — the solve's starting point AND
+    /// the batch's [`SceneTargetMode::Offset`] reference candidate.
+    asis: f64,
+    /// Dynamics spread (LU) of that same capture.
+    spread: f64,
+    /// The target this scene is ACTUALLY solved against (see [`effective_scene_target`]).
+    eff_target: f64,
+    /// How far `eff_target` was shifted from the requested one; `None` = not shifted.
+    target_offset_lu: Option<f64>,
+}
+
+/// The prologue BOTH per-scene lanes share (`jointk_one_scene` on the amp's `outputLevel`,
+/// `handle_one_scene` on the user's own control): ONE isolated fresh re-amp capture of the
+/// scene as-is — no write, no Scene Edit, nothing to undo — split into level + spread, then
+/// resolved into the scene's own effective target.
+///
+/// What is deliberately NOT here is the already-at-target short-circuit, because the two
+/// lanes' skip TESTS genuinely differ (same `KNOB_TOL_LU` band, different clamp input):
+/// joint-k asks `scene_at_target(asis, target, clamped)` with the clamp flag from
+/// `solve_joint_k_at` — which does not exist until after its own solver runs, and which
+/// deliberately forces a clamped scene to fall through and be REPORTED even when the as-is
+/// reading happens to sit on target. The handle lane has no closed-form solve and therefore
+/// no clamp flag to pass (`false`). Each lane keeps its own one-line test and builds the
+/// skip outcome through [`Prologue::already_there`], so only the test differs, not the shape.
+fn scene_prologue(
+    job: &SceneJob,
+    stimulus: &[f32],
+    requested: f64,
+    reference_asis: Option<f64>,
+) -> Result<Prologue, String> {
+    // Hard-error on a persistent flat read (after the retry). Trade-off, made
+    // consciously: a real scene crushed by a limiter (the UA1176 case) with spread ≤ the
+    // trip gate would false-error — but the library's Base minimum is 0.12 and without the
+    // guard a floor read lands on the no-authority clamp path, which mislabels a USB
+    // failure as an off-branch amp.
+    let loudness = require_live(|| measure_scene_asis(job.scene_slot, stimulus), stimulus)?;
+    let (asis, spread) = (loudness.integrated_lufs, loudness.spread_lu());
+    let (eff_target, target_offset_lu) =
+        effective_scene_target(job.target_mode, requested, asis, reference_asis);
+    Ok(Prologue {
+        asis,
+        spread,
+        eff_target,
+        target_offset_lu,
+    })
+}
+
+impl Prologue {
+    /// The scene is already at its target: report the as-is reading and leave every knob
+    /// untouched (`writes: 0`). `levels` is what the device already holds — each knob's
+    /// authored `current`.
+    fn already_there(&self, levels: Vec<f32>) -> SceneSolve {
+        SceneSolve {
+            lufs: self.asis,
+            levels,
+            clamped: false,
+            spread: self.spread,
+            writes: 0,
+            clamp_reason: None,
+            verify_by_ear: false,
+            eff_target: self.eff_target,
+            target_offset_lu: self.target_offset_lu,
+            asis: self.asis,
+        }
+    }
+}
+
 /// Per-scene joint-k: measure the scene AS-IS once, solve one factor `k`, apply it to every
 /// lane amp (preserving their mix), VERIFY, then `correct_iter` (bounded secant) to converge
 /// through a downstream compressor. The open-loop `20·log10(k)` model is exact for pure gain
@@ -4513,14 +5010,11 @@ fn jointk_one_scene(
     defer: bool,
     verify: bool,
     saved: Option<&serde_json::Value>,
+    reference_asis: Option<f64>,
 ) -> Result<SceneSolve, String> {
-    // Hard-error on a persistent flat read (after the retry). Trade-off, made
-    // consciously: a real scene crushed by a limiter (the UA1176 case below) with
-    // spread ≤ the trip gate would false-error — but the library's Base minimum is
-    // 0.12 and without the guard a floor read lands on the no-authority clamp path,
-    // which mislabels a USB failure as an off-branch amp.
-    let loudness = require_live(|| measure_scene_asis(job.scene_slot, stimulus), stimulus)?;
-    let (measured, spread) = (loudness.integrated_lufs, loudness.spread_lu());
+    let prologue = scene_prologue(job, stimulus, target_lufs, reference_asis)?;
+    let (measured, spread) = (prologue.asis, prologue.spread);
+    let target_lufs = prologue.eff_target;
     let JointK {
         levels,
         clamped,
@@ -4528,18 +5022,11 @@ fn jointk_one_scene(
         k_eff,
     } = solve_joint_k_at(&job.knobs, target_lufs, measured)?;
     // Already at target (within the KNOB_TOL_LU acceptance band) and not clamped →
-    // leave every knob untouched (a clamp must still be REPORTED even if nothing moves).
+    // leave every knob untouched (a clamp must still be REPORTED even if nothing moves,
+    // which is why this lane's test takes the joint-k clamp flag and the handle lane's
+    // cannot).
     if scene_at_target(measured, target_lufs, clamped) {
-        let currents = job.knobs.iter().map(|kt| kt.current).collect();
-        return Ok(SceneSolve {
-            lufs: measured,
-            levels: currents,
-            clamped: false,
-            spread,
-            writes: 0,
-            clamp_reason: None,
-            verify_by_ear: false,
-        });
+        return Ok(prologue.already_there(job.knobs.iter().map(|kt| kt.current).collect()));
     }
     // Scene writes are NEVER saved per apply: `defer` accumulates them unsaved in the
     // working copy (the runner saves ONCE at batch end); `!defer` is the dry-run shape
@@ -4601,6 +5088,122 @@ fn jointk_one_scene(
         writes,
         clamp_reason,
         verify_by_ear: false,
+        eff_target: target_lufs,
+        target_offset_lu: prologue.target_offset_lu,
+        asis: measured,
+    })
+}
+
+/// Correction budget for the scene HANDLE lane's param secant — half [`FS_CORRECT_MAX`].
+/// Each iterate is a fresh-connect re-amp capture (~10 s) and a scene batch pays it up to 9
+/// times over, so the footswitch lane's 16 would put a whole-preset handle run past 20
+/// minutes; 8 still covers the HW-observed worst case (the Hiwatt `volume` cliff converged
+/// in ~4 Illinois-damped bracket iterates), and a well-behaved knob exits on its first
+/// in-tolerance iterate either way. A row that runs out reports honestly — it lands off
+/// target and `handle_one_scene` marks it clamped against the scene lane's own
+/// [`KNOB_TOL_LU`] band, never silently as done.
+const SCENE_HANDLE_CORRECT_MAX: u32 = 8;
+
+/// One scene solved on the USER'S OWN handle instead of the amp's `outputLevel`.
+///
+/// SEAM CHOICE (`solve_param_secant`, i.e. the footswitch solve's loop, over the joint-k
+/// one): joint-k is not a search at all — it is the closed-form `k = 10^((target−measured)/20)`
+/// that only holds for an AMPLITUDE knob multiplying the whole summed output, and
+/// `solve_joint_k_at` hard-errors on anything outside `0..1` for exactly that reason. A
+/// user-chosen handle is an arbitrary control (a raw-dB `gain`, a wet `mix`, a pedal taper),
+/// so the lane needs the generic param-space search that already carries the class gate,
+/// the range-driven bounds, the wet floor, silence-as-data and the Illinois-damped bracket
+/// — that is the footswitch solve, and duplicating it would fork every one of those HW
+/// lessons. Only the capture budget differs ([`SCENE_HANDLE_CORRECT_MAX`]).
+///
+/// The measure closure is [`measure_knob_at`] with the knob's SCENE context, so every
+/// probe writes through the Scene-Edit-aware `set_knobs`: its overlay gates apply unchanged
+/// — a `BypassOnly` scene (knobs shared with base) refuses on the FIRST capture and the row
+/// becomes a per-scene failed outcome, never a write that leaks to base.
+///
+/// AS-IS FIRST, exactly like `jointk_one_scene`: one `measure_scene_asis` capture (no write
+/// at all) supplies the [`SceneTargetMode::Offset`] reference AND the idempotency skip, and
+/// the solve then seeds from the param's own range. That is why `current_value` is `None`
+/// below — the solve's own idempotency probe would re-measure this very point.
+///
+/// The write is DEFERRED like every other scene write (`defer`), so the batch's single
+/// `save_deferred_scene_writes` persists it: ONE save per preset, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn handle_one_scene(
+    slot: u32,
+    job: &SceneJob,
+    handle: &FsParamTarget,
+    stimulus: &[f32],
+    target_lufs: f64,
+    defer: bool,
+    saved: Option<&serde_json::Value>,
+    reference_asis: Option<f64>,
+) -> Result<SceneSolve, String> {
+    // CLASS GATE, before any device work — the same refusal wording every lane shares.
+    if let Some(refusal) = handle.refuse_if_not_a_level_control() {
+        return Err(refusal);
+    }
+    let kt = match job.knobs.as_slice() {
+        [one] => one,
+        n => {
+            return Err(format!(
+                "a user-chosen scene handle addresses exactly one control, got {}",
+                n.len()
+            ))
+        }
+    };
+    let prologue = scene_prologue(job, stimulus, target_lufs, reference_asis)?;
+    let (asis, spread) = (prologue.asis, prologue.spread);
+    let target_lufs = prologue.eff_target;
+    // Already there → leave the handle untouched (the scene lane's `scene_at_target` rule,
+    // on its own acceptance band). No closed-form solve runs here, so there is no clamp flag
+    // to feed it — unlike `jointk_one_scene`, whose flag exists by this point.
+    if scene_at_target(asis, target_lufs, false) {
+        return Ok(prologue.already_there(vec![kt.current]));
+    }
+    let knob = &kt.knob;
+    let solved = solve_param_secant(
+        stimulus,
+        target_lufs,
+        None,
+        handle,
+        SCENE_HANDLE_CORRECT_MAX,
+        |v| measure_knob_at(stimulus, knob, v, &[], saved),
+    )?;
+    // The sweep left the LAST probed value in the working copy, not necessarily the best
+    // one — write the solved value explicitly (unsaved under `defer`; the batch-end save
+    // persists it).
+    let opts = LevelOptions {
+        verify: false,
+        defer,
+        ..Default::default()
+    };
+    apply_levels(
+        slot,
+        stimulus,
+        &[(knob, solved.final_value)],
+        opts,
+        false,
+        saved,
+    )?;
+    // Reported on the SCENE lane's band (`KNOB_TOL_LU`), not the tighter footswitch one the
+    // search accepts on: a handle row and an amp row in the same batch must mean the same
+    // thing by "done". A routing clamp (`clamp_reason`) rides through verbatim.
+    let clamped = solved.clamp_reason.is_some()
+        || solved.clamped
+        || (solved.predicted_lufs - target_lufs).abs() > KNOB_TOL_LU;
+    Ok(SceneSolve {
+        lufs: solved.predicted_lufs,
+        levels: vec![solved.final_value],
+        clamped,
+        spread,
+        // The solve's own captures plus this final apply write.
+        writes: solved.iterations + 1,
+        clamp_reason: solved.clamp_reason,
+        verify_by_ear: false,
+        eff_target: target_lufs,
+        target_offset_lu: prologue.target_offset_lu,
+        asis,
     })
 }
 
@@ -4974,7 +5577,7 @@ pub fn level_scenes_rebalance(
             let eff_target = job.target_lufs;
             // Non-mergeable scenes: plain joint-k (nothing to rebalance), self-correcting.
             if !job.rebalanceable || job.knobs.len() < 2 {
-                jointk_one_scene(slot, job, stimulus, eff_target, save, true, saved)
+                jointk_one_scene(slot, job, stimulus, eff_target, save, true, saved, None)
             } else {
                 // Rebalanceable: 2-lane equalize → joint-k. (Only the first two knobs are the
                 // rebalance pair; the classifier never produces >2 for a single split.)
@@ -5114,6 +5717,21 @@ fn rebalance_one_scene(
         writes: 1 + retry_writes + corr_writes,
         clamp_reason,
         verify_by_ear,
+        // The rebalance runner always re-establishes an ABSOLUTE target (that is what a
+        // gain-budget change exists to restore), so it never offsets — it feeds no reference
+        // and takes none, which is what the `None` reference below says. Routed through the
+        // same helper so the mode's wire reporting stays identical to the other lanes'
+        // rather than hard-coded here. `asis` is the BALANCED pair's combined reading — the
+        // only as-is number the flow has.
+        eff_target: target_lufs,
+        target_offset_lu: effective_scene_target(
+            job.target_mode,
+            target_lufs,
+            combined.integrated_lufs,
+            None,
+        )
+        .1,
+        asis: combined.integrated_lufs,
     })
 }
 
@@ -5144,6 +5762,9 @@ fn solved_scene_outcome(
         clamp_reason: s.clamp_reason,
         verify_by_ear: s.verify_by_ear,
         persist_mismatch: None,
+        // Stamped by `run_scene_jobs`, which is the only caller that holds the REQUESTED
+        // target this effective one was shifted from.
+        target_offset_lu: None,
     }
 }
 
@@ -5168,6 +5789,7 @@ fn failed_scene_outcome(
         clamp_reason: None,
         verify_by_ear: false,
         persist_mismatch: None,
+        target_offset_lu: None,
     }
 }
 
@@ -5330,6 +5952,7 @@ pub fn level_preset_block(
             previous_level: None,
             true_peak_dbtp: None,
             persist_mismatch: None,
+            target_offset_lu: None,
         })
     })();
     restore_after_unsaved_error(slot, opts.save, result)
@@ -6965,6 +7588,55 @@ mod tests {
     }
 
     /// A synthetic loudness reading for the injected-capture footswitch tests.
+    // ── Scene target modes (the offset rule, pure) ──────────────────────────────────
+
+    // `Match` is the default and the pre-existing behavior: every scene solves to the job
+    // target verbatim, whatever it measured and whatever the reference is.
+    #[test]
+    fn match_mode_ignores_the_as_is_reading_and_the_reference() {
+        assert_eq!(
+            effective_scene_target(SceneTargetMode::Match, -23.0, -14.0, Some(-19.0)),
+            (-23.0, None),
+            "no shift applied, and the row reports none"
+        );
+    }
+
+    // `Offset` preserves the AUTHORED relationship: a scene the player wrote 4 LU above the
+    // reference sound stays 4 LU above the target; one written 6 LU below stays 6 below.
+    #[test]
+    fn offset_mode_preserves_each_scenes_distance_from_the_reference() {
+        let reference = Some(-19.0);
+        // The SHIFT rides out WITH the target — the runner stamps it rather than recovering
+        // it by subtracting the requested target back off.
+        let (louder, louder_shift) =
+            effective_scene_target(SceneTargetMode::Offset, -23.0, -15.0, reference);
+        assert!(
+            (louder - (-19.0)).abs() < 1e-9,
+            "a scene 4 LU LOUDER than the reference solves 4 LU above target"
+        );
+        assert!((louder_shift.expect("shift reported") - 4.0).abs() < 1e-9);
+        let (quieter, quieter_shift) =
+            effective_scene_target(SceneTargetMode::Offset, -23.0, -25.0, reference);
+        assert!(
+            (quieter - (-29.0)).abs() < 1e-9,
+            "a scene 6 LU QUIETER than the reference solves 6 LU below target"
+        );
+        assert!((quieter_shift.expect("shift reported") - (-6.0)).abs() < 1e-9);
+    }
+
+    // The REFERENCE row itself (and every row measured before one exists — e.g. after the
+    // first row's measurement failed) lands on the plain target: its own offset is 0 by
+    // definition, so an offset batch's first sound is leveled exactly like a match batch's.
+    #[test]
+    fn offset_mode_without_a_reference_yet_is_the_plain_target() {
+        assert_eq!(
+            effective_scene_target(SceneTargetMode::Offset, -23.0, -15.0, None),
+            (-23.0, Some(0.0)),
+            "the reference row's own offset is 0 by definition — reported as a zero shift, \
+             not as `None` (which means the row isn't offset-moded at all)"
+        );
+    }
+
     fn fs_loud(integrated: f64) -> lufs::Loudness {
         lufs::Loudness {
             integrated_lufs: integrated,

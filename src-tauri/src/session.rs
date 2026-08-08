@@ -1419,12 +1419,14 @@ impl Session {
             .ok_or_else(|| "could not parse preset JSON, even tolerantly".to_string())
     }
 
-    /// The current preset's level-type block controls, parsed from the data the
-    /// handshake fetched. To enumerate a SPECIFIC slot, load it then open a fresh
+    /// The current preset's leveling-candidate block controls, parsed from the data
+    /// the handshake fetched. To enumerate a SPECIFIC slot, load it then open a fresh
     /// `Session` (the handshake fetches whatever preset is current, and a loaded
-    /// preset stays current across reconnects).
+    /// preset stays current across reconnects). Gated by
+    /// [`extract_level_candidates`] — the classifier table, the same one the
+    /// footswitch and scene-handle pickers use.
     pub fn current_preset_blocks(&self) -> Result<Vec<LevelBlock>, String> {
-        Ok(extract_level_blocks(&self.current_preset_value()?))
+        Ok(extract_level_candidates(&self.current_preset_value()?))
     }
 
     /// The active preset's full signal-chain graph (active-preset signal chain block strip) — every
@@ -3104,6 +3106,13 @@ fn extract_partial_json_string(text: &str, key: &str) -> Option<String> {
 /// A control name is a leveling candidate if it reads as a level/volume/output
 /// control. Deliberately EXCLUDES `gain`/drive (changes tone, not clean level)
 /// and EQ — the scoping decision was "level-type controls only".
+///
+/// NOT the leveling PICKER's gate any more — that is
+/// [`crate::param_class::classify`], via [`extract_level_candidates`]. This
+/// name-substring rule survives only inside [`extract_level_blocks`], whose
+/// remaining callers all look up ONE known control (the amp's `outputLevel`) or
+/// dump a probe diagnostic, so the two rules can no longer disagree about what
+/// the user is OFFERED.
 fn is_level_param(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     if n.contains("gain") || n.contains("drive") {
@@ -3116,6 +3125,12 @@ fn is_level_param(name: &str) -> bool {
 /// `audioGraph.guitarNodes.{G1..G7}[].dspUnitParameters`. Numeric params only;
 /// names filtered by `is_level_param`. Each node's id is its `nodeId` (falling
 /// back to `FenderId`). Tolerant of missing branches.
+///
+/// A VALUE LOOKUP, not a picker: every remaining caller either narrows to one
+/// known control (the amp's `outputLevel` — `scene_jobs::classify_scene_knobs`,
+/// `probe_api::overlay_ab`, `probe_api::level::filter_amp_candidates`) or prints a
+/// probe diagnostic. What the user is OFFERED comes from
+/// [`extract_level_candidates`] instead.
 pub(crate) fn extract_level_blocks(v: &serde_json::Value) -> Vec<LevelBlock> {
     let mut out = Vec::new();
     let Some(groups) = v
@@ -3157,6 +3172,65 @@ pub(crate) fn extract_level_blocks(v: &serde_json::Value) -> Vec<LevelBlock> {
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// The leveling PICKER's block-control list: every control under
+/// `audioGraph.guitarNodes.{G1..G7}[].dspUnitParameters` that
+/// [`crate::param_class::classify`] recognises as a level or wet/mix control, via the shared
+/// [`crate::footswitch::level_candidates_for_node`].
+///
+/// Same walk and same [`LevelBlock`] shape as [`extract_level_blocks`] — only the GATE
+/// differs, and that is the point. The legacy name-substring rule ([`is_level_param`]) and the
+/// classifier disagree in both directions, and the disagreement was user-visible: the preset
+/// lane's picker OFFERED `ACD_TMRumbleV3.level` (an amp knob the run-time gate then refuses)
+/// and HID wet `mix` / `ACD_Boost.gain` (raw dB, HW-verified fw 1.8.45) that the footswitch
+/// and scene-handle pickers both offer. One gate for every picker, so the same control can no
+/// longer be answered two ways.
+///
+/// GUITAR graph only, like [`extract_level_blocks`]: re-amp drives the instrument input, so
+/// only the guitar chain reaches the USB-Out the leveler measures.
+pub(crate) fn extract_level_candidates(v: &serde_json::Value) -> Vec<LevelBlock> {
+    let mut out = Vec::new();
+    let Some(groups) = v
+        .pointer("/audioGraph/guitarNodes")
+        .and_then(|g| g.as_object())
+    else {
+        return out;
+    };
+    for (group_id, nodes) in groups {
+        for node in nodes.as_array().into_iter().flatten() {
+            let node_id = node
+                .get("nodeId")
+                .and_then(|x| x.as_str())
+                .or_else(|| node.get("FenderId").and_then(|x| x.as_str()))
+                .unwrap_or("");
+            if node_id.is_empty() {
+                continue;
+            }
+            // The classifier's override key. A graph carrying no `FenderId` falls back to the
+            // node id — the same fallback `leveller::FsParamTarget::from_preset` applies, so
+            // the picker and the solve classify such a node identically.
+            let model_id = node
+                .get("FenderId")
+                .and_then(|x| x.as_str())
+                .unwrap_or(node_id);
+            let Some(params) = node.get("dspUnitParameters").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            out.extend(
+                crate::footswitch::level_candidates_for_node(group_id, node_id, model_id, params)
+                    .into_iter()
+                    .map(|c| LevelBlock {
+                        group_id: c.group_id,
+                        node_id: c.node_id,
+                        model_id: c.fender_id,
+                        parameter_id: c.parameter_id,
+                        value: c.current as f32,
+                    }),
+            );
         }
     }
     out
@@ -4549,6 +4623,56 @@ mod tests {
     #[test]
     fn extract_level_blocks_tolerates_missing_graph() {
         assert!(super::extract_level_blocks(&serde_json::json!({})).is_empty());
+    }
+
+    // BUG→GATE: the preset lane's PICKER used to run the name-substring rule, which
+    // disagreed with the run-time class gate in BOTH directions — it offered
+    // `ACD_TMRumbleV3.level` (an amp knob the solve then refuses) and hid the wet `mix` and
+    // raw-dB `ACD_Boost.gain` the footswitch and scene-handle pickers offer. One classifier
+    // for every picker.
+    #[test]
+    fn extract_level_candidates_uses_the_classifier_not_the_name_rule() {
+        let json = serde_json::json!({
+            "audioGraph": { "guitarNodes": { "G1": [
+                { "nodeId": "bass", "FenderId": "ACD_TMRumbleV3",
+                  "dspUnitParameters": { "level": 0.5, "volume": 0.6 } },
+                { "nodeId": "boost", "FenderId": "ACD_Boost",
+                  "dspUnitParameters": { "gain": 2.5 } },
+                { "nodeId": "chorus", "FenderId": "ACD_Chorus",
+                  "dspUnitParameters": { "mix": 0.4 } }
+            ] } }
+        });
+        let got: Vec<(String, String)> = super::extract_level_candidates(&json)
+            .into_iter()
+            .map(|b| (b.node_id, b.parameter_id))
+            .collect();
+        assert!(
+            !got.iter().any(|(n, _)| n == "bass"),
+            "`level` on ACD_TMRumbleV3 is an amp knob and `volume` on an amp is the breakup \
+             knob — neither may be offered: {got:?}"
+        );
+        assert!(
+            got.contains(&("boost".to_string(), "gain".to_string())),
+            "ACD_Boost.gain is raw dB with ~1:1 authority — the name rule hid it: {got:?}"
+        );
+        assert!(
+            got.contains(&("chorus".to_string(), "mix".to_string())),
+            "a wet/mix control IS levelable (floored, not gutted) — the name rule hid it: \
+             {got:?}"
+        );
+        // The classifier still reads the block's FenderId, so the raw-dB value passes through
+        // unscaled (the old `(0.0..=1.0)` value filter would have dropped 2.5).
+        let boost = super::extract_level_candidates(&json)
+            .into_iter()
+            .find(|b| b.node_id == "boost")
+            .expect("boost candidate");
+        assert!((boost.value - 2.5).abs() < 1e-6);
+        assert_eq!(boost.model_id, "ACD_Boost");
+    }
+
+    #[test]
+    fn extract_level_candidates_tolerates_missing_graph() {
+        assert!(super::extract_level_candidates(&serde_json::json!({})).is_empty());
     }
 
     // The real wire case: a preset JSON truncated mid-object after audioGraph

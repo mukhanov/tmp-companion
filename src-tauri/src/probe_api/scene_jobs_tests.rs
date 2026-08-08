@@ -766,8 +766,11 @@ fn change_param_false_for_a_node_no_scene_mentions() {
 // overlays untouched). Classifying it as a knob overlay is the bug this split fixes, so
 // each shape below is pinned exactly.
 
-/// `saved_preset()` with scene 0's `ampA` overlay replaced by `params`.
-fn with_scene0_overlay(params: serde_json::Value) -> serde_json::Value {
+/// `saved_preset()` with scene 0's `ampA` overlay replaced by `params`. `pub(crate)`
+/// so `commands::doctor_tests`' `bypass_only_conflict` tests share this fixture
+/// shape instead of re-typing it (both scan `scene_overlay` against `ampA`/`G1`/
+/// `ACD_TwinReverb`).
+pub(crate) fn with_scene0_overlay(params: serde_json::Value) -> serde_json::Value {
     let mut p = saved_preset();
     p["scenes"][0]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
         serde_json::json!({ "dspUnitParameters": params });

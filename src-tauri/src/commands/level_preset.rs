@@ -205,26 +205,47 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
         let mut previous_level: Option<f32> = None;
         let result = match block {
             Some((group_id, node_id, parameter_id)) => {
-                let (lo, hi) = knob_bounds(block_value.unwrap_or(0.5));
-                let knob = leveller::LevelKnob::Block { group_id, node_id, parameter_id, scene_slot: None };
+                // CLASS GATE + RANGE, replacing the value-sniffed `knob_bounds(current)`:
+                // the picker can offer ANY block param, and sweeping a non-level control
+                // (a distortion knob, say) changes the sound the player wrote rather than
+                // its loudness — the exact hazard the footswitch lane already refuses.
+                // `param_class::classify` keys on the block's FenderId, so this arm now
+                // ALWAYS pays the one field-8 read the saving path already paid; the same
+                // read still supplies `restore_scene`. An unreadable preset REFUSES rather
+                // than guessing a class — the safe direction, and no offline spec exercises
+                // this arm (every fixture job sends a null block triple).
+                let saved = crate::read_saved_preset(slot);
+                let Some(preset) = saved.as_ref() else {
+                    return Err(format!(
+                        "could not read preset {} to classify {parameter_id} on {node_id} — \
+                         leveling an unclassified parameter could change the sound instead of \
+                         its loudness",
+                        slot + 1
+                    ));
+                };
+                // `block_value` — the value the picker displayed — stays the wet-floor
+                // anchor, falling back to the saved graph. Everything else (FenderId
+                // resolution, classification, the shared refusal) is
+                // `FsParamTarget::classified`, so this lane and the scene HANDLE lane
+                // cannot answer the same control two ways.
+                let authored = block_value
+                    .or_else(|| node_param_f64(preset, &node_id, &parameter_id).map(|v| v as f32))
+                    .unwrap_or(0.0);
+                let target =
+                    leveller::FsParamTarget::classified(preset, &node_id, &parameter_id, authored)?;
+                let (lo, hi) = target.bounds();
                 // A saving block-knob run measures/applies in base context too, so its save
-                // must re-stamp the original `lastLoadedScene` like the whole-preset arm —
-                // this arm has no other preset read to fold the lookup into, so pay one
-                // field-8 read only when actually saving.
+                // must re-stamp the original `lastLoadedScene` like the whole-preset arm.
                 if save {
-                    // `read_saved_preset` owns this exact sequence: one field-8 read
-                    // (logged on failure) + the single post-read reconnect gap.
-                    let saved = crate::read_saved_preset(slot);
-                    opts.restore_scene = saved.as_ref().and_then(crate::last_loaded_scene);
-                    if let Some(p) = saved.as_ref() {
-                        crate::warn_missing_restore_scene(
-                            "level_preset(block)",
-                            slot,
-                            p,
-                            opts.restore_scene,
-                        );
-                    }
+                    opts.restore_scene = crate::last_loaded_scene(preset);
+                    crate::warn_missing_restore_scene(
+                        "level_preset(block)",
+                        slot,
+                        preset,
+                        opts.restore_scene,
+                    );
                 }
+                let knob = leveller::LevelKnob::Block { group_id, node_id, parameter_id, scene_slot: None };
                 // Pre-dispatch cancel: nothing has touched the device yet — early-return
                 // (the leveller bails at its own pre-measure checkpoint) so the run-end
                 // backstop below is skipped, mirroring the None arm's cancel path.

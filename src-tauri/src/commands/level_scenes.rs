@@ -33,6 +33,24 @@ pub(crate) struct SceneLevelProgressItem {
 pub(crate) struct SceneLevelJobArg {
     scene_slot: u32,
     target_lufs: f64,
+    /// How to read `target_lufs` — see [`leveller::SceneTargetMode`]. Defaulted to `match`
+    /// (today's behavior) so an existing payload with no `targetMode` key is unchanged.
+    #[serde(default)]
+    target_mode: leveller::SceneTargetMode,
+    /// The user's OWN control for this scene. Absent = the amp-`outputLevel` path (joint-k,
+    /// rebalance, every existing caller).
+    #[serde(default)]
+    handle: Option<SceneHandleArg>,
+}
+
+/// A user-chosen scene leveling control: the block param the solve should sweep INSTEAD of
+/// the active amp's `outputLevel`.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SceneHandleArg {
+    group_id: String,
+    node_id: String,
+    parameter_id: String,
 }
 
 /// Wire payload for `tmp://leveling-lufs` — the advisory live measured loudness streamed
@@ -256,14 +274,19 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
     profile_id: Option<String>,
     on_result: tauri::ipc::Channel<SceneLevelProgressItem>,
 ) -> Result<Vec<leveller::LevelResult>, String> {
-    if !candidates
-        .iter()
-        .any(|c| is_amp_output_level_param(&c.parameter_id))
-    {
-        return Err("per-scene leveling needs at least one amp outputLevel candidate".to_string());
-    }
     if jobs.is_empty() {
         return Err("no scenes selected".to_string());
+    }
+    // A row that names its own control needs no amp candidate and no routing classification —
+    // the user picked the knob. So this pre-device guard fires only for a batch where NOBODY
+    // named one (every row is an amp-`outputLevel` joint-k row and the whole run is doomed);
+    // a MIXED batch proceeds and `build_scene_jobs_with_handles` skips just the amp rows.
+    if jobs.iter().all(|j| j.handle.is_none())
+        && !candidates
+            .iter()
+            .any(|c| is_amp_output_level_param(&c.parameter_id))
+    {
+        return Err("per-scene leveling needs at least one amp outputLevel candidate".to_string());
     }
     SCENE_LEVEL_CANCEL.store(false, SeqCst);
     // Playback compensation is one offset for the whole batch; each job's own target
@@ -320,19 +343,40 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
             // OWN wire job's offset-adjusted target (match by scene slot) so a mixed-target
             // preset levels in this ONE batch. `jobs` is non-empty (guarded above).
             let base_target = jobs[0].target_lufs + offset;
-            let mut scene_jobs = build_scene_jobs(
+            // Each row's own control, threaded INTO the builder (sparse, keyed by wire scene
+            // slot): a handle row is built from that param and never consults the amp
+            // classifier, so an unreadable routing template can only skip the rows that
+            // actually need the amp.
+            let handles: Vec<(u32, SceneHandleSpec)> = jobs
+                .iter()
+                .filter_map(|j| {
+                    j.handle.as_ref().map(|h| {
+                        (
+                            j.scene_slot,
+                            SceneHandleSpec {
+                                group_id: &h.group_id,
+                                node_id: &h.node_id,
+                                parameter_id: &h.parameter_id,
+                            },
+                        )
+                    })
+                })
+                .collect();
+            let mut scene_jobs = build_scene_jobs_with_handles(
                 &scene_slots,
                 &candidates,
                 &docs,
                 base_target,
                 saved.as_ref(),
+                &handles,
             )?;
             if !base_requested {
                 scene_jobs.retain(|sj| sj.scene_slot != session::BASE_SCENE_SLOT);
             }
             // Error on ANY slot mismatch between the built jobs and the wire jobs — a silent
             // default (especially NaN, which `.min(k_cap)` would collapse to the cap and slam
-            // the amp) must never reach a solve.
+            // the amp) must never reach a solve. This is also where each row's target MODE is
+            // stamped: one reconciliation pass over the wire jobs, not two.
             for sj in scene_jobs.iter_mut() {
                 let arg = jobs
                     .iter()
@@ -347,6 +391,7 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     ));
                 }
                 sj.target_lufs = arg.target_lufs + offset;
+                sj.target_mode = arg.target_mode;
             }
             if let Some(j) = jobs
                 .iter()
@@ -482,7 +527,166 @@ fn outcome_to_level_result(
         // path in `level_preset` estimates it).
         true_peak_dbtp: None,
         persist_mismatch: o.persist_mismatch,
+        // `target_lufs` above is already the EFFECTIVE (offset-shifted) target; this is the
+        // shift itself, which the frontend can't derive from what it sent.
+        target_offset_lu: o.target_offset_lu,
     }
+}
+
+// ───────────────────── Scene handle picker (enumeration) ─────────────────────
+
+/// One control a scene row could be leveled on, with the two annotations the picker cannot
+/// derive on its own. `class`/`range` come from [`crate::param_class`]; `current` is the
+/// value AUTHORED IN THAT SCENE (overlay if present, else base).
+///
+/// Block DISPLAY info is `groupId`/`nodeId`/`fenderId` only — the frontend owns the
+/// friendly name (it has the models catalog; the backend deliberately does not, the same
+/// split as the amp candidates the Level view already sends down).
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SceneHandleCandidate {
+    group_id: String,
+    node_id: String,
+    fender_id: String,
+    parameter_id: String,
+    /// `"level_linear" | "level_db" | "wet_mix"` — the classifier's verdict, serialized
+    /// straight off [`param_class::ParamClass`] (no hand-rolled mapping to drift from the
+    /// table). `"other"` never appears: `footswitch::level_candidates_for_node` admits only
+    /// params the classifier recognises, so an unrecognised one is not a candidate at all.
+    class: param_class::ParamClass,
+    /// The param's usable `[lo, hi]` — NOT `[0,1]` for every control (`ACD_Boost.gain` is
+    /// raw dB over `[0, 12]`). For a `wet_mix` the LOW bound is already raised to the wet
+    /// floor, so the picker shows the range the solve may actually write.
+    range: [f32; 2],
+    current: f32,
+    /// Does writing this control in THIS scene affect ONLY this scene?
+    /// * `"isolated"` — the scene carries a knob overlay for the node (or none at all, in
+    ///   which case the Scene Edit enable materialises one). The write stays here.
+    /// * `"shared_with_base"` — the node's Scene Edit flag is OFF (a bypass-only overlay),
+    ///   so this scene reads the BASE knob and a write would change every sharing scene.
+    ///   `set_knobs` REFUSES such a write, so the picker must warn rather than offer it
+    ///   silently.
+    /// * `"unknown"` — the saved read could not answer (a truncated `scenes` tail). Both
+    ///   write shapes corrupt from there, so the write is refused too.
+    scope: String,
+    /// `"full"` = the control has room in both directions. `"lowers_only"` = its authored
+    /// value already sits at (or within a whisker of) the top of its range, so this handle
+    /// can only make the scene QUIETER — the picker should say so before the user finds out
+    /// from a clamped row.
+    headroom: String,
+}
+
+/// The handle candidates for ONE scene.
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SceneHandleRow {
+    /// 0-based `scenes[]` wire index. FS scenes only — base handles are the preset lane's
+    /// own picker (`list_level_blocks`), and the overlay annotations below are meaningless
+    /// for base (it has no overlay concept).
+    scene_slot: u32,
+    candidates: Vec<SceneHandleCandidate>,
+}
+
+/// Within this fraction of the range's top, a control counts as having no room to go up.
+/// A knob authored at 0.995 of `[0,1]` has ~0.04 dB of boost left — reporting that as "full"
+/// headroom would be a lie the user only discovers from a clamped row.
+const HANDLE_TOP_EPS_FRACTION: f32 = 0.01;
+
+/// Per-scene handle candidates for the picker. PURE apart from ONE field-8 read: every
+/// annotation (class, range, per-scene current value, overlay scope) comes out of the saved
+/// document, so no scene is recalled on the unit and nothing is measured.
+#[tauri::command]
+pub(crate) async fn list_scene_level_handles(
+    state: State<'_, AppState>,
+    slot: u32,
+) -> Result<Vec<SceneHandleRow>, String> {
+    with_released_seize(state.session.clone(), move || {
+        let (preset, _, _) = read_slot_preset_parsed(slot)?;
+        Ok(scene_handle_rows(&preset))
+    })
+    .await
+}
+
+/// [`list_scene_level_handles`]'s pure core — the whole annotation rule, unit-testable
+/// against a preset document with no device in the loop.
+fn scene_handle_rows(preset: &serde_json::Value) -> Vec<SceneHandleRow> {
+    let scene_count = preset
+        .get("scenes")
+        .and_then(|s| s.as_array())
+        .map_or(0, |a| a.len()) as u32;
+    // nodeId → its base `dspUnitParameters` (the candidate source; a scene overlay only
+    // ever restates params the base node already carries).
+    let mut params: std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::HashMap::new();
+    audiograph::for_each_node(preset, |obj| {
+        if let Some(nid) = obj.get("nodeId").and_then(|v| v.as_str()) {
+            params.insert(
+                nid.to_string(),
+                obj.get("dspUnitParameters")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    });
+    let roster = audiograph::roster(preset);
+    (0..scene_count)
+        .map(|scene| {
+            let mut candidates = Vec::new();
+            for (group_id, node_id, fender_id) in &roster {
+                let Some(base_params) = params.get(node_id) else {
+                    continue;
+                };
+                // The overlay decides BOTH the scope annotation and which values are the
+                // scene's own — one lookup per node, reused for every candidate on it.
+                // `scene_overlay_for`, not `scene_overlay`: the roster triple is already in
+                // hand, so the string-keyed wrapper's whole-graph `roster_entry` walk would
+                // be re-paid once per (scene, node) pair for an answer we resolved once.
+                let overlay = scene_overlay_for(preset, scene, (group_id, node_id, fender_id));
+                let (scope, overlay_params) = match &overlay {
+                    SceneOverlay::Full(p) => ("isolated", Some(*p)),
+                    // No overlay yet: the Scene Edit enable materialises one, so a write
+                    // here does land on this scene alone.
+                    SceneOverlay::Absent => ("isolated", None),
+                    SceneOverlay::BypassOnly(_) => ("shared_with_base", None),
+                    SceneOverlay::Unknown => ("unknown", None),
+                };
+                for mut c in
+                    footswitch::level_candidates_for_node(group_id, node_id, fender_id, base_params)
+                {
+                    if let Some(v) = overlay_params
+                        .and_then(|p| p.get(&c.parameter_id))
+                        .and_then(|v| v.as_f64())
+                    {
+                        c.current = v;
+                    }
+                    let current = c.current as f32;
+                    let target = leveller::FsParamTarget::new(fender_id, &c.parameter_id, current);
+                    let (lo, hi) = target.bounds();
+                    let headroom = if current >= hi - (hi - lo).abs() * HANDLE_TOP_EPS_FRACTION {
+                        "lowers_only"
+                    } else {
+                        "full"
+                    };
+                    candidates.push(SceneHandleCandidate {
+                        group_id: c.group_id,
+                        node_id: c.node_id,
+                        fender_id: c.fender_id,
+                        parameter_id: c.parameter_id,
+                        class: target.info.class,
+                        range: [lo, hi],
+                        current,
+                        scope: scope.to_string(),
+                        headroom: headroom.to_string(),
+                    });
+                }
+            }
+            SceneHandleRow {
+                scene_slot: scene,
+                candidates,
+            }
+        })
+        .collect()
 }
 
 // ───────────────────────── Gain-budget redistribution (PR5) ─────────────────────────
@@ -829,4 +1033,203 @@ pub(crate) async fn level_scenes(
             .ok_or_else(|| "no finite scene loudness measured".to_string())
     })
     .await
+}
+
+#[cfg(test)]
+mod scene_handle_tests {
+    use super::*;
+
+    /// A 2-scene preset: an amp whose scene-0 overlay carries a KNOB (`Full`) and whose
+    /// scene-1 overlay carries only `bypass` (`BypassOnly` — Scene Edit off, knobs shared
+    /// with base), plus a pedal no scene mentions at all (`Absent`).
+    fn preset() -> serde_json::Value {
+        serde_json::json!({
+            "audioGraph": { "guitarNodes": { "G1": [
+                { "nodeId": "amp", "FenderId": "ACD_TwinReverb65NoFx",
+                  "dspUnitParameters": { "outputLevel": 0.5, "volume": 0.7, "bypass": false } },
+                { "nodeId": "ped", "FenderId": "ACD_KingOfTone",
+                  "dspUnitParameters": { "volume": 1.0, "overdrive": 0.4, "bypass": false } }
+            ] } },
+            "scenes": [
+                { "guitarNodes": { "G1": {
+                    "ACD_TwinReverb65NoFx": { "dspUnitParameters": { "outputLevel": 0.3 } } } } },
+                { "guitarNodes": { "G1": {
+                    "ACD_TwinReverb65NoFx": { "dspUnitParameters": { "bypass": true } } } } }
+            ]
+        })
+    }
+
+    /// The batch's amp candidate — an `outputLevel` on the fixture's amp, so a HANDLE-less
+    /// row has something to classify (the fixture carries no `audioGraph.template`, so the
+    /// amp path still fails its routing prerequisite; that is the mixed-batch gate below).
+    fn amp_candidates() -> Vec<LevelBlockArg> {
+        vec![LevelBlockArg {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            value: 0.5,
+        }]
+    }
+
+    /// Build the batch's jobs the way `level_scenes_apply_batched` does: the handles threaded
+    /// INTO the builder, sparse and keyed by wire scene slot.
+    fn build(
+        slots: &[u32],
+        handles: &[(u32, (&str, &str, &str))],
+        docs: &[(u32, Option<serde_json::Value>)],
+        saved: Option<&serde_json::Value>,
+    ) -> Result<Vec<leveller::SceneJob>, String> {
+        let specs: Vec<(u32, SceneHandleSpec)> = handles
+            .iter()
+            .map(|(scene, (g, n, p))| {
+                (
+                    *scene,
+                    SceneHandleSpec {
+                        group_id: g,
+                        node_id: n,
+                        parameter_id: p,
+                    },
+                )
+            })
+            .collect();
+        build_scene_jobs_with_handles(slots, &amp_candidates(), docs, -23.0, saved, &specs)
+    }
+
+    // A handle points the row at the user's control, and its starting value / wet-floor
+    // anchor is the value authored IN THAT SCENE (the pedal has no scene-0 overlay, so it
+    // inherits base — the amp would have taken its overlay's 0.3 instead).
+    #[test]
+    fn a_handle_repoints_the_row_and_takes_the_scenes_own_value() {
+        let preset = preset();
+        let docs = vec![(0u32, Some(preset.clone()))];
+        let jobs = build(&[0], &[(0, ("G1", "ped", "volume"))], &docs, Some(&preset))
+            .expect("an all-handles batch needs no amp prerequisite");
+        let sj = &jobs[0];
+        assert!(sj.skip.is_none());
+        assert!(sj.handle.is_some(), "the row is handle-driven");
+        assert!(
+            !sj.rebalanceable,
+            "one user-chosen control is not a rebalanceable lane pair"
+        );
+        match &sj.knobs[..] {
+            [k] => {
+                assert_eq!(k.current, 1.0, "the pedal's authored volume");
+                assert_eq!((k.lo, k.hi), (0.0, 1.0));
+                assert_eq!(
+                    k.knob.label(),
+                    "G1/ped/volume@scene0",
+                    "the write is scene-scoped"
+                );
+            }
+            n => panic!("expected exactly one handle knob, got {}", n.len()),
+        }
+    }
+
+    // An unrecognised control is refused BEFORE any device work, as that ROW's skip — the
+    // rest of the batch must still run (the lane's own per-scene-skip rule).
+    #[test]
+    fn an_unclassifiable_handle_skips_only_its_own_row() {
+        let preset = preset();
+        let docs = vec![(0u32, Some(preset.clone())), (1u32, Some(preset.clone()))];
+        let jobs = build(
+            &[0, 1],
+            &[
+                // `overdrive` is a drive control, not a level control.
+                (0, ("G1", "ped", "overdrive")),
+                (1, ("G1", "ped", "volume")),
+            ],
+            &docs,
+            Some(&preset),
+        )
+        .expect("one bad handle is a row skip, never a batch abort");
+        let reason = jobs[0].skip.as_deref().expect("row 0 refused");
+        assert!(
+            reason.contains("not a level control"),
+            "the shared refusal wording: {reason}"
+        );
+        assert!(jobs[0].knobs.is_empty(), "a refused row drives nothing");
+        assert!(jobs[1].skip.is_none(), "row 1 is unaffected");
+    }
+
+    // Without the saved document there is no FenderId to classify against — refuse the row
+    // rather than sweep an unclassified control.
+    #[test]
+    fn a_handle_without_a_saved_read_is_refused() {
+        let jobs = build(&[0], &[(0, ("G1", "ped", "volume"))], &[], None)
+            .expect("still a row skip, not a batch abort");
+        assert!(jobs[0].skip.is_some());
+        assert!(jobs[0].knobs.is_empty());
+    }
+
+    // BUG→GATE (the mixed-batch class): the amp prerequisites — an `outputLevel` candidate
+    // and a readable routing template — are inputs a HANDLE row does not need. The fixture
+    // carries no `audioGraph.template`, so the amp classifier fails preset-wide; that must
+    // skip only the row that needed the amp, never the row whose control the user named.
+    #[test]
+    fn an_amp_prerequisite_failure_skips_only_the_rows_that_need_the_amp() {
+        let preset = preset();
+        let docs = vec![(0u32, Some(preset.clone())), (1u32, Some(preset.clone()))];
+        let jobs = build(
+            &[0, 1],
+            &[(1, ("G1", "ped", "volume"))],
+            &docs,
+            Some(&preset),
+        )
+        .expect("a mixed batch must not abort on the amp classifier");
+        assert!(
+            jobs[0].skip.as_deref().unwrap_or("").contains("routing"),
+            "the amp row reports the routing read: {:?}",
+            jobs[0].skip
+        );
+        assert!(jobs[1].skip.is_none(), "the handle row levels regardless");
+        assert!(jobs[1].handle.is_some());
+    }
+
+    // The picker's two annotations, both read straight off the saved overlays.
+    #[test]
+    fn handle_rows_annotate_scope_and_headroom_per_scene() {
+        let rows = scene_handle_rows(&preset());
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per FS scene (base is not enumerated)"
+        );
+        let find = |row: &SceneHandleRow, node: &str, param: &str| {
+            row.candidates
+                .iter()
+                .find(|c| c.node_id == node && c.parameter_id == param)
+                .cloned()
+        };
+
+        // Scene 0: the amp's overlay carries a knob → the write stays in this scene, and
+        // the overlay's own 0.3 is the current value (not base's 0.5).
+        let amp0 = find(&rows[0], "amp", "outputLevel").expect("amp outputLevel");
+        assert_eq!(amp0.scope, "isolated");
+        assert_eq!(amp0.current, 0.3);
+        assert_eq!(amp0.class, param_class::ParamClass::LevelLinear);
+        assert_eq!(
+            serde_json::to_value(amp0.class).expect("class serializes"),
+            "level_linear",
+            "the wire spelling the frontend reads is the table's own"
+        );
+        assert_eq!(amp0.range, [0.0, 1.0]);
+        assert_eq!(amp0.headroom, "full");
+
+        // Scene 1: bypass-only overlay means Scene Edit is OFF, so the knobs are SHARED
+        // with base (and `set_knobs` refuses the write) — the picker must say so.
+        let amp1 = find(&rows[1], "amp", "outputLevel").expect("amp outputLevel");
+        assert_eq!(amp1.scope, "shared_with_base");
+        assert_eq!(amp1.current, 0.5, "shared, so it reads the BASE value");
+
+        // No overlay at all: the Scene Edit enable materialises one, so still isolated; and
+        // a control authored at the top of its range can only go DOWN.
+        let ped = find(&rows[0], "ped", "volume").expect("pedal volume");
+        assert_eq!(ped.scope, "isolated");
+        assert_eq!(ped.headroom, "lowers_only");
+
+        // The classifier's bars hold here too: an AMP's `volume` is the breakup knob, and a
+        // pedal's `overdrive` is a drive control — neither is ever offered.
+        assert!(find(&rows[0], "amp", "volume").is_none());
+        assert!(find(&rows[0], "ped", "overdrive").is_none());
+    }
 }

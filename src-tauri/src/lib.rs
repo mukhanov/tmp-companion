@@ -79,9 +79,10 @@ pub use probe_api::*;
 pub(crate) use probe_api::level::filter_amp_candidates;
 pub(crate) use probe_api::scene_bench::knob_bounds;
 pub(crate) use probe_api::scene_jobs::{
-    build_scene_jobs, is_amp_model_id, is_amp_output_level_param, last_loaded_scene,
-    prepass_scene_docs_via, read_saved_preset, scene_overlay, scene_overlays_change_param,
-    scenes_restating_base, warn_missing_restore_scene, SceneOverlay,
+    build_scene_jobs, build_scene_jobs_with_handles, is_amp_model_id, is_amp_output_level_param,
+    last_loaded_scene, prepass_scene_docs_via, read_saved_preset, scene_overlay, scene_overlay_for,
+    scene_overlays_change_param, scene_write_verdict, scenes_restating_base,
+    warn_missing_restore_scene, SceneHandleSpec, SceneOverlay, SceneWriteVerdict,
 };
 pub(crate) use probe_api::setlists::{read_setlist_list, read_setlist_songs};
 pub(crate) use probe_api::slot_write::{discover_active_graph, load_then_discover_blocks};

@@ -78,6 +78,7 @@ pub fn run() {
             level_scenes,
             level_scenes_apply,
             level_scenes_apply_batched,
+            list_scene_level_handles,
             redistribute_headroom,
             restore_redistribution,
             common_reachable_target,

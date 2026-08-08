@@ -415,7 +415,7 @@ impl SimState {
     /// [`SimState::overlay_is_full_shaped`] uses, so the two can't read a shape
     /// differently. Shared by `rendered_param` (any param) and `rendered_bypass` (asked
     /// for `"bypass"`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     fn scene_overlay_value(
         &mut self,
         scene: u32,
@@ -435,7 +435,7 @@ impl SimState {
     /// The BASE graph node's own `(group, node, param)` value, from the cached parsed doc —
     /// the un-overlaid fallback both renderers fall through to. Shared walk, replacing what
     /// used to be a hand-rolled `guitarNodes` traversal duplicated in three places.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     fn base_graph_value(
         &mut self,
         group: &str,
@@ -463,7 +463,7 @@ impl SimState {
     /// scene's own overlay doesn't carry
     /// (pin: `scene_recall_renders_the_overlay_per_param_with_no_retention_from_the_prior_scene`).
     /// Test-only: its sole caller is [`SimDevice::rendered_param`] (`#[cfg(test)]`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e"))]
     fn rendered_param(&mut self, group: &str, node: &str, param: &str) -> Option<f64> {
         let scene_key = self.scene_key();
         // 1. An explicit write for the address space under measurement (the active
@@ -1321,7 +1321,7 @@ impl SimDevice {
         if !st.reamp_on {
             return silent_capture(stimulus.len(), rate);
         }
-        match model_lufs(&st, sidecar(), stored_levels()) {
+        match model_lufs(&mut st, sidecar(), stored_levels()) {
             Some(l_model) => scale_stimulus(stimulus, rate, l_model),
             None => silent_capture(stimulus.len(), rate), // off-branch
         }
@@ -1349,7 +1349,7 @@ impl SimState {
 /// the sidecar C table and the presetJson-derived stored knob map.
 #[cfg(feature = "e2e")]
 fn model_lufs(
-    st: &SimState,
+    st: &mut SimState,
     sidecar: &Sidecar,
     stored: &std::collections::HashMap<u32, StoredLevels>,
 ) -> Option<f64> {
@@ -1376,18 +1376,29 @@ fn model_lufs(
     // overrides the flat C law for exactly the ENGAGED declared block's own knob — Base
     // and every OTHER switch's isolated measurement (this block bypassed) fall through
     // to the ordinary formula below unperturbed.
-    if let Some(lp) = entry.and_then(|e| {
+    let leveled = entry.and_then(|e| {
         e.leveled_params
             .iter()
             .find(|lp| st.bypass_writes.get(&lp.node).copied() == Some(false))
-    }) {
+            .cloned()
+    });
+    if let Some(lp) = leveled {
         let key = (
             st.scene_key(),
             lp.group.clone(),
             lp.node.clone(),
             lp.param.clone(),
         );
-        let v = st.param_writes.get(&key).copied()?;
+        // The leveler's own sweep write when there is one; otherwise the block's AUTHORED
+        // value, rendered through the same chain a `loadScene` recall uses
+        // (`rendered_param`). Without that fallback a capture of this block ENGAGED but
+        // NEVER WRITTEN — exactly a VERIFY row's engaged capture, which writes no param by
+        // definition — returned `None` and the model reported it as off-branch SILENCE,
+        // making the whole verify-vs-level distinction unobservable offline.
+        let v = match st.param_writes.get(&key).copied() {
+            Some(v) => v,
+            None => st.rendered_param(&lp.group, &lp.node, &lp.param)? as f32,
+        };
         let c = saturated_pedal_lufs(v)?;
         let preset_term = 20.0 * f64::from(st.preset_level.max(1e-6)).log10();
         return Some(c + preset_term);
@@ -1532,7 +1543,7 @@ struct LeveledParam {
 /// matching the HW note that the bracket-expansion probe down there reads NO_SIGNAL, not
 /// merely "very quiet".
 #[cfg(feature = "e2e")]
-fn saturated_pedal_lufs(v: f32) -> Option<f64> {
+pub(crate) fn saturated_pedal_lufs(v: f32) -> Option<f64> {
     let v = f64::from(v);
     if v <= 0.10 {
         return None;
@@ -1943,7 +1954,7 @@ mod physics_tests {
         let sc = one_slot(401, -16.0, vec![], None);
         let stored = std::collections::HashMap::new();
         let loud = model_lufs(
-            &SimState {
+            &mut SimState {
                 current_slot: 401,
                 preset_level: 0.5,
                 ..Default::default()
@@ -1953,7 +1964,7 @@ mod physics_tests {
         )
         .unwrap();
         let quiet = model_lufs(
-            &SimState {
+            &mut SimState {
                 current_slot: 401,
                 preset_level: 0.25,
                 ..Default::default()
@@ -1993,7 +2004,7 @@ mod physics_tests {
                 st.param_writes
                     .insert((0, "G1".into(), "amp".into(), "outputLevel".into()), w);
             }
-            model_lufs(&st, &sc, &stored).unwrap()
+            model_lufs(&mut st, &sc, &stored).unwrap()
         };
         let as_stored = with_write(None);
         assert!(
@@ -2017,12 +2028,12 @@ mod physics_tests {
         };
         st.bypass_writes.insert("ACD_Amp".into(), true);
         assert!(
-            model_lufs(&st, &sc, &stored).is_none(),
+            model_lufs(&mut st, &sc, &stored).is_none(),
             "bypassing the routed amp must silence the capture"
         );
         st.bypass_writes.insert("ACD_Amp".into(), false);
         assert!(
-            model_lufs(&st, &sc, &stored).is_some(),
+            model_lufs(&mut st, &sc, &stored).is_some(),
             "un-bypassed, the sound is measurable"
         );
     }
@@ -2044,7 +2055,7 @@ mod physics_tests {
             if let Some(b) = byp {
                 st.bypass_writes.insert("ACD_TubeScreamer".into(), b);
             }
-            model_lufs(&st, &sc, &stored)
+            model_lufs(&mut st, &sc, &stored)
         };
         assert!(
             with_bypass(Some(false)).is_none(),
@@ -2195,22 +2206,38 @@ mod physics_tests {
         // Not engaged (no write at all) — the ordinary flat C, unperturbed by the pedal
         // curve: the "don't touch existing scenarios" guarantee, pinned at the boundary.
         assert!(
-            (model_lufs(&st, &sc, &stored).unwrap() - (-10.0)).abs() < 1e-6,
+            (model_lufs(&mut st, &sc, &stored).unwrap() - (-10.0)).abs() < 1e-6,
             "unengaged must fall through to the flat C"
         );
-        // Engaged (bypass=false) but nothing written yet for the leveled param → no
+        // Engaged (bypass=false), nothing written AND no authored value in the graph → no
         // signal, never a silent fallback to the flat C (which would mask a real bug).
         st.bypass_writes.insert("pedal".into(), false);
         assert!(
-            model_lufs(&st, &sc, &stored).is_none(),
-            "engaged with no written value must not silently read as the flat C"
+            model_lufs(&mut st, &sc, &stored).is_none(),
+            "engaged with neither a write nor an authored value must not read as the flat C"
+        );
+        // Engaged with the block's AUTHORED value and still no write — a VERIFY row's
+        // engaged capture, which writes no param by definition. It must render the pedal
+        // curve at the authored 0.5, NOT off-branch silence (which is what made the whole
+        // verify-vs-level distinction unobservable offline).
+        st.preset_json = serde_json::json!({
+            "audioGraph": { "guitarNodes": { "G1": [
+                { "nodeId": "pedal", "dspUnitParameters": { "level": 0.5 } }
+            ] } }
+        })
+        .to_string();
+        st.parsed_preset_cache = None;
+        let authored = model_lufs(&mut st, &sc, &stored).expect("authored value renders");
+        assert!(
+            (authored - saturated_pedal_lufs(0.5).unwrap()).abs() < 1e-6,
+            "an unwritten engaged block must render its authored 0.5, got {authored}"
         );
         // Engaged with a mid-cliff value → the curve's own arithmetic.
         st.param_writes.insert(
             (SCENE_BASE, "G1".into(), "pedal".into(), "level".into()),
             0.1857,
         );
-        let lufs = model_lufs(&st, &sc, &stored).unwrap();
+        let lufs = model_lufs(&mut st, &sc, &stored).unwrap();
         // PR2 re-baseline: +3 from the mono-era -26 (the cliff's floor anchor moved
         // -62 → -59, same -420*(v-0.10) slope).
         assert!(
@@ -2219,7 +2246,7 @@ mod physics_tests {
         );
         // Forced OFF again (a sibling's own isolated measurement) — back to the flat C.
         st.bypass_writes.insert("pedal".into(), true);
-        assert!((model_lufs(&st, &sc, &stored).unwrap() - (-10.0)).abs() < 1e-6);
+        assert!((model_lufs(&mut st, &sc, &stored).unwrap() - (-10.0)).abs() < 1e-6);
     }
 
     // ── lazy-commit `presetLevel` (the same-slot stale-load incident, at the sim layer) ──
