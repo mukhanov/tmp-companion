@@ -259,6 +259,61 @@ fn main() {
         }
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--dump-list") {
+        // --dump-list <listEnum> <fromSlot> <toSlot> <outDir> — field-8 sweep over a
+        // slot range of any preset list (My=1, Cloud=3, Factory=4), JSON per slot to
+        // outDir. Read-only census instrumentation.
+        let le: u32 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let from: u32 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let to: u32 = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dir = args.get(i + 4).cloned().unwrap_or_default();
+        if le == 0 || from == 0 || to < from || dir.is_empty() {
+            eprintln!("usage: probe --dump-list <listEnum> <fromSlot> <toSlot> <outDir>");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_dump_list(le, from, to, &dir) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--scene-node-doc") {
+        // --scene-node-doc <listIdx> <group> <node> <scene…>  — probe_scene_doc
+        // generalized to a caller-chosen node: rendered field-3 params + ftsw active
+        // flags after each recall, in the given order (non-destructive).
+        let idx: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        let group = args.get(i + 2).cloned().unwrap_or_default();
+        let node = args.get(i + 3).cloned().unwrap_or_default();
+        let scenes: Vec<u32> = args
+            .iter()
+            .skip(i + 4)
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if idx == u32::MAX || group.is_empty() || node.is_empty() || scenes.is_empty() {
+            eprintln!("usage: probe --scene-node-doc <listIdx> <group> <node> <scene…>");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_scene_node_doc(idx, &group, &node, &scenes) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--knob-sweep") {
         // --knob-sweep <listIdx> <group> <node> <param> <v1,v2,…>  (TMP_LEVELLER_STIMULUS=<wav>)
         let idx: u32 = args

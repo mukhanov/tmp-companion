@@ -205,6 +205,97 @@ pub fn probe_scene_doc(list_index: u32, scenes: &[u32]) -> Result<String, String
     Ok(out)
 }
 
+/// `probe --scene-node-doc <listIdx> <group> <node> <scene…>` — repro instrumentation:
+/// the [`probe_scene_doc`] recipe (load, then recall the given scenes IN ORDER on ONE
+/// held session, harvesting the rendered field-3 doc after each recall) generalized to
+/// a caller-chosen node instead of the hard-coded Hiwatt/UniVibe pair. Prints the
+/// node's FULL rendered `dspUnitParameters` (bools and strings included, not just
+/// floats) plus the doc's `ftsw` active flags — the discriminator for how a partial
+/// (bypass-only) scene overlay and `ftswStates` materialize on recall.
+/// NON-DESTRUCTIVE: no writes, no re-amp.
+pub fn probe_scene_node_doc(
+    list_index: u32,
+    group: &str,
+    node: &str,
+    scenes: &[u32],
+) -> Result<String, String> {
+    fn fmt_doc(label: &str, doc: &serde_json::Value, group: &str, node: &str) -> String {
+        let mut out = format!(
+            "[{label}] lastLoadedScene={:?}\n",
+            doc.get("lastLoadedScene")
+        );
+        match crate::scenes::guitar_node(doc, group, node)
+            .and_then(|n| n.get("dspUnitParameters"))
+            .and_then(|p| p.as_object())
+        {
+            Some(params) => {
+                let mut kv: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                kv.sort();
+                out += &format!("  {group}/{node}: {}\n", kv.join(" "));
+            }
+            None => out += &format!("  {group}/{node}: <absent/truncated>\n"),
+        }
+        match doc.get("ftsw").and_then(|f| f.as_array()) {
+            Some(slots) => {
+                let active: Vec<String> = slots
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, slot)| {
+                        slot.as_array().into_iter().flatten().map(move |a| {
+                            format!(
+                                "FS{i}:{}{}",
+                                a.get("customLabel").and_then(|l| l.as_str()).unwrap_or("?"),
+                                if a.get("isActive").and_then(|b| b.as_bool()) == Some(true) {
+                                    "=ON"
+                                } else {
+                                    "=off"
+                                }
+                            )
+                        })
+                    })
+                    .collect();
+                out += &format!("  ftsw: {}\n", active.join(" "));
+            }
+            None => out += "  ftsw: <absent/truncated>\n",
+        }
+        out
+    }
+    let mut s = Session::connect()?;
+    for _ in 0..8 {
+        s.heartbeat()?;
+        s.pump_collect(120)?;
+    }
+    s.raw.clear();
+    s.send_and_collect(&proto::load_preset((list_index + 1) as u64, 1), 300)?;
+    for _ in 0..6 {
+        s.heartbeat()?;
+        s.pump_collect(200)?;
+    }
+    let mut out = format!("[probe --scene-node-doc] list_index={list_index} {group}/{node}\n");
+    match s.current_preset_value() {
+        Ok(d) => out += &fmt_doc("post-load", &d, group, node),
+        Err(e) => out += &format!("[post-load] no doc: {e}\n"),
+    }
+    for &sc in scenes {
+        s.raw.clear();
+        s.send_and_collect(&proto::load_scene(sc as u64), 300)?;
+        let mut doc = None;
+        for _ in 0..4 {
+            s.heartbeat()?;
+            s.pump_collect(150)?;
+            if let Ok(v) = s.current_preset_value() {
+                doc = Some(v);
+                break;
+            }
+        }
+        match doc {
+            Some(d) => out += &fmt_doc(&format!("recall scene {sc}"), &d, group, node),
+            None => out += &format!("[recall scene {sc}] NO DOC harvested\n"),
+        }
+    }
+    Ok(out)
+}
+
 /// NON-DESTRUCTIVE classifier check (`probe --classify <listIdx> [scene…]`): load the
 /// preset, harvest the pre-pass scene docs, and print how `build_scene_jobs` classifies
 /// each scene's amp-knob set (routing → series last-amp / parallel joint-k / skip).
