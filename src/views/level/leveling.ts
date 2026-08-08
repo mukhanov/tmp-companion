@@ -18,14 +18,22 @@ import type {
   FootswitchInfo,
   LevelJob,
   LevelParamCandidate,
+  ParamClass,
   Profile,
   SceneInfo,
   SilenceHint,
 } from "../../lib/types";
 import type { PresetRow } from "../PresetList";
 import type { PickOption } from "../overlays/Pick";
+// `SceneHandlePick` is declared ONCE, as the `levelScenesApplyBatched` wire type in
+// invoke.ts (its `SceneLevelJobWire.handle` field) — re-exported below so
+// `SetupOption`/`RunItem` and the scene-handle-picker wiring can import it from
+// either module without a second, driftable copy.
+import type { SceneHandlePick } from "../../lib/invoke";
 import { shortFallback } from "../../models/blockArt";
-import { slotLabel } from "../../lib/format";
+import { signedDb, slotLabel } from "../../lib/format";
+
+export type { SceneHandlePick };
 
 // ── selection scene-key helpers (shared by the list + the flow) ─────────────
 
@@ -59,34 +67,84 @@ export function childKeys(
 }
 
 /** The leveling coordinates a footswitch row carries into `levelFootswitchesApply`:
- *  the `ftsw` switch index + the block param to solve (the backend classifies bake vs
- *  assign). Built from `FootswitchInfo` (switch + its first level candidate). */
-export interface FootswitchTarget {
-  /** 0-based `ftsw` array index (the wire footswitch address). */
-  switchIndex: number;
-  levGroupId: string;
-  levNodeId: string;
-  levParameterId: string;
+ *  the `ftsw` switch index + (in LEVEL mode) the block param to solve. Built from
+ *  `FootswitchInfo` (switch + a chosen level candidate).
+ *
+ *  A discriminated union on `mode`, not three independently-nullable `lev*` fields —
+ *  the old shape let `{mode:"verify", levGroupId:"x"}` exist at the type level,
+ *  forcing every consumer to triple-null-check instead of narrowing on `mode`. LEVEL
+ *  mode's three coords are always ALL present together (mirrors the backend's
+ *  `FsJobMode`, which never sends a partial handle either).
+ *
+ *  `switchIndex` stays populated in BOTH branches, so `it.footswitch != null` keeps
+ *  meaning "this is a footswitch row" everywhere it's checked (`ceilingOf`, the run
+ *  loop's dispatch) regardless of whether the row has a handle yet. */
+export type FootswitchTarget =
+  | {
+      /** "verify" — measure engaged vs disengaged, write nothing (the P2 default: a
+       *  row is only WRITTEN once the user has explicitly given it a handle in Set
+       *  up, never silently on a tone-safe auto-pick). */
+      mode: "verify";
+      /** 0-based `ftsw` array index (the wire footswitch address). */
+      switchIndex: number;
+    }
+  | {
+      /** "level" — solve + write the handle below (opt-in). */
+      mode: "level";
+      switchIndex: number;
+      levGroupId: string;
+      levNodeId: string;
+      levParameterId: string;
+    };
+
+/** Rank a candidate's WIRE-CARRIED class for `defaultParamIndex`: a genuine level
+ *  control (linear or dB) ranks above a wet/dry mix (which changes loudness but also
+ *  the effect's presence). There is no "unclassified" rank to skip — the backend
+ *  (`footswitch::level_candidates_for_node`) admits only params the classifier
+ *  recognises, so every candidate the frontend ever sees already carries a real class. */
+const CLASS_RANK: Record<ParamClass, number> = {
+  level_linear: 0,
+  level_db: 0,
+  wet_mix: 1,
+};
+
+/** Friendly labels for the technical parameter ids (fallback: capitalize the id).
+ *  Shared by `FsParamPick` and `SceneLevelPick` — the two "which block parameter"
+ *  pickers — so the dictionary can't drift between them. */
+const PARAM_LABELS: Partial<Record<string, string>> = {
+  level: "Level",
+  outputLevel: "Output level",
+  output: "Output",
+  mix: "Mix",
+  volume: "Volume",
+  gain: "Gain",
+  drive: "Drive",
+  tone: "Tone",
+  fuzz: "Fuzz",
+  treble: "Treble",
+  bass: "Bass",
+  presence: "Presence",
+};
+export function paramLabel(p: string): string {
+  return PARAM_LABELS[p] ?? (p ? p.charAt(0).toUpperCase() + p.slice(1) : "");
 }
 
-/** Block params that change loudness without changing the SOUND — the tone-safe
- *  leveling targets. Anything else (gain/tone/drive…) also alters the tone. */
-const LOUDNESS_PARAMS = new Set([
-  "level",
-  "outputLevel",
-  "output",
-  "mix",
-  "volume",
-  "loudness",
-]);
-/** True when adjusting this parameter changes loudness only (not the tone). */
-export const isLoudnessParam = (p: string): boolean => LOUDNESS_PARAMS.has(p);
-/** The tone-safe default candidate index: the first loudness-only param, else the
- *  first candidate. Replaces the old alphabetical-first `[0]` pick, which could land
- *  on a gain/tone knob and change the sound while leveling. */
+/** The tone-safe default candidate index: the best-classified (level over wet-mix)
+ *  candidate off the WIRE `class` field, tie-broken to the first match. Returns `-1`
+ *  only for an EMPTY list — every candidate the backend offers already carries a real
+ *  (never "other") class, so a non-empty list always has a valid default; callers with
+ *  a non-empty `params` can treat the result as always `>= 0`. */
 export function defaultParamIndex(params: LevelParamCandidate[]): number {
-  const i = params.findIndex((c) => isLoudnessParam(c.parameter_id));
-  return i >= 0 ? i : 0;
+  let bestIdx = -1;
+  let bestRank = Number.POSITIVE_INFINITY;
+  params.forEach((c, i) => {
+    const rank = CLASS_RANK[c.class];
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestIdx = i;
+    }
+  });
+  return bestIdx;
 }
 
 /** The apply-to-all instrument's place on the good → better → best ladder that drives
@@ -103,8 +161,8 @@ export function instCalState(
   return o.calibrated ? "cal" : "uncal";
 }
 
-/** Build leveling coordinates from a specific candidate (the user's chosen param, or
- *  the default). The backend classifies bake vs assign from these ids. */
+/** Build a LEVEL-mode target from a specific candidate (the user's explicit pick). The
+ *  backend classifies bake vs assign from these ids. */
 export function targetFromCandidate(
   switchIndex: number,
   c: LevelParamCandidate,
@@ -114,7 +172,14 @@ export function targetFromCandidate(
     levGroupId: c.group_id,
     levNodeId: c.node_id,
     levParameterId: c.parameter_id,
+    mode: "level",
   };
+}
+
+/** Build a VERIFY-mode target (no handle) — the row's default until the user opts in
+ *  with an explicit pick. */
+export function verifyFootswitchTarget(switchIndex: number): FootswitchTarget {
+  return { switchIndex, mode: "verify" };
 }
 
 /** The display footswitch number for a switch index (human FS tag = index + 1 — the
@@ -152,28 +217,40 @@ export function instrumentName(
 
 /** The row name for a footswitch: the player's own `customLabel` when set, else the
  *  toggled block's friendly name (many presets leave the label blank — a nameless row
- *  is useless, so fall back to e.g. "Tube Screamer" from the leveled block's id). */
+ *  is useless, so fall back to e.g. "Tube Screamer" from the leveled block's id).
+ *
+ *  NOT display-only: this string flows into `displayLabel`, which the backend writes
+ *  as the switch's on-device `customLabel` on save — a wrong pick here is a WIRE WRITE,
+ *  not cosmetic. So the fallback never reaches for an arbitrary candidate: it names the
+ *  row after the tone-safe DEFAULT level param (the same one Set up recommends), and
+ *  only falls further back to the switch's own toggled/adjusted block (its first
+ *  function's `fender_id`) when there is no classifiable level param at all. */
 export function footswitchName(f: FootswitchInfo): string {
   const label = f.label.trim();
   if (label) return label;
-  if (f.level_params.length > 0)
-    return shortFallback(
-      f.level_params[defaultParamIndex(f.level_params)].fender_id,
-    );
+  if (f.level_params.length > 0) {
+    // Every candidate the backend offers already carries a real (never "other") class,
+    // so `idx` is always >= 0 here in practice — the `undefined` guard exists only so a
+    // future loosening of that backend guarantee fails to the function fallback below
+    // instead of silently naming the row after `level_params[0]`.
+    const idx = defaultParamIndex(f.level_params);
+    const picked = idx >= 0 ? f.level_params[idx] : undefined;
+    if (picked) return shortFallback(picked.fender_id);
+  }
+  if (f.functions.length > 0) return shortFallback(f.functions[0].fender_id);
   return "Footswitch";
 }
 
-/** Resolve a levelable footswitch's DEFAULT leveling coordinates (its tone-safe
- *  candidate). The Set up step can override the candidate per row; null when the
- *  footswitch has no candidate (it should have been filtered out upstream). */
+/** Resolve a levelable footswitch's DEFAULT row target: VERIFY (P2 — a row is only
+ *  ever written once the user has explicitly given it a handle in Set up; the old
+ *  auto-pick-and-write default is gone). `null` when the footswitch has no leveling
+ *  candidate at all (it should have been filtered out upstream — nothing to verify OR
+ *  level). */
 function footswitchTarget(f: FootswitchInfo): FootswitchTarget | null {
   // Length-guard rather than `!candidate` — the array index type lies (no
   // noUncheckedIndexedAccess), so the truthiness check reads as "always truthy".
   if (f.level_params.length === 0) return null;
-  return targetFromCandidate(
-    f.switch,
-    f.level_params[defaultParamIndex(f.level_params)],
-  );
+  return verifyFootswitchTarget(f.switch);
 }
 
 // ── setup: one selectable row (Base or an FS scene) ─────────────────────────
@@ -202,6 +279,13 @@ export interface SetupOption {
    *  picker). Present only on footswitch rows; the chosen one is baked into
    *  `footswitch` when the run starts. */
   levelParams?: LevelParamCandidate[];
+  /** Scene rows only: this row's target-mode pick ("match" every scene solves to the
+   *  named target — the default when absent; "offset" preserves the scene's authored
+   *  loudness RELATIONSHIP). Undefined for Base/footswitch rows. */
+  sceneTargetMode?: "match" | "offset";
+  /** Scene rows only: the user's chosen leveling control, INSTEAD of the active amp's
+   *  `outputLevel` — undefined/null = the amp default (every existing caller). */
+  sceneHandle?: SceneHandlePick | null;
 }
 
 /** A chosen setup row + its resolved instrument id and target name (the setup
@@ -290,8 +374,13 @@ export function chosenFrom(
 // of measurement captures — running it again improves it. Backed by
 // `FootswitchLevelResult.unconverged` (footswitch rows only today). Folding it into
 // `clamped` would also feed a non-ceiling into `ceilingOf` → the derived common target.
+//
+// `verified` is a footswitch VERIFY row (no handle chosen): nothing was solved or
+// written, only measured (`FootswitchLevelResult.on_off_delta_lu` is the discriminator
+// — see `useLevelingFlow`'s `outcomeOf`). It must NEVER read as "done" (which would
+// claim a write that never happened).
 export type Outcome =
-  "done" | "clamped" | "unconverged" | "offbranch" | "skipped";
+  "done" | "clamped" | "unconverged" | "offbranch" | "skipped" | "verified";
 
 /** Dynamics-spread flag threshold (LU): short-term-max − integrated above this
  *  marks a DYNAMIC sound — the gated reading understates its peaks vs a
@@ -325,6 +414,18 @@ export interface RunItem {
   outcome?: Outcome;
   /** Measured loudness (verify/predicted), or null. */
   value?: number | null;
+  /** VERIFY footswitch rows ONLY (`outcome === "verified"`): engaged − disengaged
+   *  loudness (LU). Positive = engaging makes the preset louder. Undefined/null for
+   *  every other row — distinct from `value`, which stays the plain measured LUFS. */
+  verifyDeltaLu?: number | null;
+  /** Scene rows in Offset target mode ONLY: how far the effective target was shifted
+   *  from the requested one to preserve the scene's authored loudness relationship
+   *  (LU). `null`/undefined in Match mode or on non-scene rows. */
+  targetOffsetLu?: number | null;
+  /** Scene rows only: this row's target-mode + handle pick, carried from Set up into
+   *  the dispatch (mirrors `SetupOption.sceneTargetMode`/`sceneHandle`). */
+  targetMode?: "match" | "offset";
+  handle?: SceneHandlePick | null;
   /** Dynamics spread of the measure capture (LU); drives the "dynamic" by-ear cause. */
   spreadLu?: number | null;
   /** The preset's saved `presetLevel` before this run wrote it — enables the Summary
@@ -337,9 +438,11 @@ export interface RunItem {
   /** Cause of the "verify by ear" marker (undefined = no flag): `envelope` = the preset
    *  contains an envelope-follower effect, which tracks the synthetic stimulus differently
    *  than real playing (the measurement itself is suspect); `dynamic` = peaks ride
-   *  above the gated average; `rebalance` = shallow lane-mute isolation made the parallel
-   *  balance approximate. Resolved to a single cause when the RunItem is built. */
-  verifyByEar?: "envelope" | "dynamic" | "rebalance";
+   *  above the gated average; `wet_floor` = a footswitch's wet-mix clamp is pinned at the
+   *  25% floor, not headroom (`FootswitchLevelResult.wet_floor`); `rebalance` = shallow
+   *  lane-mute isolation made the parallel balance approximate. Resolved to a single
+   *  cause when the RunItem is built. */
+  verifyByEar?: "envelope" | "dynamic" | "wet_floor" | "rebalance";
   /** The preset's backup-scan silence hint, stamped at item build — refines the
    *  offbranch row status (see `offbranchStatus`). */
   silenceHint?: SilenceHint;
@@ -384,6 +487,30 @@ export function offbranchStatus(hint: SilenceHint | undefined): string {
   return "not on USB 1/2";
 }
 
+/** Verify-row result prose (footswitch rows only, `outcome === "verified"`): a compact
+ *  ON-vs-OFF delta, e.g. "+2.3 LU vs off" / "−1.1 LU vs off" — honest (states direction
+ *  + magnitude) without claiming a write that never happened. Rendered verbatim in
+ *  RunBody + SummaryBody. */
+export function verifyDeltaText(deltaLu: number | null | undefined): string {
+  if (deltaLu == null || !Number.isFinite(deltaLu)) return "verified";
+  return `${signedDb(deltaLu)} LU vs off`;
+}
+
+/** Scene Offset-mode result suffix, e.g. " · kept +1.4 LU" — empty when there's nothing
+ *  to report (Match mode, or a shift too small to matter). Rendered verbatim in RunBody
+ *  + SummaryBody. */
+export function targetOffsetSuffix(
+  offsetLu: number | null | undefined,
+): string {
+  if (
+    offsetLu == null ||
+    !Number.isFinite(offsetLu) ||
+    Math.abs(offsetLu) < 0.05
+  )
+    return "";
+  return ` · kept ${signedDb(offsetLu)} LU`;
+}
+
 /** The sound's preset line — the mono sub-line under its name. Rendered verbatim in
  *  RunBody + SummaryBody, so it lives here rather than being retyped on both. */
 export const presetLine = (it: RunItem): string =>
@@ -415,6 +542,8 @@ export function optionToRunItem(
     instId,
     targetName,
     status: "queued",
+    targetMode: o.sceneTargetMode,
+    handle: o.sceneHandle,
   };
 }
 
@@ -434,6 +563,8 @@ export function runItemToOption(it: RunItem): SetupOption {
     tag: it.tag,
     hasScenes: !it.isBase || it.tag != null,
     footswitch: it.footswitch ?? null,
+    sceneTargetMode: it.targetMode,
+    sceneHandle: it.handle,
   };
 }
 

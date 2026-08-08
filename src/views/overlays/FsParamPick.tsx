@@ -13,16 +13,19 @@
 // DialogCardCtx) so it flips ABOVE near the fixed frame's bottom edge — same machinery
 // as the sibling instrument/target `Pick`.
 
-import { useContext, useLayoutEffect, useRef, useState } from "react";
+import { useContext } from "react";
 
 import { useTheme } from "../../theme/ThemeContext";
 import { Icon } from "../../ui/Icon";
 import { Tag } from "../../ui/Tag";
 import { BlockArt } from "../../ui/BlockArt";
 import { blockArtTile } from "../../models/blockArt";
-import { defaultParamIndex, isLoudnessParam } from "../level/leveling";
+import { defaultParamIndex, paramLabel } from "../level/leveling";
 import { DialogCardCtx } from "./wizardContext";
 import { PickPortalMenu } from "./PickPortalMenu";
+import { usePickAnchor } from "./usePickAnchor";
+import { pickTriggerBorder } from "./pickTriggerChrome";
+import { BlockParamRow, BlockParamWarnNote } from "./BlockParamRow";
 import type { LevelParamCandidate } from "../../lib/types";
 
 export interface FsParamPickProps {
@@ -33,228 +36,69 @@ export interface FsParamPickProps {
   onChange: (i: number) => void;
 }
 
-/** Friendly labels for the technical parameter ids (fallback: capitalize the id). */
-const PARAM_LABELS: Partial<Record<string, string>> = {
-  level: "Level",
-  outputLevel: "Output level",
-  output: "Output",
-  mix: "Mix",
-  volume: "Volume",
-  gain: "Gain",
-  drive: "Drive",
-  tone: "Tone",
-  fuzz: "Fuzz",
-  treble: "Treble",
-  bass: "Bass",
-  presence: "Presence",
-};
-function paramLabel(p: string): string {
-  return PARAM_LABELS[p] ?? (p ? p.charAt(0).toUpperCase() + p.slice(1) : "");
-}
-
-interface Anchor {
-  left: number;
-  below: number;
-  above: number;
-  width: number;
-  cardW: number;
-  cardH: number;
-}
-
 export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
   const { t } = useTheme();
-  const [open, setOpen] = useState(false);
-  const [anchor, setAnchor] = useState<Anchor | null>(null);
-  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
-  // Portal target captured in `openMenu` (an event handler) so render never reads
-  // `ref.current` — mirrors Pick.tsx.
-  const [cardEl, setCardEl] = useState<HTMLDivElement | null>(null);
-  const triggerRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
   const cardRef = useContext(DialogCardCtx);
 
-  // Two-pass: render hidden to measure, then place (clamped horizontally, flipped
-  // above when it would overflow the card bottom). Identical to Pick.
-  useLayoutEffect(() => {
-    if (!open || !anchor || !menuRef.current) return;
-    const mw = menuRef.current.offsetWidth;
-    const mh = menuRef.current.offsetHeight;
-    const left = Math.min(
-      Math.max(8, anchor.left),
-      Math.max(8, anchor.cardW - mw - 8),
-    );
-    let top = anchor.below;
-    if (top + mh > anchor.cardH - 8) top = Math.max(8, anchor.above - mh - 4);
-    setPos({ left, top });
-  }, [open, anchor]);
-
-  const interactive = params.length > 1;
+  // DANGER-rule guard (danger.md's Pick/BlockPick trap): a stored `index` the current
+  // `params` doesn't cover (out of range, or -1 = "no classifiable default yet") must
+  // NEVER silently render as `params[0]` — that showed one control while a different
+  // one (or none) was actually about to be swept. A single un-picked candidate still
+  // forces an explicit click (interactive), not a silent auto-select.
+  const hasSelection = index >= 0 && index < params.length;
+  const interactive = params.length > 1 || !hasSelection;
   const defIdx = defaultParamIndex(params);
 
-  const openMenu = (e: React.MouseEvent) => {
-    if (!interactive) return;
-    e.stopPropagation();
-    const card = cardRef?.current;
-    if (!card || !triggerRef.current) return;
-    const tr = triggerRef.current.getBoundingClientRect();
-    const cr = card.getBoundingClientRect();
-    setAnchor({
-      left: tr.left - cr.left,
-      below: tr.bottom - cr.top + 4,
-      above: tr.top - cr.top,
-      width: tr.width,
-      cardW: cr.width,
-      cardH: cr.height,
-    });
-    setCardEl(card);
-    setPos(null);
-    setOpen(true);
-  };
-  const close = () => {
-    setOpen(false);
-    setPos(null);
-  };
+  const { open, anchor, pos, cardEl, menuRef, triggerRef, openMenu, close } =
+    usePickAnchor(cardRef, { guard: () => interactive });
   const pick = (i: number) => {
     close();
     onChange(i);
   };
 
   if (params.length === 0) return null;
-  const safeIdx = index >= 0 && index < params.length ? index : 0;
-  const cur = params[safeIdx];
-  const curArt = blockArtTile(cur.fender_id);
+  const cur = hasSelection ? params[index] : null;
+  const curArt = cur ? blockArtTile(cur.fender_id) : null;
 
   // Built only while the menu is open — the rows (and their per-candidate
   // `blockArtTile` lookups) are otherwise never rendered.
   const optionRows = open
     ? params.map((c, i) => {
-        const on = i === safeIdx;
+        const on = hasSelection && i === index;
         const rec = i === defIdx;
-        const loud = isLoudnessParam(c.parameter_id);
-        const art = blockArtTile(c.fender_id);
+        // Every candidate the backend offers is already a real (non-"other") loudness
+        // control — only a wet/dry mix ALSO moves the effect's presence, so that's the
+        // one class flagged "may change the tone" rather than "loudness only".
+        const loud = c.class !== "wet_mix";
         return (
-          <div
+          <BlockParamRow
             key={`${c.node_id}:${c.parameter_id}`}
-            onClick={(e) => {
-              e.stopPropagation();
+            art={blockArtTile(c.fender_id)}
+            paramLabel={paramLabel(c.parameter_id)}
+            selected={on}
+            onPick={() => {
               pick(i);
             }}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: t.space5,
-              padding: t.space4,
-              borderRadius: 8,
-              cursor: "pointer",
-              background: on ? t.accentSoft : "transparent",
-            }}
-            onMouseEnter={(e) => {
-              if (!on) e.currentTarget.style.background = t.hover;
-            }}
-            onMouseLeave={(e) => {
-              if (!on) e.currentTarget.style.background = "transparent";
-            }}
-          >
-            <span
-              style={{
-                width: 38,
-                height: 38,
-                flexShrink: 0,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <BlockArt
-                icon={art.icon}
-                tone={art.tone}
-                footswitch={art.footswitch}
-                bodyColor={art.body}
-                panelColor={art.panel}
-                accentColor={art.accent}
-                label={false}
-                size={34}
-              />
-            </span>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "baseline",
-                  gap: t.space4,
-                }}
-              >
-                <span
-                  style={{
-                    fontFamily: t.serif,
-                    fontSize: 14,
-                    color: t.ink,
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {art.fullName ?? art.name}
-                </span>
-                <span style={{ color: t.faint }}>·</span>
+            note={
+              rec ? (
+                <Tag tone="good" uppercase>
+                  Recommended · loudness only
+                </Tag>
+              ) : loud ? (
                 <span
                   style={{
                     fontFamily: t.sans,
-                    fontSize: 12.5,
-                    fontWeight: 500,
-                    color: t.ink2,
-                    whiteSpace: "nowrap",
+                    fontSize: 10.5,
+                    color: t.mutedInk,
                   }}
                 >
-                  {paramLabel(c.parameter_id)}
+                  changes loudness only
                 </span>
-              </div>
-              <div style={{ marginTop: t.space2 }}>
-                {rec ? (
-                  <Tag tone="good" uppercase>
-                    Recommended · loudness only
-                  </Tag>
-                ) : loud ? (
-                  <span
-                    style={{
-                      fontFamily: t.sans,
-                      fontSize: 10.5,
-                      color: t.mutedInk,
-                    }}
-                  >
-                    changes loudness only
-                  </span>
-                ) : (
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: t.space3,
-                      fontFamily: t.sans,
-                      fontSize: 10.5,
-                      color: t.sevWarn,
-                    }}
-                  >
-                    <Icon
-                      name="warn-tri"
-                      size={10}
-                      stroke={t.sevWarn}
-                      strokeWidth={1.7}
-                    />
-                    may change the tone
-                  </span>
-                )}
-              </div>
-            </div>
-            {on && (
-              <span style={{ flexShrink: 0 }}>
-                <Icon
-                  name="check"
-                  size={15}
-                  stroke={t.accentDeep}
-                  strokeWidth={2}
-                />
-              </span>
-            )}
-          </div>
+              ) : (
+                <BlockParamWarnNote>may change the tone</BlockParamWarnNote>
+              )
+            }
+          />
         );
       })
     : [];
@@ -267,9 +111,11 @@ export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
       <div
         onClick={openMenu}
         title={
-          interactive
+          !hasSelection
             ? "Choose which block parameter is leveled"
-            : "Only one option — nothing to choose"
+            : interactive
+              ? "Choose which block parameter is leveled"
+              : "Only one option — nothing to choose"
         }
         style={{
           display: "flex",
@@ -278,7 +124,7 @@ export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
           height: 26,
           padding: `0 ${String(t.space4)}px`,
           boxSizing: "border-box",
-          border: `0.5px solid ${open ? t.accent : t.hairlineStrong}`,
+          border: pickTriggerBorder(t, { open, warn: !hasSelection }),
           borderRadius: 6,
           background: interactive ? t.bg : t.bgAlt,
           cursor: interactive ? "pointer" : "default",
@@ -296,16 +142,25 @@ export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
             justifyContent: "center",
           }}
         >
-          <BlockArt
-            icon={curArt.icon}
-            tone={curArt.tone}
-            footswitch={curArt.footswitch}
-            bodyColor={curArt.body}
-            panelColor={curArt.panel}
-            accentColor={curArt.accent}
-            label={false}
-            size={16}
-          />
+          {cur && curArt ? (
+            <BlockArt
+              icon={curArt.icon}
+              tone={curArt.tone}
+              footswitch={curArt.footswitch}
+              bodyColor={curArt.body}
+              panelColor={curArt.panel}
+              accentColor={curArt.accent}
+              label={false}
+              size={16}
+            />
+          ) : (
+            <Icon
+              name="warn-tri"
+              size={13}
+              stroke={t.sevWarn}
+              strokeWidth={1.7}
+            />
+          )}
         </span>
         <span
           style={{
@@ -313,12 +168,16 @@ export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
             minWidth: 0,
             fontFamily: t.sans,
             fontSize: 11,
-            color: interactive ? t.ink2 : t.mutedInk,
+            color: !hasSelection
+              ? t.sevWarn
+              : interactive
+                ? t.ink2
+                : t.mutedInk,
             overflow: "hidden",
             textOverflow: "ellipsis",
           }}
         >
-          {paramLabel(cur.parameter_id)}
+          {cur ? paramLabel(cur.parameter_id) : "Choose a parameter"}
         </span>
         {interactive && (
           <Icon

@@ -39,6 +39,8 @@ import {
   offbranchStatus,
   presetLine,
   resolvedTargetLufs,
+  targetOffsetSuffix,
+  verifyDeltaText,
   type RunItem,
 } from "../level/leveling";
 
@@ -109,7 +111,10 @@ export function RunBody({
       return `off target · ${fmtLufs(it.value)}`;
     if (it.outcome === "offbranch") return offbranchStatus(it.silenceHint);
     if (it.outcome === "skipped") return "skipped · read failed";
-    return `done · ${fmtLufs(it.value)}`;
+    // VERIFY row — nothing was written, only measured. Never say "done" (that would
+    // claim a write that never happened).
+    if (it.outcome === "verified") return verifyDeltaText(it.verifyDeltaLu);
+    return `done · ${fmtLufs(it.value)}${targetOffsetSuffix(it.targetOffsetLu)}`;
   };
   const resultColor = (it: RunItem): string =>
     it.outcome === "clamped" || it.outcome === "unconverged"
@@ -118,7 +123,9 @@ export function RunBody({
         ? t.warn
         : it.outcome === "skipped"
           ? t.mutedInk
-          : t.good;
+          : it.outcome === "verified"
+            ? t.ink2
+            : t.good;
   const headerTitle = (): string => {
     if (stopping) return "Stopping…";
     if (stopped) return "Leveling stopped";
@@ -318,6 +325,13 @@ export function RunBody({
                           size={13}
                           stroke={t.mutedInk}
                           strokeWidth={2}
+                        />
+                      ) : it.outcome === "verified" ? (
+                        <Icon
+                          name="info"
+                          size={13}
+                          stroke={t.ink2}
+                          strokeWidth={1.7}
                         />
                       ) : (
                         <Icon

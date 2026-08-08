@@ -35,8 +35,18 @@ export interface LibraryScan {
   ampCandidates: Map<number, AmpCandidate[]>;
   /** Per-preset LEVELABLE block-acting footswitches (those with ≥1 level candidate)
    *  keyed by 0-based LIST INDEX — read from the SAME backup, so the list shows the
-   *  footswitch count + the flow levels them with no extra device read. */
+   *  footswitch count + the Level flow levels them with no extra device read. Feeds
+   *  Level's selection tree ONLY — a switch with no level candidate has nothing to
+   *  solve there. Doctor's damage detector needs the FULL roster instead; see
+   *  `allFootswitchesByIndex` below (never filter the feed twice for two different
+   *  reasons under one name). */
   footswitchesPerIndex: Map<number, FootswitchInfo[]>;
+  /** Every per-preset block-acting footswitch — INCLUDING one with zero level
+   *  candidates (e.g. an Other-class-only param, or a plain on/off toggle) — keyed by
+   *  0-based LIST INDEX, from the SAME backup. Doctor's offline force-bypass isolation
+   *  derivation needs every switch that can toggle a block, not just the levelable
+   *  subset; `footswitchesPerIndex` hid an Other-class-only switch from it entirely. */
+  allFootswitchesByIndex: Map<number, FootswitchInfo[]>;
   /** Per-preset block roster (exact node FenderIds) keyed by 0-based LIST INDEX —
    *  read from the same backup. Drives the per-preset CPU total. */
   blocksByIndex: Map<number, string[]>;
@@ -70,6 +80,7 @@ const emptyScan = (): LibraryScan => ({
   sceneInfo: new Map(),
   ampCandidates: new Map(),
   footswitchesPerIndex: new Map(),
+  allFootswitchesByIndex: new Map(),
   blocksByIndex: new Map(),
   graphByIndex: new Map(),
   silenceHintByIndex: new Map(),
@@ -132,6 +143,7 @@ export async function ensureLibraryScan(): Promise<void> {
     const m = new Map<number, SceneInfo[]>();
     const amps = new Map<number, AmpCandidate[]>();
     const fsw = new Map<number, FootswitchInfo[]>();
+    const allFsw = new Map<number, FootswitchInfo[]>();
     const blocks = new Map<number, string[]>();
     const graphs = new Map<number, ActiveGraph>();
     const silence = new Map<number, SilenceHint>();
@@ -140,8 +152,11 @@ export async function ensureLibraryScan(): Promise<void> {
     res.presets.forEach((p) => {
       m.set(p.slot - 1, p.scenes);
       amps.set(p.slot - 1, p.amp_candidates);
-      // Only LEVELABLE footswitches (≥1 level candidate) become rows — one without a
-      // candidate has nothing to solve and would always skip.
+      // Level's selection tree: only LEVELABLE footswitches (≥1 level candidate)
+      // become rows — one without a candidate has nothing to solve and would always
+      // skip. Doctor needs the FULL roster (see `allFootswitchesByIndex`'s doc) — keep
+      // both maps rather than re-filtering the same feed for two different reasons.
+      if (p.footswitches.length > 0) allFsw.set(p.slot - 1, p.footswitches);
       const levelable = p.footswitches.filter((f) => f.level_params.length > 0);
       if (levelable.length > 0) fsw.set(p.slot - 1, levelable);
       blocks.set(
@@ -175,6 +190,7 @@ export async function ensureLibraryScan(): Promise<void> {
       sceneInfo: m,
       ampCandidates: amps,
       footswitchesPerIndex: fsw,
+      allFootswitchesByIndex: allFsw,
       blocksByIndex: blocks,
       graphByIndex: graphs,
       silenceHintByIndex: silence,

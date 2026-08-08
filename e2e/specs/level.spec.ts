@@ -89,11 +89,12 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
   // The mandatory "both scenes and footswitches" case: E2E Reference carries a Base, 2
   // footswitch SCENES (Rhythm/Lead, amp outputLevel) AND block-acting FOOTSWITCHES. Ticking
   // the whole preset sweeps in ALL of them, so the run exercises base (level_preset) +
-  // scene (level_scenes_apply_batched) + footswitch (level_footswitches_apply) leveling in
-  // one preset. Oracle: Set up shows all three row kinds (asserted via their distinct
-  // sub-text), the bake/assign mechanism never leaks, and the run reaches a terminal
-  // Summary. Offline the fake re-amp may clamp scenes/footswitches — that's expected; the
-  // base still solves and the flow completes.
+  // scene (level_scenes_apply_batched) + footswitch (level_footswitches_apply, VERIFY
+  // mode by default — measures ON/OFF delta, writes nothing) leveling in one preset.
+  // Oracle: Set up shows all three row kinds (asserted via their distinct sub-text), the
+  // bake/assign mechanism never leaks, and the run reaches a terminal Summary. Offline the
+  // fake re-amp may clamp scenes — that's expected; the base still solves and the flow
+  // completes.
   test("levels a preset with base + scenes + footswitches end to end", async ({
     page,
   }) => {
@@ -126,8 +127,13 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await expect(
       page.getByText(/levels this scene against/).first(),
     ).toBeVisible(); // a footswitch SCENE
+    // Footswitch rows default to VERIFY-only (measure ON/OFF, write nothing) — the
+    // "evens this footswitch out to your target" copy only appears once a row opts
+    // into LEVEL mode via "Make level-neutral".
     await expect(
-      page.getByText(/evens this footswitch out to your target/).first(),
+      page
+        .getByText(/measures this footswitch.s ON.OFF loudness difference/)
+        .first(),
     ).toBeVisible(); // a block-acting FOOTSWITCH
     // The bake/assign mechanism is never surfaced.
     await expect(page.getByText(/baked|assigned/i)).toHaveCount(0);

@@ -41,6 +41,11 @@ pub struct LevelParamCandidate {
     pub fender_id: String,
     pub parameter_id: String,
     pub current: f64, // base value (the switch-OFF / `valueB` default)
+    /// The classifier's verdict for this param on this block — the wire-carried single
+    /// source of truth for "how should the picker rank/label this control?". Never
+    /// [`crate::param_class::ParamClass::Other`]: [`level_candidates_for_node`] admits only
+    /// params the classifier recognises, so an unrecognised one is not a candidate at all.
+    pub class: crate::param_class::ParamClass,
 }
 
 /// A footswitch that acts on at least one block (on/off or parameter change), with its
@@ -68,10 +73,18 @@ pub struct FootswitchInfo {
 /// (HW-verified fw 1.8.45, accepted by `changeParameter`, ~1:1 dB→LUFS) — params are no
 /// longer all `[0,1]`, so the RANGE now comes from `ParamInfo.range`, never from the
 /// observed value.
-fn is_levelable_param(fender_id: &str, key: &str, val: &Value) -> bool {
-    val.as_f64().is_some()
-        && crate::param_class::classify(fender_id, key).class
-            != crate::param_class::ParamClass::Other
+///
+/// Returns the classifier's verdict on a hit (`Some(class)`, never `Other`) rather than a
+/// bare bool, so [`level_candidates_for_node`] classifies each key exactly ONCE and reuses
+/// the verdict for the candidate's `class` field instead of calling `classify` again.
+fn is_levelable_param(
+    fender_id: &str,
+    key: &str,
+    val: &Value,
+) -> Option<crate::param_class::ParamClass> {
+    val.as_f64()?;
+    let class = crate::param_class::classify(fender_id, key).class;
+    (class != crate::param_class::ParamClass::Other).then_some(class)
 }
 
 /// ONE node's leveling-candidate params, in stable (sorted-key) order — the candidate
@@ -88,13 +101,16 @@ pub fn level_candidates_for_node(
     let mut keys: Vec<&String> = params.keys().collect();
     keys.sort();
     keys.into_iter()
-        .filter(|k| is_levelable_param(fender_id, k, &params[*k]))
-        .map(|k| LevelParamCandidate {
-            group_id: group_id.to_string(),
-            node_id: node_id.to_string(),
-            fender_id: fender_id.to_string(),
-            parameter_id: k.clone(),
-            current: params[k].as_f64().unwrap_or(0.0),
+        .filter_map(|k| {
+            let class = is_levelable_param(fender_id, k, &params[k])?;
+            Some(LevelParamCandidate {
+                group_id: group_id.to_string(),
+                node_id: node_id.to_string(),
+                fender_id: fender_id.to_string(),
+                parameter_id: k.clone(),
+                current: params[k].as_f64().unwrap_or(0.0),
+                class,
+            })
         })
         .collect()
 }

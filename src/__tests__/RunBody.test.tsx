@@ -142,4 +142,18 @@ describe("RunBody columned rows", () => {
     expect(screen.queryByText("done · −24.3")).not.toBeInTheDocument();
     expect(screen.queryByText(/clamped/)).not.toBeInTheDocument();
   });
+
+  // P2: a VERIFY footswitch row wrote nothing — the fallthrough that reports every
+  // unbranched outcome as "done" would falsely claim a write happened.
+  it("states a verified footswitch row as its ON/OFF delta, never done", () => {
+    const verified: RunItem = {
+      ...activeItem,
+      status: "result",
+      outcome: "verified",
+      verifyDeltaLu: 2.3,
+    };
+    render(runBody(null, [verified]));
+    expect(screen.getByText("+2.3 LU vs off")).toBeInTheDocument();
+    expect(screen.queryByText(/^done/)).not.toBeInTheDocument();
+  });
 });

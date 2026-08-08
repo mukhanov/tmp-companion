@@ -13,6 +13,7 @@ import type { InvokeArgs } from "@tauri-apps/api/core";
 
 import { actionableError } from "./connectError";
 import { logError } from "./log";
+import type { FootswitchTarget } from "../views/level/leveling";
 import type {
   AppInfo,
   PresetEntry,
@@ -32,6 +33,7 @@ import type {
   SetlistRecord,
   SongSaveOutcome,
   PresetScenes,
+  SceneHandleRow,
   BackupReadResult,
   CopyJob,
   CopyApplyItem,
@@ -129,14 +131,35 @@ export interface SceneLevelProgressItem {
   message: string | null;
 }
 
+/** A user-chosen scene leveling control (mirrors the backend's `SceneHandleArg`) — the
+ * block param to sweep INSTEAD of the active amp's `outputLevel`. The ONE declaration
+ * (this wire type); `leveling.ts` imports it rather than re-declaring its own copy. */
+export interface SceneHandlePick {
+  groupId: string;
+  nodeId: string;
+  parameterId: string;
+}
+
 /** Batched APPLY path. One backend command levels all selected scenes
  * and streams row progress over a Tauri channel. Each `job` carries its OWN
  * per-scene target (camelCase nested keys, like `levelFootswitchesApply`), so a
  * mixed-target preset still levels in ONE batch. */
+export interface SceneLevelJobWire {
+  sceneSlot: number;
+  targetLufs: number;
+  /** How to read `targetLufs`: "match" (every scene solves to it, the default — an
+   *  omitted key means the same thing) or "offset" (preserve the scene's authored
+   *  loudness RELATIONSHIP to the batch reference). Mirrors `leveller::SceneTargetMode`. */
+  targetMode?: "match" | "offset";
+  /** The user's OWN control for this scene, INSTEAD of the active amp's outputLevel.
+   *  Omitted/null = the amp path (every existing caller). */
+  handle?: SceneHandlePick | null;
+}
+
 export const levelScenesApplyBatched = (
   args: {
     slot: number;
-    jobs: { sceneSlot: number; targetLufs: number }[];
+    jobs: SceneLevelJobWire[];
     candidates: LevelBlockCandidate[];
     save: boolean;
     /** Opt-in: equalize a path-MERGE scene's two lanes before joint-k (no effect on
@@ -156,6 +179,14 @@ export const levelScenesApplyBatched = (
 /** Cooperatively stop an in-flight batched scene-leveling run. */
 export const cancelSceneLeveling = (): Promise<void> =>
   invoke("cancel_scene_leveling");
+
+/** Per-scene handle candidates for the Set-up step's scene control picker — every
+ * FS scene's controls in ONE call, so a scene row's picker fetches lazily (on first
+ * open) and caches per preset rather than firing per row. PURE apart from one field-8
+ * read: no scene is recalled on the unit and nothing is measured. */
+export const listSceneLevelHandles = (
+  slot: number,
+): Promise<SceneHandleRow[]> => invoke("list_scene_level_handles", { slot });
 
 /** One knob's PRE-redistribution value — the Restore anchor. `sceneSlot` null = the base
  * amp (plain write); a number = that FS scene's overlay. Mirrors `commands::PreviousKnob`. */
@@ -231,21 +262,56 @@ export interface FootswitchLevelProgressItem {
 /** Level one or more block-acting footswitches' engaged states for preset `slot`,
  * streaming a progress row per switch. Each `job` picks a switch + the block param to
  * solve. Mirrors `levelScenesApplyBatched`. */
+export interface FootswitchLevelJobWire {
+  switch: number;
+  /** "level" (solve + write the handle below — the default when omitted, today's
+   *  behavior) or "verify" (measure engaged vs disengaged, write nothing). Mirrors
+   *  `FsJobMode`. */
+  mode?: "level" | "verify";
+  /** The leveling handle. Omit ALL THREE for a "verify" row — the backend defaults
+   *  them (never send an empty string; the Rust field is a plain `String`, not
+   *  `Option<String>`, so an explicit `null` fails to deserialize). */
+  levGroupId?: string;
+  levNodeId?: string;
+  levParameterId?: string;
+  targetLufs: number;
+  /** The switch's CURRENT display label (the Level list's row name). The backend
+   * writes it as the switch's `customLabel` when it adds a second function to an
+   * UNLABELLED switch — the unit displays "MULTI" for a multi-function switch with
+   * no label, so this keeps the pedalboard display unchanged. */
+  displayLabel?: string;
+}
+
+/** Build one `levelFootswitchesApply` job from a `FootswitchTarget` — the ONE place
+ * that turns the discriminated union into the wire's optional-field shape. Verified
+ * against `commands::level_footswitch::FootswitchLevelJob`: `lev_group_id`/
+ * `lev_node_id`/`lev_parameter_id` are plain `String`s (not `Option<String>`) with
+ * `#[serde(default)]`, so an explicit `null` FAILS TO DESERIALIZE — a verify-mode
+ * target must omit the three keys entirely, never send them as `null`. */
+export function toFootswitchJobWire(
+  target: FootswitchTarget,
+  targetLufs: number,
+  displayLabel: string,
+): FootswitchLevelJobWire {
+  return {
+    switch: target.switchIndex,
+    mode: target.mode,
+    ...(target.mode === "level"
+      ? {
+          levGroupId: target.levGroupId,
+          levNodeId: target.levNodeId,
+          levParameterId: target.levParameterId,
+        }
+      : {}),
+    targetLufs,
+    displayLabel,
+  };
+}
+
 export const levelFootswitchesApply = (
   args: {
     slot: number;
-    jobs: {
-      switch: number;
-      levGroupId: string;
-      levNodeId: string;
-      levParameterId: string;
-      targetLufs: number;
-      /** The switch's CURRENT display label (the Level list's row name). The backend
-       * writes it as the switch's `customLabel` when it adds a second function to an
-       * UNLABELLED switch — the unit displays "MULTI" for a multi-function switch with
-       * no label, so this keeps the pedalboard display unchanged. */
-      displayLabel?: string;
-    }[];
+    jobs: FootswitchLevelJobWire[];
     save: boolean;
     topologyId: string | null;
     calibrationLufs: number | null;
@@ -509,6 +575,7 @@ export const cmd = {
   redistributeHeadroom,
   restoreRedistribution,
   commonReachableTarget,
+  listSceneLevelHandles,
   // Profiles + store
   getStore,
   saveProfiles,

@@ -57,6 +57,7 @@ function fsw(sw: number, label: string): FootswitchInfo {
         fender_id: "ACD_BluesDriver",
         parameter_id: "gain",
         current: 0.5,
+        class: "level_linear",
       },
     ],
   };

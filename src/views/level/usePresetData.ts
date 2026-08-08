@@ -273,6 +273,9 @@ export function usePresetData(connected: boolean) {
     sceneCount,
     sceneInfo,
     footswitchInfo,
+    /** Every footswitch (incl. Other-class-only, no level candidate) — Doctor's damage
+     *  detector needs the full roster, not the levelable-only `footswitchInfo` list. */
+    allFootswitchInfo: lib.allFootswitchesByIndex,
     ampCandidates: lib.ampCandidates,
     blocksByIndex: lib.blocksByIndex,
     silenceHintByIndex: lib.silenceHintByIndex,

@@ -38,6 +38,7 @@ import {
   redistributeHeadroom,
   restoreRedistribution,
   commonReachableTarget,
+  listSceneLevelHandles,
   levelScenesApplyBatched,
   cancelSceneLeveling,
   cancelPresetLeveling,
@@ -59,6 +60,7 @@ import {
   doctorApply,
   doctorSave,
   doctorDiscard,
+  toFootswitchJobWire,
   cmd,
 } from "../lib/invoke";
 import type {
@@ -66,6 +68,7 @@ import type {
   FootswitchLevelProgressItem,
 } from "../lib/invoke";
 import type { LevelJob } from "../lib/types";
+import type { FootswitchTarget } from "../views/level/leveling";
 
 const pluginErrorMock = vi.mocked(pluginError);
 
@@ -204,6 +207,48 @@ describe("camelCase top-level arg keys (Tauri auto-converts to snake_case)", () 
   it("cancel_scene_leveling invokes the cooperative cancel command", async () => {
     await cancelSceneLeveling();
     expectCall("cancel_scene_leveling", undefined);
+  });
+
+  it("list_scene_level_handles uses slot", async () => {
+    await listSceneLevelHandles(9);
+    expectCall("list_scene_level_handles", { slot: 9 });
+  });
+
+  it("level_scenes_apply_batched jobs carry an optional targetMode + handle", async () => {
+    const onResult = vi.fn<(item: SceneLevelProgressItem) => void>(() => {
+      /* no-op */
+    });
+    await levelScenesApplyBatched(
+      {
+        slot: 5,
+        jobs: [
+          { sceneSlot: 0, targetLufs: -24, targetMode: "offset" },
+          {
+            sceneSlot: 1,
+            targetLufs: -24,
+            handle: { groupId: "G1", nodeId: "ped", parameterId: "volume" },
+          },
+        ],
+        candidates: [],
+        save: false,
+        rebalance: false,
+        topologyId: null,
+        calibrationLufs: null,
+        profileId: null,
+      },
+      onResult,
+    );
+    const [, calledArgs] = invokeMock.mock.calls[0];
+    expect(calledArgs).toMatchObject({
+      jobs: [
+        { sceneSlot: 0, targetLufs: -24, targetMode: "offset" },
+        {
+          sceneSlot: 1,
+          targetLufs: -24,
+          handle: { groupId: "G1", nodeId: "ped", parameterId: "volume" },
+        },
+      ],
+    });
   });
 
   it("redistribute_headroom passes jobs + deficit + a progress channel", async () => {
@@ -393,6 +438,75 @@ describe("camelCase top-level arg keys (Tauri auto-converts to snake_case)", () 
     await cancelFootswitchLeveling();
     expectCall("cancel_footswitch_leveling", undefined);
   });
+
+  it("level_footswitches_apply sends a verify row with mode set and no lev* keys", async () => {
+    const jobs = [{ switch: 2, mode: "verify" as const, targetLufs: -23 }];
+    const onResult = vi.fn<(item: FootswitchLevelProgressItem) => void>(() => {
+      /* no-op */
+    });
+    await levelFootswitchesApply(
+      {
+        slot: 9,
+        jobs,
+        save: false,
+        topologyId: null,
+        calibrationLufs: null,
+        profileId: null,
+      },
+      onResult,
+    );
+    const [, calledArgs] = invokeMock.mock.calls[0];
+    if (calledArgs === undefined) {
+      throw new Error("expected level_footswitches_apply args but got none");
+    }
+    expect(calledArgs).toMatchObject({ jobs });
+    // No lev* keys were invented for the verify row (the backend's `String` fields
+    // would fail to deserialize a `null`, so they must be OMITTED, not nulled).
+    const sentJob = (calledArgs.jobs as Record<string, unknown>[])[0];
+    expect("levGroupId" in sentJob).toBe(false);
+    expect("levNodeId" in sentJob).toBe(false);
+    expect("levParameterId" in sentJob).toBe(false);
+  });
+
+  // `toFootswitchJobWire` — the ONE place `FootswitchTarget` becomes the wire's
+  // optional-field shape (item 5). A `toEqual({..., levGroupId: undefined, ...})`
+  // would pass even with the null-instead-of-missing bug back (`toEqual` treats an
+  // undefined-valued key as absent), so this asserts key ABSENCE directly — the
+  // backend's `lev*` fields are plain `String`s, not `Option<String>`, and FAIL TO
+  // DESERIALIZE an explicit `null`.
+  it("toFootswitchJobWire omits the lev* keys entirely for a verify target", () => {
+    const verify: FootswitchTarget = { mode: "verify", switchIndex: 5 };
+    const wire = toFootswitchJobWire(verify, -23, "Boost");
+    expect(wire).toEqual({
+      switch: 5,
+      mode: "verify",
+      targetLufs: -23,
+      displayLabel: "Boost",
+    });
+    expect("levGroupId" in wire).toBe(false);
+    expect("levNodeId" in wire).toBe(false);
+    expect("levParameterId" in wire).toBe(false);
+  });
+
+  it("toFootswitchJobWire carries the full handle for a level target", () => {
+    const level: FootswitchTarget = {
+      mode: "level",
+      switchIndex: 5,
+      levGroupId: "G1",
+      levNodeId: "amp",
+      levParameterId: "outputLevel",
+    };
+    const wire = toFootswitchJobWire(level, -23, "Boost");
+    expect(wire).toEqual({
+      switch: 5,
+      mode: "level",
+      levGroupId: "G1",
+      levNodeId: "amp",
+      levParameterId: "outputLevel",
+      targetLufs: -23,
+      displayLabel: "Boost",
+    });
+  });
 });
 
 describe("single-struct / nested-payload args (snake_case inside the payload)", () => {
@@ -458,10 +572,10 @@ describe("device-backed song/setlist CRUD (Songs page)", () => {
 });
 
 describe("cmd namespace mirrors the named exports", () => {
-  it("cmd exposes exactly the 37 contract commands", () => {
+  it("cmd exposes exactly the 38 contract commands", () => {
     // Pins the wire-contract surface: bump this when a command is added or removed
     // (the count guards against an accidental export slip in the cmd registry).
-    expect(Object.keys(cmd).length).toBe(37);
+    expect(Object.keys(cmd).length).toBe(38);
   });
 });
 

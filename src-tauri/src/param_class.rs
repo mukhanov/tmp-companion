@@ -1,8 +1,11 @@
 //! Parameter-classification table: annotates block parameters for the leveling
 //! picker and gates which params may be swept for loudness. Single source of
 //! truth is the checked-in `src/models/param-class.json` (repo-root, frontend
-//! `src/`) — parsed once here and mirrored verbatim by
-//! `src/views/level/paramClass.ts` on the TS side, so the two can't drift.
+//! `src/`), parsed once here — Rust is now the ONLY classifier. There used to be
+//! a hand-mirrored TS copy (`src/views/level/paramClass.ts`); it was deleted once
+//! `footswitch::LevelParamCandidate`/`commands::SceneHandleCandidate` started
+//! shipping [`ParamClass`] itself on the wire, so drift is no longer possible —
+//! the frontend reads the verdict off the candidate, it never re-derives one.
 //!
 //! **This table ANNOTATES; it never guesses intent.** A param absent from both
 //! `defaults` and `blockOverrides` classifies as [`ParamClass::Other`] — silence
@@ -79,9 +82,11 @@ use crate::probe_api::scene_jobs::resolve_base_id;
 
 /// How a block parameter may be used by the leveling picker. Serializes to the JSON
 /// table's own spelling (`level_linear` / `level_db` / `wet_mix` / `other`), so a wire
-/// payload carrying a class — the scene handle picker's candidate rows — ships the enum
-/// itself rather than a hand-rolled match that could drift from the table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// payload carrying a class — the scene handle picker's candidate rows and
+/// `footswitch::LevelParamCandidate` — ships the enum itself rather than a hand-rolled
+/// match that could drift from the table. `Deserialize` rides along so structs embedding
+/// it (`LevelParamCandidate` derives both, for its own test fixtures) still compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamClass {
     /// Linear amplitude control (`captured_LUFS = 20*log10(v) + C`).
@@ -299,12 +304,13 @@ mod tests {
         assert_eq!(info.class, ParamClass::Other);
     }
 
-    // Drift gate, mirrored VERBATIM in `paramClass.test.ts`: one canonical id per amp
-    // category `scene_jobs::is_amp_category` names (the TS side re-types that category
-    // list, and neither language can read the other's — so both suites pin the same ids
-    // and a category drift fails one of them). Catalog caveat, recorded honestly: every
-    // "Combo Amps"/"Half Stacks" id in `tmp-model-guide.json` also carries "Amp Heads",
-    // so only a dropped "Amp Heads" or "Bass Amps" category is actually caught today.
+    // One canonical id per amp category `scene_jobs::is_amp_category` names. This USED
+    // to be mirrored verbatim in `paramClass.test.ts`, back when the TS side ran its own
+    // copy of this classifier; that file is gone now that the wire carries `class`
+    // directly (see the module header), so this is the sole pin. Catalog caveat,
+    // recorded honestly: every "Combo Amps"/"Half Stacks" id in `tmp-model-guide.json`
+    // also carries "Amp Heads", so only a dropped "Amp Heads" or "Bass Amps" category is
+    // actually caught today.
     #[test]
     fn amp_volume_bar_covers_every_amp_category_canonical_ids() {
         for amp in [

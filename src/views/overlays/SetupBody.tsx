@@ -19,6 +19,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTheme, useStyles } from "../../theme/ThemeContext";
 import { Icon } from "../../ui/Icon";
 import { Button, Toggle } from "../../ui/primitives";
+import { Tag } from "../../ui/Tag";
 import { BackupAckLabel } from "../../ui/BackupAckLabel";
 import { SetupGroupHeader } from "../../ui/SetupGroupHeader";
 import { PresetOptionRow } from "../../ui/PresetOptionRow";
@@ -28,12 +29,19 @@ import { WizardFooter, WizTitle } from "./WizardShell";
 import { ByEarChip } from "./ByEarChip";
 import { Pick, type PickOption } from "./Pick";
 import { FsParamPick } from "./FsParamPick";
+import { SceneLevelPick } from "./SceneLevelPick";
+import { useSceneHandles } from "../level/useSceneHandles";
 import {
   defaultParamIndex,
   instCalState,
   targetFromCandidate,
+  verifyFootswitchTarget,
 } from "../level/leveling";
-import type { SetupOption, SetupChoice } from "../level/leveling";
+import type {
+  SetupOption,
+  SetupChoice,
+  SceneHandlePick,
+} from "../level/leveling";
 
 export type { SetupChoice };
 
@@ -177,6 +185,91 @@ function CalibrationOnboardingBanner({ show }: { show: boolean }) {
   );
 }
 
+/** A footswitch row's mode cell: VERIFY (default) shows a compact "Verify only" chip
+ *  + a one-click "Make level-neutral" opt-in that reveals the param picker; LEVEL
+ *  shows the picker + a small revert-to-verify affordance. P2's core UX decision:
+ *  a row is only ever WRITTEN once the user has explicitly opted in here — never a
+ *  silent auto-pick-and-write. */
+function FsModeControl({
+  mode,
+  paramsNode,
+  onMakeLevel,
+  onRevertVerify,
+}: {
+  mode: "level" | "verify";
+  paramsNode: ReactNode;
+  onMakeLevel: () => void;
+  onRevertVerify: () => void;
+}) {
+  const { t } = useTheme();
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: t.space3,
+        minWidth: 0,
+      }}
+    >
+      {mode === "verify" ? (
+        <>
+          <Tag tone="neutral">Verify only</Tag>
+          <button
+            type="button"
+            onClick={onMakeLevel}
+            title="Pick a control to solve + write, instead of only measuring the ON/OFF difference"
+            style={{
+              cursor: "pointer",
+              background: "none",
+              border: "none",
+              padding: 0,
+              fontFamily: t.sans,
+              fontSize: 10.5,
+              color: t.accentDeep,
+              textDecoration: "underline",
+              textDecorationStyle: "dotted",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Make level-neutral
+          </button>
+        </>
+      ) : (
+        <>
+          <span style={{ flex: 1, minWidth: 0 }}>{paramsNode}</span>
+          <button
+            type="button"
+            title="Verify only — measure the ON/OFF difference, write nothing"
+            onClick={onRevertVerify}
+            style={{
+              cursor: "pointer",
+              background: "none",
+              border: "none",
+              padding: 0,
+              flexShrink: 0,
+              display: "flex",
+            }}
+          >
+            <Icon name="undo" size={12} stroke={t.mutedInk} />
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** One row's editable choices, keyed by `SetupOption.key`. `param`/`fsMode` are
+ *  footswitch-row-only fields; `targetMode`/`handle` are scene-row-only — undefined
+ *  on a row of the other kind (Base rows carry neither). */
+interface RowChoice {
+  inst: string;
+  target: string;
+  param: number | undefined;
+  fsMode: "level" | "verify" | undefined;
+  targetMode: "match" | "offset" | undefined;
+  handle: SceneHandlePick | null | undefined;
+}
+
 export interface SetupBodyProps {
   /** The exact scenes picked in the list — all of them WILL be leveled. */
   options: SetupOption[];
@@ -252,37 +345,57 @@ export function SetupBody({
     return [...by.values()].sort((a, b) => a.slot - b.slot);
   }, [options]);
 
-  // Per-row instrument + target — the real values that get leveled.
-  const [rowInst, setRowInst] = useState<Record<string, string>>(() => {
-    const m: Record<string, string> = {};
-    options.forEach((o) => (m[o.key] = defaultInst));
-    return m;
-  });
-  const [rowTarget, setRowTarget] = useState<Record<string, string>>(() => {
-    const m: Record<string, string> = {};
-    options.forEach((o) => (m[o.key] = defaultTarget));
-    return m;
-  });
-  const setOneInst = (k: string, v: string) => {
-    setRowInst((p) => ({ ...p, [k]: v }));
-  };
-  const setOneTarget = (k: string, v: string) => {
-    setRowTarget((p) => ({ ...p, [k]: v }));
-  };
-
-  // Which block parameter levels each footswitch (index into the row's `levelParams`).
-  // Seeded with the tone-safe default; only footswitch rows with candidates appear.
-  const [rowParam, setRowParam] = useState<Record<string, number>>(() => {
-    const m: Record<string, number> = {};
+  // One per-row choice map — instrument/target (every row) + the footswitch-only and
+  // scene-only fields, all seeded in one pass and patched with one setter. Replaces
+  // six parallel `Record<string, X>` maps (one seeding loop + setter each): every row
+  // used to be assembled by re-keying into six different objects, which made adding a
+  // 7th field (or reading "the whole row") six times more code than it needed to be.
+  const [rows, setRows] = useState<Partial<Record<string, RowChoice>>>(() => {
+    const m: Partial<Record<string, RowChoice>> = {};
     options.forEach((o) => {
-      if (o.footswitch != null && o.levelParams && o.levelParams.length > 0)
-        m[o.key] = defaultParamIndex(o.levelParams);
+      m[o.key] = {
+        inst: defaultInst,
+        target: defaultTarget,
+        // Footswitch rows: the tone-safe default param index; undefined elsewhere.
+        param:
+          o.footswitch != null && o.levelParams && o.levelParams.length > 0
+            ? defaultParamIndex(o.levelParams)
+            : undefined,
+        // VERIFY is the P2 default; a row only becomes LEVEL once the user clicks
+        // "Make level-neutral" (or a re-level round carried LEVEL forward via
+        // `runItemToOption`).
+        fsMode: o.footswitch != null ? o.footswitch.mode : undefined,
+        // Scene rows: target mode ("match" the default, or "offset" — keep the
+        // scene's authored loudness relationship) + an optional user-chosen control,
+        // both seeded from the option's own carried-forward pick or the defaults.
+        targetMode:
+          o.sceneSlot != null && !o.isBase
+            ? (o.sceneTargetMode ?? "match")
+            : undefined,
+        handle:
+          o.sceneSlot != null && !o.isBase
+            ? (o.sceneHandle ?? null)
+            : undefined,
+      };
     });
     return m;
   });
-  const setOneParam = (k: string, i: number) => {
-    setRowParam((p) => ({ ...p, [k]: i }));
+  const patchRow = (k: string, partial: Partial<RowChoice>) => {
+    setRows((p) => {
+      const cur = p[k];
+      // Every option's key was seeded at mount — an unseeded key is unreachable, but
+      // guard rather than assume so the map's real (possibly-undefined) index type
+      // holds (this tsconfig has no `noUncheckedIndexedAccess`, so the honest guard
+      // has to be written by hand rather than inferred).
+      if (!cur) return p;
+      return { ...p, [k]: { ...cur, ...partial } };
+    });
   };
+
+  // Scene-control candidates: a real device read (`list_scene_level_handles`), so it
+  // is fetched LAZILY — once per PRESET, on the first time any of that preset's scene
+  // rows opens its picker — never eagerly (Set up otherwise does no device reads).
+  const { prefetch: fetchHandlesFor, candidatesFor } = useSceneHandles();
 
   // Bulk-edit selection (which rows the "Apply to" bar writes to). Empty = all.
   const {
@@ -299,17 +412,23 @@ export function SetupBody({
   const [bulkTarget, setBulkTarget] = useState(defaultTarget);
   const applyBulkInst = (v: string) => {
     setBulkInst(v);
-    setRowInst((p) => {
+    setRows((p) => {
       const n = { ...p };
-      targetsForBulk().forEach((k) => (n[k] = v));
+      targetsForBulk().forEach((k) => {
+        const cur = n[k];
+        if (cur) n[k] = { ...cur, inst: v };
+      });
       return n;
     });
   };
   const applyBulkTarget = (v: string) => {
     setBulkTarget(v);
-    setRowTarget((p) => {
+    setRows((p) => {
       const n = { ...p };
-      targetsForBulk().forEach((k) => (n[k] = v));
+      targetsForBulk().forEach((k) => {
+        const cur = n[k];
+        if (cur) n[k] = { ...cur, target: v };
+      });
       return n;
     });
   };
@@ -318,24 +437,40 @@ export function SetupBody({
 
   const start = () => {
     const choices: SetupChoice[] = options.map((o) => {
-      // Bake the chosen candidate into the footswitch row's leveling target; Base +
-      // scene rows pass through unchanged.
+      const row = rows[o.key];
       let option = o;
-      if (o.footswitch != null && o.levelParams && o.levelParams.length > 0) {
-        const idx = rowParam[o.key];
-        if (idx >= 0 && idx < o.levelParams.length)
-          option = {
-            ...o,
-            footswitch: targetFromCandidate(
-              o.footswitch.switchIndex,
-              o.levelParams[idx],
-            ),
-          };
+      if (o.footswitch != null) {
+        // A row is written (LEVEL) only once the user explicitly opted in AND picked a
+        // real candidate; every other case — still VERIFY, or opted in with no valid
+        // pick yet (e.g. an unclassifiable-only candidate list) — stays VERIFY. Never
+        // silently sweep an unpicked/ambiguous parameter.
+        const wantsLevel = row?.fsMode === "level";
+        const idx = row?.param;
+        const picked =
+          wantsLevel &&
+          o.levelParams &&
+          idx != null &&
+          idx >= 0 &&
+          idx < o.levelParams.length
+            ? o.levelParams[idx]
+            : null;
+        option = {
+          ...o,
+          footswitch: picked
+            ? targetFromCandidate(o.footswitch.switchIndex, picked)
+            : verifyFootswitchTarget(o.footswitch.switchIndex),
+        };
+      } else if (o.sceneSlot != null && !o.isBase) {
+        option = {
+          ...o,
+          sceneTargetMode: row?.targetMode ?? "match",
+          sceneHandle: row?.handle ?? null,
+        };
       }
       return {
         option,
-        instId: rowInst[o.key] ?? defaultInst,
-        targetName: rowTarget[o.key] ?? defaultTarget,
+        instId: row?.inst ?? defaultInst,
+        targetName: row?.target ?? defaultTarget,
       };
     });
     if (choices.length) onStart(choices);
@@ -423,12 +558,19 @@ export function SetupBody({
           >
             <SetupGroupHeader slot={g.slot} name={g.name} />
             {g.opts.map((o) => {
+              const row = rows[o.key];
               const tag = o.isBase ? (o.hasScenes ? "BASE" : null) : o.tag;
               const nameLabel = o.isBase ? "Whole preset" : o.sceneName;
+              const fsMode =
+                o.footswitch != null
+                  ? (row?.fsMode ?? o.footswitch.mode)
+                  : null;
               const sub = o.isBase
                 ? "levels this preset against the others"
                 : o.footswitch != null
-                  ? "evens this footswitch out to your target"
+                  ? fsMode === "level"
+                    ? "evens this footswitch out to your target"
+                    : "measures this footswitch's ON/OFF loudness difference"
                   : "levels this scene against the preset’s base";
               return (
                 <PresetOptionRow
@@ -444,16 +586,44 @@ export function SetupBody({
                   title="Tick to bulk-edit this row with the bar above"
                   columns="132px 108px 108px"
                 >
-                  {/* Footswitch rows: choose which block parameter to level. Base +
-                      scene rows keep the column empty so the pickers stay aligned. */}
+                  {/* Footswitch rows: verify-only by default, with a "Make level-
+                      neutral" opt-in that reveals the param picker. Scene rows: the
+                      target-mode + control picker. Base rows keep the column empty
+                      so the pickers stay aligned. */}
                   {o.footswitch != null &&
                   o.levelParams &&
                   o.levelParams.length > 0 ? (
-                    <FsParamPick
-                      params={o.levelParams}
-                      index={rowParam[o.key]}
-                      onChange={(i) => {
-                        setOneParam(o.key, i);
+                    <FsModeControl
+                      mode={fsMode ?? "verify"}
+                      paramsNode={
+                        <FsParamPick
+                          params={o.levelParams}
+                          index={row?.param ?? -1}
+                          onChange={(i) => {
+                            patchRow(o.key, { param: i });
+                          }}
+                        />
+                      }
+                      onMakeLevel={() => {
+                        patchRow(o.key, { fsMode: "level" });
+                      }}
+                      onRevertVerify={() => {
+                        patchRow(o.key, { fsMode: "verify" });
+                      }}
+                    />
+                  ) : o.sceneSlot != null && !o.isBase ? (
+                    <SceneLevelPick
+                      targetMode={row?.targetMode ?? "match"}
+                      onTargetModeChange={(m) => {
+                        patchRow(o.key, { targetMode: m });
+                      }}
+                      handle={row?.handle ?? null}
+                      onHandleChange={(h) => {
+                        patchRow(o.key, { handle: h });
+                      }}
+                      candidates={candidatesFor(o.slot, o.sceneSlot)}
+                      onOpen={() => {
+                        fetchHandlesFor(o.slot);
                       }}
                     />
                   ) : (
@@ -461,19 +631,19 @@ export function SetupBody({
                   )}
                   <Pick
                     grow
-                    value={rowInst[o.key] ?? defaultInst}
+                    value={row?.inst ?? defaultInst}
                     options={instrumentOptions}
                     onChange={(v) => {
-                      setOneInst(o.key, v);
+                      patchRow(o.key, { inst: v });
                     }}
                   />
                   <Pick
                     grow
                     tid={`target:${g.name}`}
-                    value={rowTarget[o.key] ?? defaultTarget}
+                    value={row?.target ?? defaultTarget}
                     options={targetOptions}
                     onChange={(v) => {
-                      setOneTarget(o.key, v);
+                      patchRow(o.key, { target: v });
                     }}
                   />
                 </PresetOptionRow>

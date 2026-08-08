@@ -50,6 +50,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
     sceneCount,
     sceneInfo,
     footswitchInfo,
+    allFootswitchInfo,
     silenceHintByIndex,
     graphByIndex,
     scan,
@@ -68,7 +69,12 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
   const flow = useDoctorFlow({
     store,
     graphByIndex,
-    footswitchesByIndex: footswitchInfo,
+    // The FULL footswitch roster (incl. Other-class-only switches) — the damage
+    // detector's offline force-bypass derivation needs every switch that can toggle a
+    // block, not just `footswitchInfo`'s levelable-only subset (that one still drives
+    // the SELECT list below, where a non-levelable FS row has nothing to diagnose as
+    // its own sound).
+    footswitchesByIndex: allFootswitchInfo,
   });
 
   // The run recalls presets on the unit — remember the player's live slot so

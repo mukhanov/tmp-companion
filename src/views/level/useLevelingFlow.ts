@@ -28,6 +28,7 @@ import {
   redistributeHeadroom,
   restoreRedistribution,
   commonReachableTarget,
+  toFootswitchJobWire,
   type CeilingArg,
   type PreviousKnob,
 } from "../../lib/invoke";
@@ -126,6 +127,15 @@ interface LevelOutcomeFields {
   /** Footswitch rows only — `LevelResult` (preset/scene) has no such field, so it stays
    *  optional and those lanes simply never report an unconverged row. */
   unconverged?: boolean;
+  /** Footswitch VERIFY rows ONLY: engaged − disengaged loudness (LU) — see
+   *  `FootswitchLevelResult.on_off_delta_lu`. Its presence IS the verify discriminator
+   *  (a LEVEL row and every scene/preset row never carry it). */
+  on_off_delta_lu?: number | null;
+  /** Footswitch rows only: the clamp's pinned bound is the wet/mix floor, not headroom —
+   *  see `FootswitchLevelResult.wet_floor`. */
+  wet_floor?: boolean;
+  /** Scene rows in Offset target mode only — see `LevelResult.target_offset_lu`. */
+  target_offset_lu?: number | null;
 }
 
 // A `clamp_reason` is set ONLY when the leveled signal isn't effectively reaching the USB 1/2
@@ -135,26 +145,37 @@ interface LevelOutcomeFields {
 // A plain headroom/authority clamp (the knob has real effect but can't reach target) has
 // `clamped` set with NO reason → "clamped at X". `unconverged` is last of the miss states
 // (the backend's own precedence): it is only ever set when `clamped` is not, and it means
-// the knob had room left, so a re-run helps.
+// the knob had room left, so a re-run helps. `on_off_delta_lu` wins over everything else —
+// its PRESENCE is the backend's own verify discriminator (see
+// `FootswitchLevelResult.on_off_delta_lu`'s doc), so a verify row is never mistaken for a
+// solved "done" (which would claim a write that never happened).
 const outcomeOf = (r: LevelOutcomeFields): RunItem["outcome"] =>
-  r.clamp_reason != null
-    ? "offbranch"
-    : r.clamped
-      ? "clamped"
-      : r.unconverged
-        ? "unconverged"
-        : "done";
+  r.on_off_delta_lu != null
+    ? "verified"
+    : r.clamp_reason != null
+      ? "offbranch"
+      : r.clamped
+        ? "clamped"
+        : r.unconverged
+          ? "unconverged"
+          : "done";
 const valueOf = (r: LevelOutcomeFields): number =>
   r.verify_lufs ?? r.predicted_lufs;
 // Resolve to a SINGLE by-ear cause. If a row is both dynamic AND rebalance-uncertain (rare —
 // rebalance is opt-in), "dynamic" wins INTENTIONALLY: it's the primary, more common ear-check
-// signal. Each row resolves to one cause; the summary footnote counts whichever each resolved to.
+// signal. `wet_floor` ranks between them: it's definitionally a CLAMP cause (why the row
+// stopped where it did), not a measurement-quality flag like `dynamic`, but it only ever
+// rides on a footswitch row, which never sets `verify_by_ear` (scene-only) — so the two
+// can't actually collide in practice. Each row resolves to one cause; the summary footnote
+// counts whichever each resolved to.
 const byEarCause = (r: LevelOutcomeFields): RunItem["verifyByEar"] =>
   (r.dynamic_spread_lu ?? 0) >= DYNAMIC_SPREAD_LU
     ? "dynamic"
-    : r.verify_by_ear
-      ? "rebalance"
-      : undefined;
+    : r.wet_floor
+      ? "wet_floor"
+      : r.verify_by_ear
+        ? "rebalance"
+        : undefined;
 
 /** A run row that levels via amp `outputLevel` in scene mode — not Base (`presetLevel`), not
  *  a block-acting footswitch. The run loop batches these; redistribution compensates them. */
@@ -396,6 +417,8 @@ export function useLevelingFlow({
             entry.item.activeMessage = null;
             entry.item.outcome = outcomeOf(result);
             entry.item.value = valueOf(result);
+            entry.item.verifyDeltaLu = result.on_off_delta_lu ?? null;
+            entry.item.targetOffsetLu = result.target_offset_lu ?? null;
             entry.item.spreadLu = result.dynamic_spread_lu;
             entry.item.verifyByEar = causeOf(result);
             finishItem(entry.item, entry.idx);
@@ -520,23 +543,15 @@ export function useLevelingFlow({
             await levelFootswitchesApply(
               {
                 slot: it.slot,
-                jobs: group.flatMap((g) =>
-                  g.footswitch != null
-                    ? [
-                        {
-                          switch: g.footswitch.switchIndex,
-                          levGroupId: g.footswitch.levGroupId,
-                          levNodeId: g.footswitch.levNodeId,
-                          levParameterId: g.footswitch.levParameterId,
-                          targetLufs: targetOf(g),
-                          // The row name IS the switch's current display label
-                          // (`footswitchName`) — sent so the backend can keep it when
-                          // an assign adds a second function to an unlabelled switch.
-                          displayLabel: g.sceneName,
-                        },
-                      ]
-                    : [],
-                ),
+                jobs: group.flatMap((g) => {
+                  if (g.footswitch == null) return [];
+                  // The row name IS the switch's current display label
+                  // (`footswitchName`) — sent so the backend can keep it when an
+                  // assign adds a second function to an unlabelled switch.
+                  return [
+                    toFootswitchJobWire(g.footswitch, targetOf(g), g.sceneName),
+                  ];
+                }),
                 save: true,
                 topologyId: profile?.topology_id ?? null,
                 calibrationLufs: profile?.calibration_lufs ?? null,
@@ -583,7 +598,13 @@ export function useLevelingFlow({
             ampBlocks(await listLevelBlocks(it.slot));
           candCache.set(it.slot, cands);
         }
-        if (cands.length === 0) {
+        // A row that names its own control (`handle`) needs no amp candidate — mirrors
+        // the backend's own mixed-batch guard (`level_scenes_apply_batched`'s doc). Only
+        // bail LOCALLY (no device call at all) when NOBODY in the group has a handle;
+        // a mixed group still dispatches, and the backend reports the amp-needing rows
+        // skipped individually via the progress channel.
+        const groupHasHandle = group.some((g) => g.handle != null);
+        if (cands.length === 0 && !groupHasHandle) {
           group.forEach((g, k) => {
             g.outcome = "skipped";
             finishItem(g, i + k);
@@ -606,9 +627,16 @@ export function useLevelingFlow({
           await levelScenesApplyBatched(
             {
               slot: it.slot,
+              // Unlike the footswitch job's `lev*` fields (plain `String`s that reject an
+              // explicit `null`), `targetMode`/`handle` are `Option`/serde-defaulted on the
+              // Rust side — an `undefined` value here is simply OMITTED by JSON
+              // serialization (never sent as `null`), so a plain field assignment reaches
+              // the same wire shape as the old conditional spread.
               jobs: group.map((g) => ({
                 sceneSlot: g.sceneSlot ?? 0,
                 targetLufs: targetOf(g),
+                targetMode: g.targetMode,
+                handle: g.handle,
               })),
               candidates: cands,
               save: true,

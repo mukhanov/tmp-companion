@@ -45,13 +45,24 @@ export interface FootswitchFn {
   is_active: boolean;
 }
 
-/** A continuous block parameter the leveler can target (`footswitch::LevelParamCandidate`). */
+/** The classifier's verdict (mirrors `param_class::ParamClass`'s serialized snake_case
+ * spelling). Shared by every wire shape that carries a class — never "other" on the wire:
+ * both `LevelParamCandidate` and `SceneHandleCandidate` are built by
+ * `footswitch::level_candidates_for_node`, which admits only params the classifier
+ * recognises, so an unrecognised one is not a candidate at all. */
+export type ParamClass = "level_linear" | "level_db" | "wet_mix";
+
+/** A continuous block parameter the leveler can target (`footswitch::LevelParamCandidate`).
+ * `class` is the wire-carried single source of truth for ranking/labeling a control — the
+ * frontend must NOT re-derive it (there is no local classifier mirror; see `paramClass`
+ * removal history). */
 export interface LevelParamCandidate {
   group_id: string;
   node_id: string;
   fender_id: string;
   parameter_id: string;
   current: number;
+  class: ParamClass;
 }
 
 /** A block-acting footswitch (on/off + parameter change) with its leveling-candidate
@@ -145,6 +156,12 @@ export interface LevelResult {
    * does NOT hold the value this result reports (do not trust the number);
    * false = re-read and confirmed; null = not checked. */
   persist_mismatch: boolean | null;
+  /** Scene rows in `SceneTargetMode.Offset` ONLY: how far this scene's effective target
+   * was shifted from the requested one to preserve its authored loudness relationship
+   * (LU) — `target_lufs` above is already the shifted value; this says by how much (the
+   * frontend can't derive it, since its own requested number was shifted again by the
+   * playback offset before the run). Null everywhere else (incl. `Match` mode). */
+  target_offset_lu: number | null;
 }
 
 /** Result of leveling one block-acting footswitch's engaged state
@@ -180,6 +197,16 @@ export interface FootswitchLevelResult {
   dynamic_spread_lu: number | null;
   /** `"baked"` (value written onto the block) or `"assigned"` (param-change function written). */
   method: string;
+  /** Post-save param-level verify (see `verify_fs_persisted_writes`): true = the saved
+   * preset does NOT hold the value this result reports (do not trust the number);
+   * false = re-read and confirmed; null = not checked (no save, nothing written, the
+   * re-read failed, or a VERIFY row, which never writes). */
+  persist_mismatch: boolean | null;
+  /** VERIFY rows ONLY: engaged loudness MINUS disengaged loudness (LU) — how much this
+   * switch changes the sound, measured with nothing written. Null on every LEVEL row,
+   * which is also the discriminator: a verify row always carries a delta, never a write
+   * (`saved: false`, `final_value` unchanged). Positive = engaging makes it louder. */
+  on_off_delta_lu: number | null;
 }
 
 /** Result of leveling a whole setlist to one common target
@@ -187,6 +214,43 @@ export interface FootswitchLevelResult {
 export interface SetlistResult {
   target_lufs: number;
   results: LevelResult[];
+}
+
+/** One control a scene row could be leveled on (mirrors `commands::SceneHandleCandidate`,
+ * camelCase wire form — the struct's own `#[serde(rename_all = "camelCase")]`). Block
+ * DISPLAY info is groupId/nodeId/fenderId only — the frontend resolves the friendly name
+ * from the models catalog, same split as the amp candidates the Level view already sends. */
+export interface SceneHandleCandidate {
+  groupId: string;
+  nodeId: string;
+  fenderId: string;
+  parameterId: string;
+  /** The classifier's verdict. Never "other" — the backend only offers params it
+   * recognises as a candidate at all. */
+  class: ParamClass;
+  /** The param's usable [lo, hi] — NOT always [0,1] (e.g. ACD_Boost.gain is raw dB over
+   * [0,12]). For a wet_mix the low bound is already raised to the wet floor. */
+  range: [number, number];
+  /** The value AUTHORED IN THAT SCENE (overlay if present, else base). */
+  current: number;
+  /** Does writing this control in THIS scene affect ONLY this scene?
+   * "isolated" — the write stays here (an overlay exists, or Scene Edit will make one).
+   * "shared_with_base" — the node's Scene Edit is off, so this scene reads the BASE knob
+   *   and a write would change every scene sharing it. The backend REFUSES such a write —
+   *   disable selection, but keep it visible with the reason.
+   * "unknown" — the saved read couldn't answer (a truncated scenes tail); refused too. */
+  scope: "isolated" | "shared_with_base" | "unknown";
+  /** "full" = room in both directions. "lowers_only" = already at (or within a whisker
+   * of) the top of its range — this handle can only make the scene QUIETER. */
+  headroom: "full" | "lowers_only";
+}
+
+/** The handle candidates for ONE scene (mirrors `commands::SceneHandleRow`). */
+export interface SceneHandleRow {
+  /** 0-based `scenes[]` wire index — FS scenes only (base handles are the preset lane's
+   * own picker, `list_level_blocks`). */
+  sceneSlot: number;
+  candidates: SceneHandleCandidate[];
 }
 
 /** A level-type block control discoverable from a preset
