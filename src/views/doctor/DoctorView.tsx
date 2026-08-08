@@ -50,6 +50,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
     sceneCount,
     sceneInfo,
     footswitchInfo,
+    silenceHintByIndex,
     graphByIndex,
     scan,
     togglePreset,
@@ -180,6 +181,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
         footswitchInfo={footswitchInfo}
         graphByIndex={graphByIndex}
         stimulusByKey={stimulusByKey}
+        silenceHintByIndex={silenceHintByIndex}
         onCheckMore={handleCheckMore}
       />
     );

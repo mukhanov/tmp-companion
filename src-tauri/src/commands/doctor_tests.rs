@@ -86,6 +86,7 @@ fn doctor_footswitch_is_optional_and_echoes_to_result() {
         band_labels: Vec::new(),
         cut_through: None,
         error: None,
+        skipped_band_count: 0,
     };
     let v = serde_json::to_value(&row).unwrap();
     assert_eq!(v["footswitch"], 0);
@@ -116,6 +117,7 @@ fn doctor_sound_result_cut_through_serializes_camel_case() {
             advisory: false,
         }),
         error: None,
+        skipped_band_count: 0,
     };
     let v = serde_json::to_value(&row).unwrap();
     assert_eq!(v["cutThrough"]["contrastDb"], 12.5);
@@ -332,6 +334,113 @@ fn floor_error_for_disarms_on_a_near_stationary_stimulus() {
     // stimulus spread ≤ STATIONARY_STIM_LU (0.30) can't discriminate by spread —
     // the guard must not fire even though the capture itself reads flat.
     assert_eq!(floor_error_for(0.01, 0.2), None);
+}
+
+// --- skipped_band_count: fix P3-4, SNR-gate transparency ---
+
+#[test]
+fn skipped_band_count_counts_false_entries() {
+    assert_eq!(skipped_band_count(Some(&[true, true, true])), 0);
+    assert_eq!(skipped_band_count(Some(&[true, false, true, false])), 2);
+    assert_eq!(skipped_band_count(Some(&[false, false])), 2);
+}
+
+#[test]
+fn skipped_band_count_absent_coverage_reads_zero() {
+    // No coverage computed at all (errored/showcase sound) reads as 0, not
+    // "everything gated".
+    assert_eq!(skipped_band_count(None), 0);
+}
+
+// --- resolve_sound_isolation: fix P3-1, scenes ride their saved overlay state ---
+
+#[test]
+fn resolve_sound_isolation_never_writes_for_a_scene_sound() {
+    // A scene sound must get NO force-bypass write — graph present (the bug: it
+    // used to route through `derived_force_bypass` with the base-forcing shape,
+    // `fs=None`, identical to the base isolation) AND graph absent (already
+    // correct pre-fix, must stay so). Base/footswitch are untouched by this fix
+    // and are covered by the `doctor_force_bypass`/`derived_force_bypass` tests
+    // elsewhere in this file.
+    let (preset, infos) = iso_ab_fixture();
+    let nodes = nodes_from(&preset);
+    let mut cache = std::collections::HashMap::new();
+    assert!(resolve_sound_isolation(&nodes, &infos, Some(0), None, 5, &mut cache).is_empty());
+    // Graph absent too — the pre-existing empty-nodes behavior for scenes.
+    assert!(resolve_sound_isolation(&[], &infos, Some(0), None, 5, &mut cache).is_empty());
+}
+
+// --- bypass_only_conflict: fix P3-2, refuse a scene-context write that would leak to base ---
+
+/// A minimal preset carrying one node (`ampA`/`ACD_TwinReverb`, group G1) with
+/// scene 0's overlay set to `overlay_params` — the ONE fixture shape
+/// `scene_overlay` itself is pinned against, shared from its own test module.
+use crate::probe_api::scene_jobs::scene_jobs_tests::with_scene0_overlay as preset_with_scene0_overlay;
+
+fn param_op(node_id: &str) -> doctor::DoctorOp {
+    doctor::DoctorOp::Param {
+        group_id: "G1".to_string(),
+        node_id: node_id.to_string(),
+        param: "outputLevel".to_string(),
+        value: 0.6,
+    }
+}
+
+#[test]
+fn bypass_only_conflict_refuses_on_a_bypass_only_overlay() {
+    // scene 0's overlay carries ONLY the bypass family — Scene Edit is OFF, the
+    // node's knobs are shared with base (`SceneWriteVerdict::Refuse`).
+    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
+    let ops = vec![param_op("ampA")];
+    let reason = bypass_only_conflict(&preset, 0, &ops).expect("BypassOnly refuses");
+    assert!(reason.contains("ampA"));
+}
+
+#[test]
+fn bypass_only_conflict_allows_a_full_overlay() {
+    // scene 0's overlay carries a real knob alongside bypass — Scene Edit is ON,
+    // the write lands in the overlay, not base (`SceneWriteVerdict::WriteDirect`).
+    let preset =
+        preset_with_scene0_overlay(serde_json::json!({ "bypass": false, "outputLevel": 0.2 }));
+    let ops = vec![param_op("ampA")];
+    assert_eq!(bypass_only_conflict(&preset, 0, &ops), None);
+}
+
+#[test]
+fn bypass_only_conflict_ignores_insert_node_ops() {
+    // InsertNode is never scene-scoped (block topology is shared across every
+    // scene) — a BypassOnly overlay on an unrelated node must not block it.
+    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
+    let ops = vec![doctor::DoctorOp::InsertNode {
+        group_id: "G1".to_string(),
+        before_fender_id: None,
+        fender_id: "ACD_TenBandEQStereo".to_string(),
+        params: Vec::new(),
+    }];
+    assert_eq!(bypass_only_conflict(&preset, 0, &ops), None);
+}
+
+#[test]
+fn bypass_only_conflict_refuses_on_an_absent_overlay_too() {
+    // Fix P3-2 widening: scene 1 of the fixture carries NO overlay for "ampA" at
+    // all (`SceneOverlay::Absent` → `SceneWriteVerdict::NeedsEnable`) — Doctor has
+    // no enable/repair pass, so this now refuses too instead of leaking to base
+    // (previously a prose-only, unenforced limitation).
+    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
+    let ops = vec![param_op("ampA")];
+    let reason = bypass_only_conflict(&preset, 1, &ops).expect("Absent overlay refuses");
+    assert!(reason.contains("ampA"));
+}
+
+#[test]
+fn bypass_only_conflict_refuses_on_an_unknown_overlay() {
+    // No `scenes` array at all (mirrors a truncated field-8 read — 22/25 real
+    // presets read "scenes unknown") — `scene_write_verdict` can't tell Absent
+    // from a cut, so it refuses rather than risk either write shape.
+    let preset = serde_json::json!({});
+    let ops = vec![param_op("ampA")];
+    let reason = bypass_only_conflict(&preset, 0, &ops).expect("Unknown overlay refuses");
+    assert!(reason.contains("ampA"));
 }
 
 // --- doctor_apply BEFORE-clip cache ---

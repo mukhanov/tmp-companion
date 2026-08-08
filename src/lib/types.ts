@@ -875,6 +875,13 @@ export interface DoctorSoundResult {
   cutThrough: CutThrough | null;
   /** Set when this sound's capture failed (no diags then); the run continued. */
   error: string | null;
+  /** How many bands the SNR gate dropped as too quiet to trust — some checks
+   *  were silently skipped for lack of signal, not because the tone measured
+   *  clean. `> 0` IS "gated"; no separate bool rides alongside this. Required
+   *  (not `?`): the wire always sends it, and the DoctorResults.test.tsx
+   *  fixture factories (`baseSound`/`singlePresetResult`) default it, so a
+   *  backend rename here is a type error, not a silent `undefined`. */
+  skippedBandCount: number;
 }
 
 export interface DoctorSceneDeltaRow {
@@ -892,10 +899,30 @@ export interface DoctorSceneConsistency {
   rx: DoctorRx[];
 }
 
+/** A leveling-damage kind (`doctor::LevelingDamageKind`). */
+export type DoctorLevelingDamageKind = "deletedEffect" | "sweptOther";
+
+/** One footswitch `param` assignment matching a leveling-damage signature
+ * (`doctor::LevelingDamageHint`) — backup-scan sourced, zero device captures.
+ * Advisory only: Doctor names the observed fact, no prescribed fix. */
+export interface DoctorLevelingDamageHint {
+  switch: number;
+  label: string;
+  nodeId: string;
+  fenderId: string;
+  parameterId: string;
+  kind: DoctorLevelingDamageKind;
+  detail: string;
+}
+
 export interface DoctorPresetResult {
   listIndex: number;
   sounds: DoctorSoundResult[];
   sceneConsistency: DoctorSceneConsistency | null;
+  /** Backup-scan-only advisories — see `DoctorLevelingDamageHint`. Required
+   *  (not `?`): the wire always sends this (possibly `[]`), and the
+   *  `singlePresetResult` test fixture factory defaults it. */
+  levelingDamage: DoctorLevelingDamageHint[];
 }
 
 export interface DoctorCheckResult {
