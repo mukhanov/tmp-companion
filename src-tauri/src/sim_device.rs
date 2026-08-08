@@ -33,6 +33,25 @@
 //! ASSIGN edits do NOT round-trip through a save; `SavedDoc`'s doc comment has the
 //! deviation rationale). See `saved_levels`' field doc for the exact read/load asymmetry.
 //!
+//! **Scene recall semantics (HW-verified fw 1.8.45, this week):** a `loadScene` recall
+//! merges the scene's JSON overlay onto base PER PARAM, not per node — a FULL overlay
+//! masks base for every param it lists, but a bypass-only overlay (`{bypass: …}`) masks
+//! ONLY `bypass`; every other param renders base, with NO retention from whatever scene
+//! was recalled before ([`SimState::rendered_param`] / [`SimState::rendered_bypass`],
+//! resolved fresh on every call, never cached). `scenes[].ftswStates` is a DERIVED CACHE
+//! the real device ignores on recall — the sim never reads that key either, deriving a
+//! footswitch's active state from the materialized block-bypass state alone. A
+//! `changeParameter` write accepts RAW values outside `[0,1]` (dB-calibrated params like
+//! `ACD_Boost.gain`) with no clamp. And a scene-context write with no preceding
+//! `setNodeSceneEdit(enable=true)` lands on BASE only when the node's overlay in that scene
+//! is NOT Full-shaped (BypassOnly, empty, or absent — Scene Edit disabled/never
+//! materialized); against a Full-shaped overlay it lands ON the overlay EVEN FOR a param
+//! the overlay doesn't yet carry, extending it per-param with siblings and base untouched
+//! (HW-verified fw 1.8.45, crafted Full-partial overlay — see `overlay_is_full_shaped`'s
+//! doc). The Scene-Edit flag state decides the landing, never per-param containment
+//! (`F_CHANGE_PARAMETER`'s `landing_scene`). See `scene_context_tests` for the pinning
+//! tests, one per fact.
+//!
 //! [`Session`]: crate::session::Session
 //! [`HidTransport`]: crate::hid::HidTransport
 
@@ -176,6 +195,21 @@ struct SimState {
     /// overrides it for a test that needs a specific pre-edit roster (e.g. to exercise
     /// an over-cap refusal).
     preset_json: String,
+    /// Lazy cache of a parsed [`SimState::scene_render_json_source`], shared by
+    /// `overlay_is_full_shaped` (every scene-context `changeParameter` on the live dispatch
+    /// path) and the two `#[cfg(test)]` renderers — each used to clone the source string and
+    /// re-parse it on every call. INVALIDATED (set back to `None`) at every WIRE-DRIVEN point
+    /// the SOURCE STRING can change: `F_LOAD_PRESET` (a slot change picks a different e2e
+    /// scenario doc) and [`SimDevice::with_preset_json`] (the plain-build override). A save
+    /// does NOT invalidate it — `record_save`/`with_patched_doc` patch the ECHOED text
+    /// (`current_preset_data_changed`), never `scene_render_json_source`'s own raw scenario
+    /// read. `current_scene` does NOT invalidate it either — the cache is the un-recalled
+    /// document; scene selection is applied fresh on every read via
+    /// [`crate::probe_api::scene_jobs::scene_overlay`]. A test that pokes `current_slot`
+    /// directly on a live `SimState` (bypassing `F_LOAD_PRESET`) — e.g. `physics_tests` —
+    /// must clear this itself if it exercises the cache; today none of those tests do
+    /// (they only reach `model_lufs`, which never reads this field).
+    parsed_preset_cache: Option<serde_json::Value>,
 
     // ── DSP state for the offline physics-faithful capture model (`e2e_capture`) ──
     // Pure state writes updated by the wire setters below; the setters echo nothing
@@ -210,6 +244,23 @@ struct SimState {
     /// `bypass`. Drives the off-branch verdict: a switch that bypasses the sidecar's
     /// `routedNode` mutes the routed sound → silence. Cleared on `loadPreset`.
     bypass_writes: HashMap<String, bool>,
+    /// `(scene, group, node)` triples that have had `setNodeSceneEdit(enable=true)` sent
+    /// THIS session, since the last `loadPreset` — the gate `F_CHANGE_PARAMETER` checks
+    /// before routing a scene-context write onto BASE instead of the scene (HW fw
+    /// 1.8.45, module header): a write against a node with NO recorded enable, whose
+    /// scene overlay is not Full-shaped, lands on base rather than extending the overlay.
+    /// Scene-keyed only (base writes never consult this set). Cleared on `loadPreset`,
+    /// same as `param_writes`/`bypass_writes`.
+    ///
+    /// KNOWN OFFLINE DIVERGENCE: on hardware a Scene-Edit enable does NOT survive a
+    /// reconnect (session-scoped, like the re-amp toggle and the loaded scene itself),
+    /// but this set lives on `SimState`, which this fake's `Arc<Mutex<_>>` persists
+    /// ACROSS `Session` instances — the sim has no transport-level "new connection"
+    /// signal distinct from a wire message, so there is no cheap seam to clear it on
+    /// reconnect without one. An offline spec must not rely on a write landing on the
+    /// overlay ACROSS a fresh connection without re-sending the enable — only
+    /// `loadPreset` is a trustworthy reset point here.
+    scene_edit_enabled: std::collections::HashSet<(u32, String, String)>,
     /// Whether re-amp is engaged (the `SettingsMessage` toggle). Latched at capture; a
     /// capture with re-amp OFF returns silence (the real device routes no USB return).
     reamp_on: bool,
@@ -300,12 +351,14 @@ impl Default for SimState {
                 {"FenderId":"ACD_ChorusCE2","nodeId":"n2","dspUnitParameters":{"bypass":false}}
             ]}}}"#
                 .to_string(),
+            parsed_preset_cache: None,
             current_slot: 0,
             current_scene: None,
             saved_scene: HashMap::new(),
             preset_level: 1.0,
             param_writes: HashMap::new(),
             bypass_writes: HashMap::new(),
+            scene_edit_enabled: std::collections::HashSet::new(),
             reamp_on: false,
             #[cfg(feature = "e2e")]
             fail_capture_slot: None,
@@ -323,6 +376,185 @@ impl SimState {
     /// The active scene as the [`param_writes`](SimState::param_writes) `i64` key.
     fn scene_key(&self) -> i64 {
         self.current_scene.map_or(SCENE_BASE, i64::from)
+    }
+
+    /// The JSON a scene-recall render resolves against: the slot's real scenario fixture
+    /// when one exists (e2e only — same precedence as [`load_echo_json`]), else
+    /// `preset_json` (so [`SimDevice::with_preset_json`] drives a plain, non-e2e test
+    /// too). Called only by [`SimState::parsed_preset`], which caches the parse — see that
+    /// method and [`SimState::parsed_preset_cache`] for the invalidation contract.
+    fn scene_render_json_source(&self) -> String {
+        #[cfg(feature = "e2e")]
+        {
+            if let Some(j) = scenario_json_for(self.current_slot) {
+                return j.to_string();
+            }
+        }
+        self.preset_json.clone()
+    }
+
+    /// Parse [`SimState::scene_render_json_source`] once and cache it — shared by
+    /// `overlay_is_full_shaped` (the live `F_CHANGE_PARAMETER` dispatch path) and the two
+    /// `#[cfg(test)]` renderers below, which each used to clone the source string and
+    /// re-parse it on every call. See [`SimState::parsed_preset_cache`] for the
+    /// invalidation contract; a stale cache here would silently falsify offline gates, so
+    /// every call site that can change the source string clears it first.
+    fn parsed_preset(&mut self) -> Option<&serde_json::Value> {
+        if self.parsed_preset_cache.is_none() {
+            let json = self.scene_render_json_source();
+            self.parsed_preset_cache = serde_json::from_str(&json).ok();
+        }
+        self.parsed_preset_cache.as_ref()
+    }
+
+    /// `scene`'s own overlay value for `(node, param)`, from the cached parsed doc — Full
+    /// and BypassOnly overlays both carry the raw per-scene body (Absent/Unknown carry
+    /// none). A BypassOnly overlay only ever carries the bypass-family keys
+    /// (`scene_jobs::BYPASS_ONLY_KEYS`), so a non-bypass `param` against one naturally
+    /// misses here and the caller falls through to base — the SAME classifier
+    /// [`SimState::overlay_is_full_shaped`] uses, so the two can't read a shape
+    /// differently. Shared by `rendered_param` (any param) and `rendered_bypass` (asked
+    /// for `"bypass"`).
+    #[cfg(test)]
+    fn scene_overlay_value(
+        &mut self,
+        scene: u32,
+        node: &str,
+        param: &str,
+    ) -> Option<serde_json::Value> {
+        use crate::probe_api::scene_jobs::SceneOverlay;
+        let doc = self.parsed_preset()?;
+        match crate::probe_api::scene_jobs::scene_overlay(doc, scene, node) {
+            SceneOverlay::Full(params) | SceneOverlay::BypassOnly(params) => {
+                params.get(param).cloned()
+            }
+            SceneOverlay::Absent | SceneOverlay::Unknown => None,
+        }
+    }
+
+    /// The BASE graph node's own `(group, node, param)` value, from the cached parsed doc —
+    /// the un-overlaid fallback both renderers fall through to. Shared walk, replacing what
+    /// used to be a hand-rolled `guitarNodes` traversal duplicated in three places.
+    #[cfg(test)]
+    fn base_graph_value(
+        &mut self,
+        group: &str,
+        node: &str,
+        param: &str,
+    ) -> Option<serde_json::Value> {
+        let doc = self.parsed_preset()?;
+        doc.get("audioGraph")?
+            .get("guitarNodes")?
+            .get(group)?
+            .as_array()?
+            .iter()
+            .find(|n| n.get("nodeId").and_then(|x| x.as_str()) == Some(node))?
+            .get("dspUnitParameters")?
+            .get(param)
+            .cloned()
+    }
+
+    /// The EFFECTIVE value of `(group, node, param)` a `loadScene` recall renders RIGHT
+    /// NOW (HW fw 1.8.45): an explicit `changeParameter` write for the active scene wins;
+    /// else the active scene's own JSON overlay carries the param (a FULL overlay masks
+    /// base for every param it lists, a bypass-only overlay masks nothing else); else an
+    /// explicit BASE write; else base's own static value. Resolved fresh every call from
+    /// the cached parsed doc, so recalling a DIFFERENT scene never retains a value the new
+    /// scene's own overlay doesn't carry
+    /// (pin: `scene_recall_renders_the_overlay_per_param_with_no_retention_from_the_prior_scene`).
+    /// Test-only: its sole caller is [`SimDevice::rendered_param`] (`#[cfg(test)]`).
+    #[cfg(test)]
+    fn rendered_param(&mut self, group: &str, node: &str, param: &str) -> Option<f64> {
+        let scene_key = self.scene_key();
+        // 1. An explicit write for the address space under measurement (the active
+        // scene, or base) always wins.
+        if let Some(v) = self.param_writes.get(&(
+            scene_key,
+            group.to_string(),
+            node.to_string(),
+            param.to_string(),
+        )) {
+            return Some(f64::from(*v));
+        }
+        // 2. In a real scene, that scene's own JSON overlay (a FULL overlay masks base
+        // for every param it lists; a bypass-only overlay masks nothing else — fact 1).
+        if let Some(scene) = self.current_scene {
+            if let Some(pv) = self
+                .scene_overlay_value(scene, node, param)
+                .and_then(|v| v.as_f64())
+            {
+                return Some(pv);
+            }
+        }
+        // 3. Falls through to BASE: an explicit base write (e.g. fact 4's landing site)
+        // wins over the static fixture's own base value — a scene inheriting base must
+        // see what base was just WRITTEN to, not the pristine fixture body.
+        if scene_key != SCENE_BASE {
+            if let Some(v) = self.param_writes.get(&(
+                SCENE_BASE,
+                group.to_string(),
+                node.to_string(),
+                param.to_string(),
+            )) {
+                return Some(f64::from(*v));
+            }
+        }
+        self.base_graph_value(group, node, param)
+            .and_then(|v| v.as_f64())
+    }
+
+    /// The EFFECTIVE `bypass` a `loadScene` recall renders RIGHT NOW for `(group, node)` —
+    /// the bypass analogue of [`SimState::rendered_param`], and the mechanism behind fact
+    /// 2 (HW fw 1.8.45): it derives from an explicit `changeParameter` bool write, else
+    /// the active scene's own overlay, else base — and NEVER consults a fixture's
+    /// `ftswStates` array (a derived cache the real device also ignores on recall), by
+    /// construction: nothing in this method's lookup chain ever reads that key. Test-only:
+    /// its sole caller is [`SimDevice::rendered_bypass`] (`#[cfg(test)]`).
+    #[cfg(test)]
+    fn rendered_bypass(&mut self, group: &str, node: &str) -> Option<bool> {
+        if let Some(b) = self.bypass_writes.get(node) {
+            return Some(*b);
+        }
+        if let Some(scene) = self.current_scene {
+            if let Some(bv) = self
+                .scene_overlay_value(scene, node, "bypass")
+                .and_then(|v| v.as_bool())
+            {
+                return Some(bv);
+            }
+        }
+        self.base_graph_value(group, node, "bypass")
+            .and_then(|v| v.as_bool())
+    }
+
+    /// True when scene `scene`'s overlay for `node` is FULL-shaped — routed straight
+    /// through the production classifier ([`crate::probe_api::scene_jobs::scene_overlay`])
+    /// off the cached parsed doc, so this sim's landing rule tracks the real classifier BY
+    /// CONSTRUCTION (micNodes overlays, FenderId-keyed overlay entries, and `Unknown`
+    /// handling all included — the old hand-rolled walk here covered only
+    /// `guitarNodes`/node-id keying and folded `Unknown` into "not full", which happened to
+    /// give the same conservative answer for that one shape but was a second, divergeable
+    /// copy of the real rule). `scene_overlay` resolves the node's group itself off the
+    /// roster, so no `group` argument is needed here.
+    ///
+    /// The landing gate below (fact 4) needs exactly this — Full-shaped or not — and NOT
+    /// "does the overlay carry THIS param": HW-verified fw 1.8.45 (crafted Full-partial
+    /// overlay: a TubeScreamer scene-0 overlay carrying `blend`/`overdrive`/`tone` but not
+    /// `level`, base `level` 0.65) proved an enable-less `changeParameter(level, …)` lands
+    /// IN the overlay — EXTENDING it per-param, siblings unchanged, base untouched — not on
+    /// base. The Scene-Edit flag state alone decides the landing.
+    ///
+    /// False when the node has NO overlay at all in this scene (Absent), the overlay is
+    /// Unknown (base slot, or an unparseable cached doc), or BypassOnly — all land on BASE
+    /// below, per the HW-proven leak-to-base for "no per-scene knobs materialized here".
+    fn overlay_is_full_shaped(&mut self, scene: u32, node: &str) -> bool {
+        let Some(doc) = self.parsed_preset() else {
+            return false;
+        };
+        matches!(
+            crate::probe_api::scene_jobs::scene_overlay(doc, scene, node),
+            crate::probe_api::scene_jobs::SceneOverlay::Full(_)
+        )
     }
 }
 
@@ -526,7 +758,11 @@ impl SimDevice {
     /// refusal end-to-end.
     #[cfg(test)]
     pub fn with_preset_json(self, json: &str) -> SimDevice {
-        self.state.lock().expect("sim lock").preset_json = json.to_string();
+        {
+            let mut st = self.state.lock().expect("sim lock");
+            st.preset_json = json.to_string();
+            st.parsed_preset_cache = None; // the source string just changed — drop the stale parse
+        }
         self
     }
 
@@ -605,6 +841,26 @@ impl SimDevice {
             .copied()
     }
 
+    /// The EFFECTIVE value of `(group, node, param)` a `loadScene` recall renders RIGHT
+    /// NOW for the CURRENTLY active scene — [`SimState::rendered_param`]. Test-only.
+    #[cfg(test)]
+    pub fn rendered_param(&self, group: &str, node: &str, param: &str) -> Option<f64> {
+        self.state
+            .lock()
+            .expect("sim lock")
+            .rendered_param(group, node, param)
+    }
+
+    /// The EFFECTIVE `bypass` a `loadScene` recall renders RIGHT NOW for `(group, node)` —
+    /// [`SimState::rendered_bypass`]. Test-only.
+    #[cfg(test)]
+    pub fn rendered_bypass(&self, group: &str, node: &str) -> Option<bool> {
+        self.state
+            .lock()
+            .expect("sim lock")
+            .rendered_bypass(group, node)
+    }
+
     /// Parse one request body and produce the device's framed reply reports.
     fn handle(&self, body: &[u8]) -> Vec<Vec<u8>> {
         let top = proto::parse(body);
@@ -639,6 +895,9 @@ impl SimDevice {
             // knob writes + forced bypasses) — reseeded from the slot's own COMMITTED doc
             // just below (e2e only; see that block's doc for why a plain build can't).
             st.current_slot = slot0;
+            // A different slot resolves to a different `scene_render_json_source` (e2e:
+            // its own scenario doc) — drop the stale cached parse.
+            st.parsed_preset_cache = None;
             st.current_scene = match st.saved_scene.get(&slot0).copied() {
                 Some(scene) => scene,
                 // No recorded save this run → the FIXTURE's own `lastLoadedScene`, so a
@@ -648,6 +907,7 @@ impl SimDevice {
             };
             st.param_writes.clear();
             st.bypass_writes.clear();
+            st.scene_edit_enabled.clear();
             // Lazy-commit doc (e2e only — module header): a load restores THIS slot's own
             // committed `presetLevel` AND baked param overlay, faithfully INCLUDING the
             // stale-load corruption window while an earlier save is still pending — but
@@ -802,13 +1062,40 @@ impl SimDevice {
                 .and_then(|(_, val)| val.as_f32());
             if let Some(v) = float_val {
                 st.events.push(SimEvent::ChangeParameter {
+                    // The event records the ACTIVE-SCENE CONTEXT the write was sent
+                    // under, not where it landed (`scene_context_tests` asserts on this
+                    // meaning) — the landing key below can differ per fact 4.
                     scene,
                     group: group.clone(),
                     node: node.clone(),
                     param: param.clone(),
                     value: v,
                 });
-                st.param_writes.insert((scene, group, node, param), v);
+                // Fact 4 (HW fw 1.8.45, revised): a scene-context write with NO preceding
+                // `setNodeSceneEdit(enable=true)` for this (scene, group, node) lands on
+                // BASE only when that node's overlay in this scene is NOT Full-shaped
+                // (BypassOnly, empty, or altogether absent — Scene Edit disabled/never
+                // materialized). Against a FULL-shaped overlay the write lands ON the
+                // overlay EVEN FOR a param it doesn't yet carry, extending it per-param —
+                // the Scene-Edit flag state decides the landing, not per-param containment
+                // (see `overlay_is_full_shaped`'s doc for the crafted-fixture HW evidence).
+                // Copied out of `st` up front: `overlay_is_full_shaped` below now needs
+                // `&mut st` (the cached-parse lookup), which the match scrutinee borrowing
+                // `st.current_scene` directly would conflict with.
+                let current_scene = st.current_scene;
+                let landing_scene = match current_scene {
+                    Some(sc)
+                        if !st
+                            .scene_edit_enabled
+                            .contains(&(sc, group.clone(), node.clone()))
+                            && !st.overlay_is_full_shaped(sc, &node) =>
+                    {
+                        SCENE_BASE
+                    }
+                    _ => scene,
+                };
+                st.param_writes
+                    .insert((landing_scene, group, node, param), v);
             } else if param == "bypass" {
                 let on = proto::first_varint(&inner, 7).unwrap_or(0) != 0;
                 st.events.push(SimEvent::Bypass {
@@ -830,6 +1117,17 @@ impl SimDevice {
                 node: node.clone(),
                 enable,
             });
+            // Fact 4's gate (F_CHANGE_PARAMETER, above): track which (scene, group, node)
+            // triples have had Scene Edit enabled THIS session, since the last load.
+            if let Some(sc) = st.current_scene {
+                if enable {
+                    st.scene_edit_enabled
+                        .insert((sc, group.clone(), node.clone()));
+                } else {
+                    st.scene_edit_enabled
+                        .remove(&(sc, group.clone(), node.clone()));
+                }
+            }
             // HW-confirmed (B): enabling Scene Edit on a node RESEEDS that node's scene
             // overlay from base — any prior override for OTHER params on this node in the
             // active scene is lost, replaced by whatever the node currently holds at base.
@@ -2193,6 +2491,169 @@ mod scene_context_tests {
             reseeded,
             Some(0.7),
             "enabling Scene Edit again must reseed drive from base (0.7), not keep 0.2"
+        );
+    }
+
+    // ── HW fw 1.8.45 findings (this week) ──────────────────────────────────────────
+
+    const PER_PARAM_OVERLAY_FIXTURE: &str = r#"{"audioGraph":{"guitarNodes":{"G1":[
+        {"FenderId":"X","nodeId":"amp","dspUnitParameters":{"bypass":false,"gain":2.5}}
+    ]}},
+    "scenes":[
+        {"guitarNodes":{"G1":{"amp":{"dspUnitParameters":{"bypass":false,"gain":5.0}}}}},
+        {"guitarNodes":{"G1":{"amp":{"dspUnitParameters":{"bypass":false}}}}}
+    ]}"#;
+
+    // (1) A FULL overlay (scene 0) masks base for every param it lists; a bypass-only
+    // overlay (scene 1) masks only `bypass` — every other param, incl. `gain`, renders
+    // BASE, with no retention of whatever the previously recalled scene rendered.
+    #[test]
+    fn scene_recall_renders_the_overlay_per_param_with_no_retention_from_the_prior_scene() {
+        let sim = SimDevice::new().with_preset_json(PER_PARAM_OVERLAY_FIXTURE);
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(6).unwrap();
+        s.load_scene(0).unwrap(); // scene 0: a FULL overlay (gain: 5.0)
+        assert_eq!(
+            sim.rendered_param("G1", "amp", "gain"),
+            Some(5.0),
+            "a full overlay must mask base's gain"
+        );
+        s.load_scene(1).unwrap(); // scene 1: a bypass-only overlay (no gain key)
+        assert_eq!(
+            sim.rendered_param("G1", "amp", "gain"),
+            Some(2.5),
+            "a bypass-only overlay must render BASE for gain (2.5), not retain scene 0's 5.0"
+        );
+    }
+
+    // (2) `ftswStates` is a derived cache the device ignores on recall — a crafted
+    // fixture whose `ftswStates[0]` says the switch is active must NOT override the
+    // materialized bypass state (here: the overlay bypasses the block → FS inactive).
+    #[test]
+    fn scene_recall_ignores_the_stored_ftsw_states_cache_and_derives_from_materialized_bypass() {
+        const FIXTURE: &str = r#"{"audioGraph":{"guitarNodes":{"G1":[
+            {"FenderId":"X","nodeId":"fx","dspUnitParameters":{"bypass":false}}
+        ]}},
+        "scenes":[
+            {"guitarNodes":{"G1":{"fx":{"dspUnitParameters":{"bypass":true}}}},
+             "ftswStates":[true]}
+        ]}"#;
+        let sim = SimDevice::new().with_preset_json(FIXTURE);
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(10).unwrap();
+        s.load_scene(0).unwrap();
+        assert_eq!(
+            sim.rendered_bypass("G1", "fx"),
+            Some(true),
+            "the overlay's own bypass=true must govern (FS inactive, block silent) even \
+             though this fixture's ftswStates[0] — a cache the real device ignores on \
+             recall — claims the switch is active"
+        );
+    }
+
+    // (3) `changeParameter` accepts RAW values outside [0,1] (dB-calibrated params like
+    // `ACD_Boost.gain`) with no clamp and no rejection.
+    #[test]
+    fn parameter_writes_accept_raw_values_outside_0_1() {
+        let sim = SimDevice::new();
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(7).unwrap();
+        s.change_parameter("G1", "ACD_Boost", "gain", 7.0).unwrap();
+        assert_eq!(
+            sim.param_write(SCENE_BASE, "G1", "ACD_Boost", "gain"),
+            Some(7.0),
+            "a dB-calibrated raw write outside [0,1] must not be clamped or rejected"
+        );
+    }
+
+    // (4) A scene-context write with no preceding Scene Edit enable, on a node whose
+    // overlay in this scene is bypass-only, lands on BASE (and thus on every scene
+    // sharing that knob) — the bypass-only overlay itself is left untouched, and other
+    // scenes' FULL overlays are untouched too.
+    #[test]
+    fn scene_context_write_without_scene_edit_enable_on_a_bypass_only_overlay_lands_on_base() {
+        const FIXTURE: &str = r#"{"audioGraph":{"guitarNodes":{"G1":[
+            {"FenderId":"X","nodeId":"amp","dspUnitParameters":{"bypass":false,"gain":2.5}}
+        ]}},
+        "scenes":[
+            {"guitarNodes":{"G1":{"amp":{"dspUnitParameters":{"bypass":false}}}}},
+            {"guitarNodes":{"G1":{"amp":{"dspUnitParameters":{"bypass":false,"gain":9.9}}}}}
+        ]}"#;
+        let sim = SimDevice::new().with_preset_json(FIXTURE);
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(8).unwrap();
+        s.load_scene(0).unwrap(); // scene 0: bypass-only overlay on "amp" — no enable sent
+        s.change_parameter("G1", "amp", "gain", 7.0).unwrap();
+        assert_eq!(
+            sim.param_write(SCENE_BASE, "G1", "amp", "gain"),
+            Some(7.0),
+            "no Scene Edit enable + a bypass-only overlay must route the write to BASE"
+        );
+        assert_eq!(
+            sim.param_write(0, "G1", "amp", "gain"),
+            None,
+            "the bypass-only overlay itself must stay untouched — no partial scene entry"
+        );
+        assert_eq!(
+            sim.rendered_param("G1", "amp", "gain"),
+            Some(7.0),
+            "scene 0 has no overlay for gain, so it must now render the just-written base value"
+        );
+        // The existing enable+reseed behavior must remain green (pinned separately by
+        // `enabling_scene_edit_reseeds_the_node_from_base`); here we only need scene 1's
+        // OWN full overlay to be untouched by our scene-0 base write.
+        s.load_scene(1).unwrap();
+        assert_eq!(
+            sim.rendered_param("G1", "amp", "gain"),
+            Some(9.9),
+            "scene 1's own full overlay must be untouched by scene 0's base-routed write"
+        );
+    }
+
+    // (4, revised) A scene-context write with no preceding Scene Edit enable, on a node
+    // whose overlay in this scene IS Full-shaped but doesn't yet carry the written param,
+    // lands ON the overlay — extending it per-param — not on base. HW-verified fw 1.8.45,
+    // crafted Full-partial overlay: a TubeScreamer scene-0 overlay carrying
+    // blend/overdrive/tone but not `level` (base `level` 0.65); an enable-less
+    // `changeParameter(level, 0.22)` landed IN the overlay, every sibling param survived
+    // unchanged (no reseed), and base stayed 0.65.
+    #[test]
+    fn scene_context_write_without_scene_edit_enable_on_a_full_overlay_extends_it_per_param() {
+        const FIXTURE: &str = r#"{"audioGraph":{"guitarNodes":{"G1":[
+            {"FenderId":"ACD_TubeScreamer","nodeId":"ts","dspUnitParameters":
+                {"bypass":false,"blend":0.5,"overdrive":0.3,"tone":0.4,"level":0.65}}
+        ]}},
+        "scenes":[
+            {"guitarNodes":{"G1":{"ts":{"dspUnitParameters":
+                {"bypass":false,"blend":0.41,"overdrive":0.0,"tone":0.5}}}}}
+        ]}"#;
+        let sim = SimDevice::new().with_preset_json(FIXTURE);
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(9).unwrap();
+        s.load_scene(0).unwrap(); // scene 0: Full overlay missing `level` — no enable sent
+        s.change_parameter("G1", "ts", "level", 0.22).unwrap();
+        assert_eq!(
+            sim.param_write(0, "G1", "ts", "level"),
+            Some(0.22),
+            "an enable-less write of a param absent from a FULL overlay must land IN the \
+             overlay (extending it), not fall through to base"
+        );
+        assert_eq!(
+            sim.param_write(SCENE_BASE, "G1", "ts", "level"),
+            None,
+            "base must stay untouched by the overlay-extending write"
+        );
+        assert_eq!(
+            sim.rendered_param("G1", "ts", "blend"),
+            Some(0.41),
+            "the overlay's own sibling params must survive unchanged — no reseed"
+        );
+        assert_eq!(
+            sim.rendered_param("G1", "ts", "level"),
+            // `rendered_param` widens the stored f32 write to f64 — compare against the
+            // same widened value, not the f64 literal (0.22f32 as f64 != 0.22f64).
+            Some(f64::from(0.22f32)),
+            "scene 0 must now render the just-extended level"
         );
     }
 }

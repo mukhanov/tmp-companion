@@ -156,7 +156,9 @@ export interface FootswitchLevelResult {
   /** Solved switch-ON value written as the `param` function's `valueA`. */
   final_value: number;
   target_lufs: number;
-  /** Achieved engaged loudness at `final_value`. */
+  /** Achieved engaged loudness at `final_value` — always a real capture of the written
+   *  value (the wet floor is folded into the solve's bounds, so nothing unwritable is
+   *  ever probed). */
   predicted_lufs: number;
   /** The knob RAN OUT: the solved value sits at a bound and the target lies beyond it, so
    *  this sound cannot reach target at all — a re-run can't help. */
@@ -165,7 +167,13 @@ export interface FootswitchLevelResult {
    *  a compressed/noisy response, so the best point found was written and a RE-RUN can
    *  improve it. Distinct from `clamped` — never collapse the two. */
   unconverged: boolean;
+  /** Pinned to "not reaching USB 1/2" (off-branch/off-USB) — never set for a wet-floor
+   *  clamp (`wet_floor` below carries that cause instead). */
   clamp_reason: string | null;
+  /** The clamp's pinned bound is the wet/mix FLOOR (25% of the authored mix — going lower
+   *  guts the effect instead of quieting it). Rides only with `clamped: true`; the UI owns
+   *  the "verify by ear" advisory prose. */
+  wet_floor: boolean;
   saved: boolean;
   verify_lufs: number | null;
   iterations: number;

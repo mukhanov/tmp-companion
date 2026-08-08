@@ -131,7 +131,9 @@ pub fn probe_dump_list(
     std::fs::create_dir_all(out_dir).map_err(|e| format!("create {out_dir}: {e}"))?;
     let mut s = Session::connect()?;
     s.drain_until_quiet(250, 20)?;
-    let mut out = format!("[probe --dump-list] listEnum={list_enum} slots {from_slot}..={to_slot} → {out_dir}\n");
+    let mut out = format!(
+        "[probe --dump-list] listEnum={list_enum} slots {from_slot}..={to_slot} → {out_dir}\n"
+    );
     let (mut ok, mut miss) = (0u32, 0u32);
     for slot in from_slot..=to_slot {
         s.raw.clear();
@@ -164,7 +166,11 @@ pub fn probe_dump_list(
                 let path = format!("{out_dir}/list{list_enum}_slot{slot:03}.json");
                 std::fs::write(&path, &decoded).map_err(|e| format!("write {path}: {e}"))?;
                 let complete = serde_json::from_slice::<serde_json::Value>(&decoded).is_ok();
-                out += &format!("  slot {slot}: {} B{}\n", decoded.len(), if complete { "" } else { " (truncated)" });
+                out += &format!(
+                    "  slot {slot}: {} B{}\n",
+                    decoded.len(),
+                    if complete { "" } else { " (truncated)" }
+                );
                 ok += 1;
             }
             None => {

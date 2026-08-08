@@ -291,6 +291,14 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                 job.lev_node_id.as_str(),
                 job.lev_parameter_id.as_str(),
             );
+            // The CLASSIFIED solve target, off the batch's single field-8 read: it carries
+            // the param's class (an `Other` refuses before any device work), its real range
+            // (no `[0,1]` assumption) and its authored value (the wet-mix floor anchor).
+            let lev_param = leveller::FsParamTarget::from_preset(
+                &preset,
+                &job.lev_node_id,
+                &job.lev_parameter_id,
+            );
             let lev_owned = || {
                 (
                     job.lev_group_id.clone(),
@@ -322,6 +330,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                     job.target_lufs + offset,
                     "baked",
                     None,
+                    &lev_param,
                 )
                 .inspect(|r| {
                     if save && r.clamp_reason.is_none() {
@@ -344,6 +353,8 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                         Err(e) => Err(e),
                         Ok((value_b, spec)) => {
                             // Re-run anchor: a prior assign's stored valueA (None = fresh).
+                            // Also the wet-floor anchor — the solve raises `lev_param`'s
+                            // anchor to this ENGAGED value itself (`FsParamTarget::anchored`).
                             let current = footswitch::existing_param_fn_value_a(
                                 &ftsw,
                                 job.switch,
@@ -359,6 +370,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                                 job.target_lufs + offset,
                                 "assigned",
                                 current,
+                                &lev_param,
                             )
                             // Skip the write when the leveler left the value unchanged — its
                             // `final_value == current` is the idempotency signal (no wire field).

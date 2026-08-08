@@ -482,11 +482,13 @@ fn scene_jobs_saved_fallback_without_template_still_errors() {
 // a node that has none leaks the write to base — so Present/Absent/Unknown must be exact.
 
 #[test]
-fn scene_overlay_present_carries_bypass() {
+fn scene_overlay_full_carries_bypass() {
     let p = saved_preset();
-    // Base node is "ampA"; the scene-0 overlay is keyed by its FenderId.
-    let SceneOverlay::Present(params) = scene_overlay(&p, 0, "ampA") else {
-        panic!("scene 0 overlays ampA");
+    // Base node is "ampA"; the scene-0 overlay is keyed by its FenderId. It carries a KNOB
+    // (`outputLevel`) alongside `bypass`, so it is a FULL overlay — the node's Scene Edit
+    // flag is on and the enable-dropped write lands on the overlay.
+    let SceneOverlay::Full(params) = scene_overlay(&p, 0, "ampA") else {
+        panic!("scene 0 fully overlays ampA");
     };
     assert_eq!(params.get("bypass").and_then(|v| v.as_bool()), Some(false));
     assert_eq!(
@@ -502,17 +504,18 @@ fn scene_overlay_resolves_by_fender_id() {
     let p = saved_preset();
     assert!(matches!(
         scene_overlay(&p, 0, "ACD_TwinReverb"),
-        SceneOverlay::Present(_)
+        SceneOverlay::Full(_)
     ));
 }
 
-// An overlay that does NOT carry bypass: Present, but the bake gate must not trip.
+// An overlay that does NOT carry bypass: still FULL (it carries a knob), but the bake gate
+// must not trip.
 #[test]
-fn scene_overlay_present_without_bypass() {
+fn scene_overlay_full_without_bypass() {
     let mut p = saved_preset();
     p["scenes"][1]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
         serde_json::json!({ "dspUnitParameters": { "outputLevel": 0.7 } });
-    let SceneOverlay::Present(params) = scene_overlay(&p, 1, "ampA") else {
+    let SceneOverlay::Full(params) = scene_overlay(&p, 1, "ampA") else {
         panic!("scene 1 overlays ampA");
     };
     assert!(!params.contains_key("bypass"));
@@ -752,4 +755,111 @@ fn change_param_false_for_a_node_no_scene_mentions() {
         "otherNode",
         "bypass"
     ));
+}
+
+// ── three-state overlay split: Full vs BypassOnly (HW-verified fw 1.8.45) ───────────────
+//
+// A scene's per-node overlay can be BYPASS-ONLY — the block's Scene Edit flag is DISABLED,
+// so the scene carries only the bypass family and SHARES the node's knobs with base. A
+// scene-context param write with the enable dropped against such a node lands on BASE
+// (measured: base gain 2.5 → 7.0, the bypass-only overlay unchanged, other scenes' full
+// overlays untouched). Classifying it as a knob overlay is the bug this split fixes, so
+// each shape below is pinned exactly.
+
+/// `saved_preset()` with scene 0's `ampA` overlay replaced by `params`.
+fn with_scene0_overlay(params: serde_json::Value) -> serde_json::Value {
+    let mut p = saved_preset();
+    p["scenes"][0]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
+        serde_json::json!({ "dspUnitParameters": params });
+    p
+}
+
+// Overlay-shape table: which param maps classify BypassOnly (device Scene Edit flag
+// disabled, knobs shared with base) vs Full (a genuine knob overlay). `bypassType` and
+// `clipState` are per-block STATE keys widened into BYPASS_ONLY_KEYS (m4), not knobs — an
+// overlay of only those plus `bypass` must stay BypassOnly. An EMPTY param map overlays no
+// knob at all so it shares base exactly like the flag-disabled case (pinned so nobody "fixes"
+// it to Full — that would authorise the leak-to-base write). ONE real knob (`outputLevel`)
+// alongside bypass is enough to flip the whole overlay to Full.
+#[test]
+fn scene_overlay_shape_classifies_bypass_only_vs_full() {
+    let cases: [(&str, serde_json::Value, bool); 5] = [
+        ("bypass alone", serde_json::json!({ "bypass": false }), true),
+        (
+            "bypass + bypassType (firmware companion enum)",
+            serde_json::json!({ "bypass": true, "bypassType": "Post" }),
+            true,
+        ),
+        (
+            "bypass + clipState (per-block state, not a knob)",
+            serde_json::json!({ "bypass": true, "clipState": "off" }),
+            true,
+        ),
+        (
+            "bypass + outputLevel (one real knob rides along)",
+            serde_json::json!({ "bypass": false, "outputLevel": 0.4 }),
+            false,
+        ),
+        (
+            "empty param map (no knob overlaid at all)",
+            serde_json::json!({}),
+            true,
+        ),
+    ];
+    for (label, params, expect_bypass_only) in cases {
+        let p = with_scene0_overlay(params);
+        match scene_overlay(&p, 0, "ampA") {
+            SceneOverlay::BypassOnly(_) => assert!(
+                expect_bypass_only,
+                "{label}: classified BypassOnly, expected Full"
+            ),
+            SceneOverlay::Full(_) => assert!(
+                !expect_bypass_only,
+                "{label}: classified Full, expected BypassOnly"
+            ),
+            _ => panic!("{label}: expected Full or BypassOnly"),
+        }
+    }
+}
+
+// The bake gate must keep firing on a BypassOnly overlay: that overlay exists PRECISELY to
+// flip the node's bypass per scene, and a bake authorised past it renders the solved value
+// in a state the leveler never measured. `Full` and `BypassOnly` share one arm here.
+#[test]
+fn change_param_true_when_a_bypass_only_overlay_flips_the_node() {
+    let mut p = bake_gate_preset();
+    // Base has `bypass: true`; scene 0 carries ONLY a bypass flip.
+    p["scenes"][0]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
+        serde_json::json!({ "dspUnitParameters": { "bypass": false } });
+    assert!(matches!(
+        scene_overlay(&p, 0, "ampA"),
+        SceneOverlay::BypassOnly(_)
+    ));
+    assert!(
+        scene_overlays_change_param(&p, "ampA", "bypass"),
+        "a bypass-only overlay that FLIPS bypass must still force the Assign path"
+    );
+}
+
+// Mirror rule: a BypassOnly scene is NOT a mirror target. Its knobs are shared with base, so
+// it already follows base for the leveled param and inherits the bake automatically —
+// writing a mirror there would be the leak-to-base write the split exists to prevent.
+#[test]
+fn restating_base_skips_a_bypass_only_scene_which_inherits_the_bake() {
+    let mut p = bake_gate_preset();
+    // Scene 0: a FULL overlay restating base's outputLevel (0.4) → a genuine mirror target.
+    p["scenes"][0]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
+        serde_json::json!({ "dspUnitParameters": { "bypass": true, "outputLevel": 0.4 } });
+    // Scene 1: bypass-only → shares base's knobs → nothing to mirror.
+    p["scenes"][1]["guitarNodes"]["G1"]["ACD_TwinReverb"] =
+        serde_json::json!({ "dspUnitParameters": { "bypass": false } });
+    assert!(matches!(
+        scene_overlay(&p, 1, "ampA"),
+        SceneOverlay::BypassOnly(_)
+    ));
+    assert_eq!(
+        scenes_restating_base(&p, "ampA", "outputLevel"),
+        vec![0],
+        "only the FULL restating overlay is mirrored; the sharing scene inherits the bake"
+    );
 }

@@ -365,6 +365,8 @@ fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
         false,
         true,
         None,
+        // `level` on a TubeScreamer is a plain level_linear control over [0,1].
+        &crate::leveller::FsParamTarget::new("ACD_TubeScreamer", "level", 0.5),
     )
     .expect("level 403 fs");
     assert!(fs.clamped, "the off-branch footswitch clamps");
@@ -849,7 +851,7 @@ fn sim_answers_the_field8_saved_preset_read() {
     assert!(
         matches!(
             crate::scene_overlay(&saved, 1, "ACD_TwinReverb65NoFx"),
-            crate::SceneOverlay::Present(_)
+            crate::SceneOverlay::Full(_)
         ),
         "the per-node overlay accessor resolves against the read document"
     );
@@ -918,7 +920,7 @@ fn hiwatt_scene_leveling_never_reseeds_an_existing_overlay() {
         assert!(
             matches!(
                 crate::scene_overlay(&saved, scene, HIWATT_AMP),
-                crate::SceneOverlay::Present(_)
+                crate::SceneOverlay::Full(_)
             ),
             "fixture premise: scene {scene} must already carry an overlay for {HIWATT_AMP}"
         );
@@ -1113,7 +1115,9 @@ fn hiwatt_footswitch_plan_bakes_and_mirrors_only_the_scenes_restating_base() {
             .unwrap_or_else(|| panic!("{node}.{param} exists at base"));
         let scenes = preset["scenes"].as_array().expect("scenes");
         let overlay_value = |scene: u32| match crate::scene_overlay(&preset, scene, node) {
-            crate::SceneOverlay::Present(p) => p.get(*param).and_then(serde_json::Value::as_f64),
+            crate::SceneOverlay::Full(p) | crate::SceneOverlay::BypassOnly(p) => {
+                p.get(*param).and_then(serde_json::Value::as_f64)
+            }
             _ => None,
         };
         let restating: Vec<u32> = (0..scenes.len() as u32)

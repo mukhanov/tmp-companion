@@ -36,26 +36,43 @@ pub(crate) fn amp_model_ids() -> &'static std::collections::HashSet<String> {
     })
 }
 
-pub(crate) fn is_amp_model_id(model_id: &str) -> bool {
-    // Device FenderIds carry cab/IR/convolution suffixes the catalog's bare amp bids
-    // omit (e.g. "ACD_HiwattDR103CanModCabIR", "ACD_PrincetonReverb68CabIRConvRvb").
-    // Strip them one at a time, checking after each — mirrors the frontend
-    // `baseDeviceId` / blockArt `SUFFIX`. ("NoFx" is part of real base ids, not stripped.)
+/// Collapse a device FenderId's cab/IR/convolution suffixes, testing `contains`
+/// after each strip, and return the first form that matches (or `None`). Device
+/// FenderIds carry suffixes a catalog's bare bid lacks (e.g.
+/// "ACD_HiwattDR103CanModCabIR", "ACD_PrincetonReverb68CabIRConvRvb") — strip them
+/// one at a time, CHECKING BEFORE each strip (so an id already catalogued WITH a
+/// suffix, like the `…CabIRConvRvb` reverb amps, matches directly and is never
+/// over-stripped), mirroring the frontend `baseDeviceId` / blockArt `SUFFIX`.
+/// ("NoFx" is part of real base ids, so it is never itself stripped.) The
+/// last-gap bridge appends "NoFx" once: a wet amp id (…CabIRConvRvb) strips to a
+/// bare id the catalog only carries WITH the NoFx token (…BlondeVibratoNoFx).
+///
+/// Shared by `is_amp_model_id` (catalog amp classification) and
+/// `param_class::classify` (block-scoped parameter overrides) so the one
+/// suffix-collapse rule can't drift between the two call sites.
+pub(crate) fn resolve_base_id(model_id: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
     const SUFFIXES: [&str; 5] = ["ConvRvb", "CabIR", "NoCab", "Cab", "IR"];
-    let amps = amp_model_ids();
     let mut m = model_id;
     loop {
-        if amps.contains(m) {
-            return true;
+        if contains(m) {
+            return Some(m.to_string());
         }
         match SUFFIXES.iter().find_map(|s| m.strip_suffix(s)) {
             Some(next) => m = next,
-            // Last-gap bridge: a wet amp id (…CabIRConvRvb) strips to a bare id the
-            // catalog only carries WITH the NoFx token (…BlondeVibratoNoFx). NoFx is
-            // never stripped, so try appending it once. Mirrors blockArt.ts.
-            None => return !m.ends_with("NoFx") && amps.contains(&format!("{m}NoFx")),
+            None => {
+                if m.ends_with("NoFx") {
+                    return None;
+                }
+                let with_nofx = format!("{m}NoFx");
+                return contains(&with_nofx).then_some(with_nofx);
+            }
         }
     }
+}
+
+pub(crate) fn is_amp_model_id(model_id: &str) -> bool {
+    let amps = amp_model_ids();
+    resolve_base_id(model_id, |m| amps.contains(m)).is_some()
 }
 
 pub(crate) fn is_amp_output_level_param(parameter_id: &str) -> bool {
@@ -606,11 +623,53 @@ fn overlay_scene_onto_graph(graph: &mut serde_json::Value, scene: &serde_json::V
 /// stored params, without one the write LEAKS TO BASE. Both mistakes corrupt the preset, so
 /// "can't tell" is its own state and never collapses into `Absent`.
 ///
+/// FOUR states, not three (HW-verified fw 1.8.45): an overlay carrying ONLY the bypass
+/// family is a node whose Scene Edit flag is DISABLED — its knobs are SHARED with base, and
+/// the enable-dropped write lands on BASE rather than on the overlay. That is
+/// [`SceneOverlay::BypassOnly`], and it must never collapse into `Full`.
+///
+/// A BYPASS-ONLY overlay's whole permitted key set — the block's per-scene STATE keys;
+/// NONE of these is a knob, so an overlay whose keys are a subset of these carries no
+/// per-scene knob values at all (HW-verified fw 1.8.45 — see [`SceneOverlay::BypassOnly`]).
+/// `bypass` is the on/off flag and `bypassType` its companion enum; `clipState`,
+/// `muteInput`, `muteOutput` are the other non-knob per-block state fields
+/// [`crate::footswitch::is_levelable_param`] also excludes — shared so the two exclusion
+/// lists (an overlay's "carries no knobs" test and a footswitch candidate's "is this a
+/// knob" test) can't drift apart: an overlay of `{bypass, clipState}` must classify
+/// `BypassOnly` exactly like a bare `{bypass}` one. An EMPTY param map is a subset too and
+/// classifies `BypassOnly` deliberately: nothing is overlaid, so the knobs are shared with
+/// base exactly as in the flag-disabled case, and the conservative (refusing) answer is the
+/// correct one. Widening this set only ever fails TOWARD `BypassOnly` (the refusing,
+/// conservative direction), never away from it.
+const BYPASS_ONLY_KEYS: [&str; 5] = [
+    "bypass",
+    "bypassType",
+    "clipState",
+    "muteInput",
+    "muteOutput",
+];
+
 /// Consumed by `leveller::set_knobs`' Scene Edit enable decision and by the footswitch bake
 /// gate (`footswitch::plan_footswitch_jobs`, via [`scene_overlays_change_param`]).
 pub(crate) enum SceneOverlay<'a> {
-    /// The scene carries params for this node — write WITHOUT the Scene Edit enable.
-    Present(&'a serde_json::Map<String, serde_json::Value>),
+    /// The scene carries KNOB params for this node (its Scene Edit flag is ENABLED) — write
+    /// WITHOUT the Scene Edit enable; the write lands on the overlay (HW). The Scene-Edit
+    /// FLAG STATE alone decides the landing, not per-param containment: an enable-less write
+    /// of a param this overlay does NOT yet carry still lands on the overlay, EXTENDING it
+    /// per-param (HW-verified fw 1.8.45, crafted Full-partial overlay: a TubeScreamer scene-0
+    /// overlay carrying `blend`/`overdrive`/`tone` but not `level`, base `level` 0.65 — an
+    /// enable-less `changeParameter(level, 0.22)` landed IN the overlay, every sibling param
+    /// survived unchanged with no reseed, base stayed 0.65, other scenes untouched).
+    Full(&'a serde_json::Map<String, serde_json::Value>),
+    /// The overlay exists but carries ONLY the bypass family ([`BYPASS_ONLY_KEYS`]) — the
+    /// block's Scene Edit flag is DISABLED, so this scene SHARES the node's knobs with the
+    /// base preset. HW-verified fw 1.8.45: a scene-context param write with the enable
+    /// dropped against such a node lands on BASE (measured: base gain 2.5 → 7.0, the
+    /// bypass-only overlay unchanged, other scenes' full overlays untouched). Neither write
+    /// shape is safe — enabling reseeds, omitting leaks to base — so a scene-scoped knob
+    /// write must REFUSE, exactly like [`SceneOverlay::Unknown`], but with a cause the user
+    /// can act on. Carries the params so the bypass-family gates can still read them.
+    BypassOnly(&'a serde_json::Map<String, serde_json::Value>),
     /// The scene exists and carries no entry for this node — the enable is what materialises
     /// the overlay, so it is REQUIRED here.
     Absent,
@@ -642,10 +701,7 @@ pub(crate) fn scene_overlay<'a>(
     // The overlay is keyed by FenderId with a nodeId fallback (exactly like
     // `overlay_scene_onto_graph`), so resolve both ids — and the node's group — from the
     // base graph roster.
-    let Some((group, node_id, fender_id)) = crate::audiograph::roster(preset)
-        .into_iter()
-        .find(|(_, node_id, fender_id)| node_id == node || fender_id == node)
-    else {
+    let Some((group, node_id, fender_id)) = crate::audiograph::roster_entry(preset, node) else {
         return SceneOverlay::Absent;
     };
     // Group ids are disjoint across the two graphs (G1..G7 guitar / M1..M4 mic), so the
@@ -657,7 +713,19 @@ pub(crate) fn scene_overlay<'a>(
     match entry {
         None => SceneOverlay::Absent,
         Some(e) => match e.get("dspUnitParameters").and_then(|p| p.as_object()) {
-            Some(params) => SceneOverlay::Present(params),
+            // Bypass-family-only ⇒ the node's Scene Edit flag is OFF and its knobs are
+            // shared with base (see [`BYPASS_ONLY_KEYS`]); anything beyond that set is a
+            // genuine per-scene knob overlay.
+            Some(params) => {
+                if params
+                    .keys()
+                    .all(|k| BYPASS_ONLY_KEYS.contains(&k.as_str()))
+                {
+                    SceneOverlay::BypassOnly(params)
+                } else {
+                    SceneOverlay::Full(params)
+                }
+            }
             // An overlay entry whose body isn't a param object is a cut read, not "no overlay".
             None => SceneOverlay::Unknown,
         },
@@ -768,12 +836,19 @@ pub(crate) fn scene_overlays_change_param(
     // `Absent` for every scene (its own roster lookup misses too) — so this `None` is never
     // consulted, and a node no scene mentions stays bakeable.
     let base = base.pop().flatten();
+    // CALL-SITE DECISION (three-state split): `Full` and `BypassOnly` share ONE body. This
+    // gate is asked for `bypass`, and a bypass-only overlay is PRECISELY the overlay that
+    // exists to flip a node's bypass per scene — routing it to `false` would stop the bake
+    // gate firing on exactly the scenes it was written to catch, letting a baked value
+    // render in a state the leveler never measured.
     (0..scenes.len() as u32).any(|scene| match scene_overlay(preset, scene, node) {
-        SceneOverlay::Present(params) => params.get(param).is_some_and(|overlay| {
-            base.as_ref()
-                .and_then(|b| b.get(param))
-                .is_none_or(|base| values_differ(base, overlay))
-        }),
+        SceneOverlay::Full(params) | SceneOverlay::BypassOnly(params) => {
+            params.get(param).is_some_and(|overlay| {
+                base.as_ref()
+                    .and_then(|b| b.get(param))
+                    .is_none_or(|base| values_differ(base, overlay))
+            })
+        }
         SceneOverlay::Unknown => true,
         SceneOverlay::Absent => false,
     })
@@ -842,10 +917,18 @@ pub(crate) fn scenes_restating_base(
     };
     (0..scenes.len() as u32)
         .filter(|&scene| match scene_overlay(preset, scene, node) {
-            SceneOverlay::Present(params) => params
+            SceneOverlay::Full(params) => params
                 .get(param)
                 .is_some_and(|overlay| !values_differ(&base_v, overlay)),
-            SceneOverlay::Absent | SceneOverlay::Unknown => false,
+            // CALL-SITE DECISION (three-state split): a BypassOnly overlay needs NO mirror
+            // write. Its Scene Edit flag is off, so the scene READS the base value for every
+            // knob — it already follows base for `param` and therefore inherits the bake
+            // automatically. That is the pleasant consequence of sharing, not a gap: writing
+            // a mirror there would be the leak-to-base write this split exists to prevent.
+            // (Structurally it also cannot match: `param` is never a bypass-family key —
+            // `footswitch::is_levelable_param` excludes those — so the map lookup would miss
+            // anyway. The arm is explicit so the REASON survives, not just the outcome.)
+            SceneOverlay::BypassOnly(_) | SceneOverlay::Absent | SceneOverlay::Unknown => false,
         })
         .collect()
 }

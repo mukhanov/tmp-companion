@@ -2109,7 +2109,13 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
 ///   that can tell the two apart: after `overlay_scene_onto_graph` a base value is
 ///   indistinguishable from an overlaid one, so the live docs can't answer it.
 ///   `SceneOverlay::Unknown` (truncated read) or no `saved` at all ⇒ REFUSE the
-///   batch before any device write; both write shapes corrupt from there.
+///   batch before any device write; both write shapes corrupt from there. So does
+///   `SceneOverlay::BypassOnly` — an overlay carrying only the bypass family means
+///   that block's Scene Edit flag is DISABLED and the scene SHARES its knobs with
+///   base, so the enable-dropped write lands on BASE and changes every sharing
+///   scene (HW-verified fw 1.8.45). The refusal is a per-scene skip, never a batch
+///   abort: `run_scene_jobs` turns a solve `Err` into a `failed_scene_outcome` and
+///   continues, exactly like a `build_scene_jobs` "no active guitar amp" skip.
 ///   Re-asserted on EVERY connection (scene + scene-edit don't survive the
 ///   leveller's reconnects) — including the enable, since `saved` is a pre-run
 ///   snapshot: an overlay this run just materialised still reads Absent, so the
@@ -2202,8 +2208,20 @@ fn set_knobs(
                 }
                 seen.push(key);
                 match saved.map(|sv| scene_overlay(sv, scene, node_id)) {
-                    Some(SceneOverlay::Present(_)) => {}
+                    Some(SceneOverlay::Full(_)) => {}
                     Some(SceneOverlay::Absent) => needs_enable.push(key),
+                    // The node's Scene Edit flag is OFF: this scene SHARES the node's knobs
+                    // with base, so the enable-dropped write would land on BASE and change
+                    // every scene that shares them (HW-verified fw 1.8.45), while the enable
+                    // would reseed. Refuse — with the sharing named, because unlike
+                    // `Unknown` this is an actionable preset fact, not a bad read.
+                    Some(SceneOverlay::BypassOnly(_)) => {
+                        return Err(format!(
+                            "set_knobs: scene {scene} shares {group_id}/{node_id}'s knobs with \
+                             the base preset (Scene Edit off for that block) — a scene write \
+                             would change every sharing scene; level Base instead"
+                        ));
+                    }
                     Some(SceneOverlay::Unknown) | None => {
                         return Err(format!(
                             "set_knobs: refusing to write {group_id}/{node_id} in scene {scene} — \
@@ -2428,6 +2446,14 @@ pub struct FootswitchLevelResult {
     /// `clamped` with no reason — three states behind one flag.
     pub unconverged: bool,
     pub clamp_reason: Option<String>,
+    /// The clamp's pinned bound IS the wet/mix floor ([`WET_FLOOR_FRACTION`] × the anchor):
+    /// target lies below what the effect can give without being gutted, so the write stops
+    /// at the floor and the row wants a "verify by ear" advisory — the UI owns that prose.
+    /// Deliberately NOT a `clamp_reason` string: that field's contract is "the leveled
+    /// signal isn't reaching USB 1/2" (`.claude/rules/leveling-dsp.md`), and the UI maps ANY
+    /// non-null reason to the `offbranch` outcome — a wet-floored row would be labelled a
+    /// routing failure. Rides only with `clamped: true`.
+    pub wet_floor: bool,
     pub saved: bool,
     pub verify_lufs: Option<f64>,
     pub iterations: u32,
@@ -2478,6 +2504,123 @@ pub enum FsWrite {
     },
 }
 
+/// The fraction of a WET/MIX parameter's AUTHORED value the footswitch solve may never go
+/// below. A wet/mix control is not a volume control: driving it toward 0 to hit a loudness
+/// target does not make the effect quieter, it makes the effect DISAPPEAR — the player loses
+/// the sound they wrote. So the solve is floored at a quarter of the authored mix and the row
+/// is reported clamped, which is an honest "this can't reach target without gutting the
+/// effect" rather than a silent tone change.
+pub(crate) const WET_FLOOR_FRACTION: f32 = 0.25;
+
+/// The CLASSIFIED footswitch-solve target: which block parameter is being swept, what
+/// [`crate::param_class`] says it is, and the authored (pre-solve) value the wet floor is
+/// measured against. Three things ride on the classification, all decided before any device
+/// work:
+///
+/// * [`crate::param_class::ParamClass::Other`] ⇒ `solve_footswitch` REFUSES — sweeping a
+///   non-level control changes the effect, not the volume.
+/// * `range` replaces the old hard-coded `[0, 1]` everywhere the FS solve reasons about
+///   knob bounds (seeds, secant clamp, bracket extremes, the pinned-at-a-bound verdict).
+///   Params are not all `[0,1]`: `ACD_Boost.gain` is raw dB over `[0, 12]` (HW-verified fw
+///   1.8.45). For a `[0,1]` param every derived number is byte-identical to before.
+/// * [`crate::param_class::ParamClass::WetMix`] ⇒ the solved value is floored at
+///   [`WET_FLOOR_FRACTION`] × `authored`.
+///
+/// The SCENE lane's amp `outputLevel` is untouched by any of this — it keeps
+/// `scene_bench::knob_bounds` and `LEVEL_MIN`/`LEVEL_MAX`.
+#[derive(Debug, Clone)]
+pub struct FsParamTarget {
+    /// The block's FenderId — the classifier's override key, and named in the refusal.
+    pub block: String,
+    pub param: String,
+    pub info: crate::param_class::ParamInfo,
+    /// The param's authored value before this run — the block's base value / the assign's
+    /// `valueB`. Anchors the wet floor; ignored for every other class. `solve_footswitch`
+    /// raises it to an existing assign's stored `valueA` itself ([`Self::anchored`]).
+    pub authored: f32,
+}
+
+impl FsParamTarget {
+    /// Classify `param` on the block `fender_id`, anchoring the wet floor at `authored`.
+    pub fn new(fender_id: &str, param: &str, authored: f32) -> Self {
+        Self {
+            block: fender_id.to_string(),
+            param: param.to_string(),
+            info: crate::param_class::classify(fender_id, param),
+            authored,
+        }
+    }
+
+    /// This target with the wet-floor anchor raised to `max(authored, engaged)` when
+    /// `engaged` (the switch's currently-configured engaged value — an existing assign's
+    /// stored `valueA`) is known and finite. The solve targets the ENGAGED state, but
+    /// `authored` starts from the BASE graph value — for an existing param assign that's the
+    /// switch-OFF `valueB`, not what the player actually dialed in while engaged. A
+    /// hand-authored assign engaging mix 0.9 over a near-dry base 0.05 would otherwise floor
+    /// at 0.0125 and could be gutted to near-silence — the exact incident (chorus mix→0) the
+    /// floor exists to prevent. Base-anchoring stays as the FLOOR of the max: it's what
+    /// keeps a re-run from ratcheting (max(base, previous solve), base intact) stable across
+    /// runs. Applied by `solve_footswitch` itself from the `current_value` it already
+    /// receives, so no call site can forget it.
+    fn anchored(&self, engaged: Option<f32>) -> Self {
+        let mut t = self.clone();
+        if let Some(v) = engaged {
+            if v.is_finite() && v > t.authored {
+                t.authored = v;
+            }
+        }
+        t
+    }
+
+    /// Resolve straight off the SAVED (field-8) preset: the node's FenderId (falling back to
+    /// the node id when the graph carries none) and its authored value for `param`. The one
+    /// constructor every production call site uses — each already holds the preset that the
+    /// batch's single field-8 read produced.
+    pub fn from_preset(preset: &serde_json::Value, node_id: &str, param: &str) -> Self {
+        let fender_id = crate::audiograph::roster_entry(preset, node_id)
+            .map(|(_, _, fid)| fid)
+            .unwrap_or_else(|| node_id.to_string());
+        let authored = crate::commands::level_footswitch::node_param_f64(preset, node_id, param)
+            .unwrap_or(0.0) as f32;
+        Self::new(&fender_id, param, authored)
+    }
+
+    /// The param's usable `(lo, hi)`. For a wet/mix param the LOW bound IS the wet floor
+    /// (`max(range lo, `[`WET_FLOOR_FRACTION`]` × authored)`), so the whole solve — seeds,
+    /// bracket extremes, secant clamp, the pinned-at-a-bound verdict — can never even PROBE
+    /// a value that would gut the effect, and every reported loudness is a real reading of a
+    /// writable value.
+    fn bounds(&self) -> (f32, f32) {
+        let (lo, hi) = self.info.range;
+        (self.wet_floor().map_or(lo, |f| lo.max(f)), hi)
+    }
+
+    /// `frac` of the way across the param's range — how the two secant seeds and the
+    /// bracket extremes are placed. `frac` 0.25/0.75 on a `[0,1]` param reproduces the
+    /// validated 0.25/0.75 seeds exactly.
+    fn at_fraction(&self, frac: f32) -> f32 {
+        let (lo, hi) = self.bounds();
+        lo + frac * (hi - lo)
+    }
+
+    /// The lowest value a wet/mix solve may write, or `None` for every other class. An
+    /// authored value of `0.0` (the effect is already fully dry) floors at `0.0`, i.e. no
+    /// constraint — the floor is RELATIVE to what the player wrote, never an absolute 0.25.
+    /// Enforced structurally: [`Self::bounds`] folds it into the low bound.
+    fn wet_floor(&self) -> Option<f32> {
+        (self.info.class == crate::param_class::ParamClass::WetMix)
+            .then_some(self.authored * WET_FLOOR_FRACTION)
+    }
+
+    /// Did this (clamped) solve pin at the wet floor specifically — i.e. the low bound was
+    /// RAISED by the floor and `v` sits on it? Distinguishes the "verify by ear" advisory
+    /// from an ordinary range-edge clamp (e.g. a dB ceiling), which needs none.
+    fn pinned_at_wet_floor(&self, v: f32) -> bool {
+        self.wet_floor()
+            .is_some_and(|f| f > self.info.range.0 && v <= f + 1e-6)
+    }
+}
+
 /// Adopt `(v, l)` as the new best-so-far when it beats `*best_lufs`'s distance to
 /// `target_lufs` — shared by `measure_footswitch`'s bracket-expansion probe and its secant
 /// loop, both of which do exactly this after every extra capture.
@@ -2520,15 +2663,25 @@ fn fs_secant_next(p0: (f64, f64), p1: (f64, f64), target: f64) -> Option<f64> {
 /// flatness specifically (not merely "unbracketed") so an ordinary out-of-bracket-but-
 /// sloped pair — which the plain secant already extrapolates from correctly — doesn't pay
 /// for an extra real device capture it doesn't need.
-fn fs_bracket_expansion(v_lo: f32, l_lo: f64, v_hi: f32, l_hi: f64, target: f64) -> Option<f32> {
+///
+/// `(lo, hi)` are the PARAM's own bounds (`FsParamTarget::bounds`), not a hard-coded
+/// `[0, 1]` — the extremes worth probing are the ends of the range the param actually has.
+fn fs_bracket_expansion(
+    v_lo: f32,
+    l_lo: f64,
+    v_hi: f32,
+    l_hi: f64,
+    target: f64,
+    (lo, hi): (f32, f32),
+) -> Option<f32> {
     if (l_hi - l_lo).abs() >= KNOB_TOL_LU {
         return None;
     }
     let (lo_l, hi_l) = (l_lo.min(l_hi), l_lo.max(l_hi));
     if target > hi_l {
-        (v_lo < 1.0 && v_hi < 1.0).then_some(1.0)
+        (v_lo < hi && v_hi < hi).then_some(hi)
     } else if target < lo_l {
-        (v_lo > 0.0 && v_hi > 0.0).then_some(0.0)
+        (v_lo > lo && v_hi > lo).then_some(lo)
     } else {
         None
     }
@@ -2582,7 +2735,17 @@ pub(crate) fn measure_fs_at(
 /// captures on a compressed/noisy response; the best point is written and a re-run can
 /// improve it). The third state, no-authority (`clamp_reason: Some(..)` from the seed's
 /// routing probe), is decided before this and rides `clamped` as it always did.
-fn classify_fs_outcome(best_v: f32, best_lufs: f64, target_lufs: f64) -> (bool, bool) {
+///
+/// `(lo, hi)` are the PARAM's own bounds (`FsParamTarget::bounds`) — "pinned at a bound"
+/// means pinned at the end of THAT param's range, which is `[0, 1]` for most controls but
+/// `[0, 12]` for a raw-dB one. `LEVEL_MIN`/`LEVEL_MAX` stay reserved for the preset/scene
+/// lanes' amplitude knobs.
+fn classify_fs_outcome(
+    best_v: f32,
+    best_lufs: f64,
+    target_lufs: f64,
+    (lo, hi): (f32, f32),
+) -> (bool, bool) {
     if (best_lufs - target_lufs).abs() <= FS_TOL_LU {
         return (false, false);
     }
@@ -2590,8 +2753,8 @@ fn classify_fs_outcome(best_v: f32, best_lufs: f64, target_lufs: f64) -> (bool, 
     // needs: maxed and target still LOUDER, or zeroed and target still QUIETER. A bound hit
     // whose miss points back INTO the knob's range means the search stopped early, not that
     // the sound can't get there.
-    let pinned_loud = best_v >= LEVEL_MAX - 1e-3 && target_lufs > best_lufs;
-    let pinned_quiet = best_v <= LEVEL_MIN + 1e-3 && target_lufs < best_lufs;
+    let pinned_loud = best_v >= hi - 1e-3 && target_lufs > best_lufs;
+    let pinned_quiet = best_v <= lo + 1e-3 && target_lufs < best_lufs;
     let clamped = pinned_loud || pinned_quiet;
     (clamped, !clamped)
 }
@@ -2618,6 +2781,11 @@ fn switch_at_target(measured: f64, target: f64, clamped: bool) -> bool {
 /// verbatim so the caller writes nothing — the re-run idempotency skip (mirrors the base
 /// `level_unchanged` / scene `scene_at_target` skips). `None` (fresh assign, Bake, probe
 /// seams) always solves.
+///
+/// `param` is the CLASSIFIED target ([`FsParamTarget`]) — it supplies the solve's bounds,
+/// the not-a-level-control refusal and the wet floor. Build it with
+/// [`FsParamTarget::from_preset`] off the batch's single field-8 read.
+#[allow(clippy::too_many_arguments)]
 pub fn measure_footswitch(
     switch: u32,
     lev: (&str, &str, &str),
@@ -2626,6 +2794,7 @@ pub fn measure_footswitch(
     target_lufs: f64,
     method: &str,
     current_value: Option<f32>,
+    param: &FsParamTarget,
 ) -> Result<FootswitchLevelResult, String> {
     solve_footswitch(
         switch,
@@ -2634,6 +2803,7 @@ pub fn measure_footswitch(
         target_lufs,
         method,
         current_value,
+        param,
         |bypass, v| measure_fs_at(lev, bypass, stimulus, v),
     )
 }
@@ -2655,8 +2825,24 @@ fn solve_footswitch(
     target_lufs: f64,
     method: &str,
     current_value: Option<f32>,
+    param: &FsParamTarget,
     mut measure: impl FnMut(&[(String, String, bool)], f32) -> Result<lufs::Loudness, String>,
 ) -> Result<FootswitchLevelResult, String> {
+    // ENTRY GUARD, before any device work: a param the classifier doesn't recognise as a
+    // level or wet/mix control is not a volume control. Sweeping it would change the sound
+    // the player wrote, not its loudness — refuse instead of "levelling" it. Surfaces as a
+    // clean per-switch `status: "error"` item (the batched command's `Err` arm).
+    if param.info.class == crate::param_class::ParamClass::Other {
+        return Err(format!(
+            "{} on {} is not a level control — leveling it would change the effect, not the \
+             volume",
+            param.param, param.block
+        ));
+    }
+    // The wet floor anchors on the ENGAGED value when the switch already has one (see
+    // `anchored`'s doc); applied here, not at call sites, so it cannot be forgotten.
+    let param = &param.anchored(current_value);
+    let (bound_lo, bound_hi) = param.bounds();
     let mut measure_at = |v: f32| measure(engaged_bypass, v);
 
     // Guaranteed re-amp OFF on a fresh connection — the measurement's last disengage can be
@@ -2686,6 +2872,7 @@ fn solve_footswitch(
                     clamped: false,
                     unconverged: false,
                     clamp_reason: None,
+                    wet_floor: false,
                     saved: false,
                     verify_lufs: None,
                     iterations: 1,
@@ -2701,8 +2888,10 @@ fn solve_footswitch(
         }
     }
 
-    // Seed two real points and run a bounded generic secant.
-    let (v_lo, v_hi) = (0.25f32, 0.75f32);
+    // Seed two real points and run a bounded generic secant. The seeds sit a quarter and
+    // three quarters of the way across the PARAM's own range — identical to the validated
+    // 0.25/0.75 pair on a `[0,1]` param, and correctly placed on a raw-dB one.
+    let (v_lo, v_hi) = (param.at_fraction(0.25), param.at_fraction(0.75));
     // The FIRST seed doubles as the routing probe: a genuinely silent capture (device output not
     // on USB 1/2) makes `processed_loudness` error "no signal captured" — convert THAT one to the
     // honest "not on USB 1/2" clamp (mirrors the scene mute-floor idiom below). Signal-present but
@@ -2730,6 +2919,7 @@ fn solve_footswitch(
                 clamped: true,
                 unconverged: false,
                 clamp_reason: Some("no signal on USB 1/2".into()),
+                wet_floor: false,
                 saved: false,
                 verify_lufs: None,
                 iterations: 1,
@@ -2774,9 +2964,14 @@ fn solve_footswitch(
         let mut p0 = (v_lo as f64, l_lo.integrated_lufs);
         let mut p1 = (v_hi as f64, l_hi_lufs);
         // Bracket before falling to the correction loop — see `fs_bracket_expansion`'s doc.
-        if let Some(v_extreme) =
-            fs_bracket_expansion(v_lo, l_lo.integrated_lufs, v_hi, l_hi_lufs, target_lufs)
-        {
+        if let Some(v_extreme) = fs_bracket_expansion(
+            v_lo,
+            l_lo.integrated_lufs,
+            v_hi,
+            l_hi_lufs,
+            target_lufs,
+            (bound_lo, bound_hi),
+        ) {
             // Silence at the probe is data (see `FS_SILENT_GEOMETRY_LUFS`); any other
             // error just forfeits the extra probe (the plain secant still runs).
             let extreme_point = match require_live(|| measure_at(v_extreme), stimulus) {
@@ -2844,7 +3039,7 @@ fn solve_footswitch(
                         // `unconverged` from classify_fs_outcome below.
                         break;
                     };
-                    let v2 = raw.clamp(0.0, 1.0) as f32;
+                    let v2 = raw.clamp(bound_lo as f64, bound_hi as f64) as f32;
                     // Silence is data (see `FS_SILENT_GEOMETRY_LUFS`); `l2_real` gates the
                     // at-target break so only a REAL capture may declare victory.
                     let (l2_lufs, l2_real) = match require_live(|| measure_at(v2), stimulus) {
@@ -2902,17 +3097,22 @@ fn solve_footswitch(
     let (clamped, unconverged) = if flat_response {
         (true, false)
     } else {
-        classify_fs_outcome(best_v, best_lufs, target_lufs)
+        classify_fs_outcome(best_v, best_lufs, target_lufs, (bound_lo, bound_hi))
     };
     Ok(FootswitchLevelResult {
         switch,
         measured_lufs: l_lo.integrated_lufs,
+        // The wet floor needs no epilogue: `bounds()` folds it into `bound_lo`, so the
+        // secant never probed below it, `best_v` is always writable, and `predicted_lufs`
+        // is a real reading OF the written value. A wet solve pinned at the floor arrives
+        // here as an ordinary at-a-bound clamp; only the advisory flag below names it.
         final_value: best_v,
         target_lufs,
         predicted_lufs: best_lufs,
         clamped,
         unconverged,
         clamp_reason: None,
+        wet_floor: clamped && param.pinned_at_wet_floor(best_v),
         saved: false,
         verify_lufs: None,
         iterations,
@@ -2953,6 +3153,7 @@ pub fn level_footswitch(
     save: bool,
     verify: bool,
     restore_scene: Option<u32>,
+    param: &FsParamTarget,
 ) -> Result<FootswitchLevelResult, String> {
     let body = || -> Result<FootswitchLevelResult, String> {
         // Freshness barrier first: this is the single-switch probe seam, called with no
@@ -2982,6 +3183,7 @@ pub fn level_footswitch(
             target_lufs,
             method,
             None,
+            param,
         )?;
         if result.clamp_reason.is_some() {
             // No-signal routing clamp: nothing to write — discard the sweep pollution.
@@ -3999,8 +4201,15 @@ fn persisted_value(saved: &serde_json::Value, w: &PersistedWrite) -> Option<f64>
             &w.parameter_id,
         );
     }
+    // CALL-SITE DECISION (three-state split): a value LOOKUP, so `Full` and `BypassOnly`
+    // share one arm — read whatever the overlay holds. A `BypassOnly` overlay carries no
+    // knob keys, so the lookup misses and the write counts as a MISS, which is right: a
+    // scene write there was refused up front (`set_knobs`), so a value reported as written
+    // into one is by definition not persisted.
     match scene_overlay(saved, w.scene_slot, &w.node_id) {
-        SceneOverlay::Present(params) => params.get(&w.parameter_id).and_then(|v| v.as_f64()),
+        SceneOverlay::Full(params) | SceneOverlay::BypassOnly(params) => {
+            params.get(&w.parameter_id).and_then(|v| v.as_f64())
+        }
         SceneOverlay::Absent | SceneOverlay::Unknown => None,
     }
 }
@@ -5592,20 +5801,40 @@ mod tests {
         // Seed pair both near a saturated ceiling (flat) — target is well below both, so
         // the amp needs to go QUIETER: probe toward 0.0.
         assert_eq!(
-            fs_bracket_expansion(0.25, -18.0, 0.75, -17.9, -25.0),
+            fs_bracket_expansion(0.25, -18.0, 0.75, -17.9, -25.0, UNIT_BOUNDS),
             Some(0.0)
         );
         // Symmetric case: target well ABOVE both seeds (needs MORE loudness) → probe 1.0.
         assert_eq!(
-            fs_bracket_expansion(0.25, -30.0, 0.75, -29.9, -20.0),
+            fs_bracket_expansion(0.25, -30.0, 0.75, -29.9, -20.0, UNIT_BOUNDS),
             Some(1.0)
         );
         // Target already bracketed by the seed pair → no expansion needed, the plain
         // secant can converge as-is.
-        assert_eq!(fs_bracket_expansion(0.25, -30.0, 0.75, -18.0, -23.0), None);
+        assert_eq!(
+            fs_bracket_expansion(0.25, -30.0, 0.75, -18.0, -23.0, UNIT_BOUNDS),
+            None
+        );
         // The relevant extreme is ALREADY one of the seeds — nothing left to try.
-        assert_eq!(fs_bracket_expansion(0.0, -30.0, 0.75, -29.9, -35.0), None);
-        assert_eq!(fs_bracket_expansion(0.25, -18.0, 1.0, -17.9, -10.0), None);
+        assert_eq!(
+            fs_bracket_expansion(0.0, -30.0, 0.75, -29.9, -35.0, UNIT_BOUNDS),
+            None
+        );
+        assert_eq!(
+            fs_bracket_expansion(0.25, -18.0, 1.0, -17.9, -10.0, UNIT_BOUNDS),
+            None
+        );
+        // The extremes follow the PARAM's range, not a hard-coded [0, 1]: on a raw-dB
+        // `[0, 12]` param the quiet/loud probes are 0.0 and 12.0, and a seed already AT
+        // 12.0 leaves nothing to try.
+        assert_eq!(
+            fs_bracket_expansion(3.0, -30.0, 9.0, -29.9, -20.0, (0.0, 12.0)),
+            Some(12.0)
+        );
+        assert_eq!(
+            fs_bracket_expansion(3.0, -30.0, 12.0, -29.9, -20.0, (0.0, 12.0)),
+            None
+        );
     }
 
     // The full bracket-then-secant shape, mirroring `correct_iter_secant_converges_on_compressor`'s
@@ -5646,7 +5875,8 @@ mod tests {
             (v_hi, l_hi)
         };
         let (mut p0, mut p1) = ((v_lo, l_lo), (v_hi, l_hi));
-        if let Some(v_extreme) = fs_bracket_expansion(v_lo as f32, l_lo, v_hi as f32, l_hi, target)
+        if let Some(v_extreme) =
+            fs_bracket_expansion(v_lo as f32, l_lo, v_hi as f32, l_hi, target, UNIT_BOUNDS)
         {
             let l_extreme = model(v_extreme as f64);
             if err(l_extreme) < err(best.1) {
@@ -6681,6 +6911,59 @@ mod tests {
         }
     }
 
+    // The BYPASS-ONLY branch (HW-verified fw 1.8.45): the node's Scene Edit flag is OFF, so
+    // the scene carries only the bypass family and SHARES the node's knobs with base. Both
+    // write shapes are wrong — the enable reseeds, the enable-dropped write lands on BASE and
+    // changes every sharing scene (measured: base gain 2.5 → 7.0, the bypass-only overlay
+    // unchanged). Refuse, with the SHARING named so the user can act on it, and touch nothing.
+    #[test]
+    fn set_knobs_refuses_a_scene_write_on_a_bypass_only_overlay() {
+        for (label, overlay) in [
+            ("bypass only", serde_json::json!({ "bypass": false })),
+            (
+                "bypass + bypassType",
+                serde_json::json!({ "bypass": false, "bypassType": "Post" }),
+            ),
+        ] {
+            let sim = crate::sim_device::SimDevice::new();
+            let mut s = Session::from_transport(Box::new(sim.clone()));
+            s.load_preset(0).expect("load_preset");
+            let mut saved = saved_with_overlay(true);
+            saved["scenes"][0]["guitarNodes"]["G1"]["amp"] =
+                serde_json::json!({ "dspUnitParameters": overlay });
+            let knob = scene_knob("outputLevel");
+            let err = set_knobs(&mut s, &[(&knob, 0.9)], Some(&saved))
+                .expect_err("a bypass-only overlay must refuse the scene-scoped write");
+            assert!(
+                err.contains("shares") && err.contains("Base"),
+                "{label}: the error must name the sharing and point at Base: {err}"
+            );
+            assert!(
+                !sim.events().iter().any(|e| matches!(
+                    e,
+                    crate::sim_device::SimEvent::ChangeParameter { .. }
+                        | crate::sim_device::SimEvent::SceneEdit { .. }
+                )),
+                "{label}: nothing may be written when the batch is refused: {:?}",
+                sim.events()
+            );
+        }
+    }
+
+    /// The bounds of an ordinary `[0,1]` control — what the FS solve assumed unconditionally
+    /// before the param-class split, so every pre-existing solve test keeps its exact
+    /// arithmetic by passing it.
+    const UNIT_BOUNDS: (f32, f32) = (0.0, 1.0);
+
+    /// A plain `level_linear` `[0,1]` solve target — the shape every legacy FS solve test
+    /// exercised implicitly. `authored` is irrelevant outside the WetMix floor, so 0.5.
+    fn fs_unit_param() -> FsParamTarget {
+        let p = FsParamTarget::new("ACD_SomeBlock", "level", 0.5);
+        assert_eq!(p.info.class, crate::param_class::ParamClass::LevelLinear);
+        assert_eq!(p.bounds(), UNIT_BOUNDS);
+        p
+    }
+
     /// A synthetic loudness reading for the injected-capture footswitch tests.
     fn fs_loud(integrated: f64) -> lufs::Loudness {
         lufs::Loudness {
@@ -6705,10 +6988,19 @@ mod tests {
         let seen: std::cell::RefCell<Vec<Vec<(String, String, bool)>>> =
             std::cell::RefCell::new(Vec::new());
         // Response with real slope so the secant keeps iterating (target never reached).
-        let r = solve_footswitch(2, &iso, &[], -20.0, "baked", None, |byp, v| {
-            seen.borrow_mut().push(byp.to_vec());
-            Ok(fs_loud(-40.0 + 10.0 * f64::from(v)))
-        })
+        let r = solve_footswitch(
+            2,
+            &iso,
+            &[],
+            -20.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |byp, v| {
+                seen.borrow_mut().push(byp.to_vec());
+                Ok(fs_loud(-40.0 + 10.0 * f64::from(v)))
+            },
+        )
         .expect("solve");
         let calls = seen.borrow();
         assert!(
@@ -6761,10 +7053,19 @@ mod tests {
     #[test]
     fn solve_footswitch_bracket_mode_converges_on_the_univibe_cliff() {
         let mut captures = 0u32;
-        let r = solve_footswitch(12, &[], &[], -20.0, "baked", None, |_, v| {
-            captures += 1;
-            Ok(fs_loud(univibe_volume_curve(v)))
-        })
+        let r = solve_footswitch(
+            12,
+            &[],
+            &[],
+            -20.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, v| {
+                captures += 1;
+                Ok(fs_loud(univibe_volume_curve(v)))
+            },
+        )
         .expect("solve");
         assert!(
             (r.predicted_lufs - -20.0).abs() <= KNOB_TOL_LU,
@@ -6785,10 +7086,19 @@ mod tests {
     #[test]
     fn solve_footswitch_flat_response_reports_clamped_not_unconverged() {
         let mut captures = 0u32;
-        let r = solve_footswitch(12, &[], &[], -20.0, "baked", None, |_, _| {
-            captures += 1;
-            Ok(fs_loud(-27.0))
-        })
+        let r = solve_footswitch(
+            12,
+            &[],
+            &[],
+            -20.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, _| {
+                captures += 1;
+                Ok(fs_loud(-27.0))
+            },
+        )
         .expect("solve");
         assert!(
             r.clamped && !r.unconverged,
@@ -6834,10 +7144,19 @@ mod tests {
     #[test]
     fn solve_footswitch_treats_post_seed_silence_as_the_quiet_extreme_not_a_routing_error() {
         let mut captures = 0u32;
-        let r = solve_footswitch(21, &[], &[], -26.0, "baked", None, |_, v| {
-            captures += 1;
-            plumes_level_curve(v)
-        })
+        let r = solve_footswitch(
+            21,
+            &[],
+            &[],
+            -26.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, v| {
+                captures += 1;
+                plumes_level_curve(v)
+            },
+        )
         .expect("a silent capture past the first seed must be DATA, never a fatal abort");
         assert!(
             (r.predicted_lufs - -26.0).abs() <= KNOB_TOL_LU,
@@ -6884,10 +7203,19 @@ mod tests {
     #[test]
     fn solve_footswitch_flat_seed_pair_with_silent_expansion_still_converges() {
         let mut captures = 0u32;
-        let r = solve_footswitch(22, &[], &[], -26.0, "baked", None, |_, v| {
-            captures += 1;
-            flat_plateau_curve(v)
-        })
+        let r = solve_footswitch(
+            22,
+            &[],
+            &[],
+            -26.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, v| {
+                captures += 1;
+                flat_plateau_curve(v)
+            },
+        )
         .expect("a silent bracket-expansion probe must not abort the solve");
         assert!(
             (r.predicted_lufs - -26.0).abs() <= KNOB_TOL_LU,
@@ -6919,10 +7247,19 @@ mod tests {
     #[test]
     fn solve_footswitch_second_seed_silence_becomes_data_not_a_hard_error() {
         let mut captures = 0u32;
-        let r = solve_footswitch(23, &[], &[], -20.0, "baked", None, |_, v| {
-            captures += 1;
-            second_seed_silent_curve(v)
-        })
+        let r = solve_footswitch(
+            23,
+            &[],
+            &[],
+            -20.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, v| {
+                captures += 1;
+                second_seed_silent_curve(v)
+            },
+        )
         .expect("a silent SECOND seed must not abort the solve either");
         assert!(
             (r.predicted_lufs - -20.0).abs() <= KNOB_TOL_LU,
@@ -6962,10 +7299,19 @@ mod tests {
     #[test]
     fn solve_footswitch_silence_sentinel_stays_below_real_captures_on_quiet_chains() {
         let mut captures = 0u32;
-        let r = solve_footswitch(26, &[], &[], -68.0, "baked", None, |_, v| {
-            captures += 1;
-            deep_quiet_pedal_curve(v)
-        })
+        let r = solve_footswitch(
+            26,
+            &[],
+            &[],
+            -68.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, v| {
+                captures += 1;
+                deep_quiet_pedal_curve(v)
+            },
+        )
         .expect("a silent probe on a quiet chain must be data, never an abort");
         assert!(
             (r.predicted_lufs - -68.0).abs() <= KNOB_TOL_LU,
@@ -6987,10 +7333,19 @@ mod tests {
     #[test]
     fn solve_footswitch_flat_response_without_silence_keeps_honest_clamp() {
         let mut captures = 0u32;
-        let r = solve_footswitch(25, &[], &[], -26.0, "baked", None, |_, _v| {
-            captures += 1;
-            Ok(fs_loud(-17.0))
-        })
+        let r = solve_footswitch(
+            25,
+            &[],
+            &[],
+            -26.0,
+            "baked",
+            None,
+            &fs_unit_param(),
+            |_, _v| {
+                captures += 1;
+                Ok(fs_loud(-17.0))
+            },
+        )
         .expect("solve");
         assert!(
             r.clamped && !r.unconverged,
@@ -7002,6 +7357,226 @@ mod tests {
              routing probe alone): {r:?}"
         );
         assert!(captures <= 3 + FS_CORRECT_MAX, "captures={captures}");
+    }
+
+    // ── param-class-driven solve: refusal, bounds, wet floor ────────────────────────────
+
+    // ENTRY GUARD: a param the classifier answers `Other` for is not a level control.
+    // Sweeping it would change the sound the player wrote, so the solve must refuse BEFORE
+    // any device work — no capture may be requested at all.
+    #[test]
+    fn solve_footswitch_refuses_a_param_that_is_not_a_level_control() {
+        let mut captures = 0u32;
+        // `intensity` is in neither the defaults nor any block override ⇒ Other.
+        let param = FsParamTarget::new("ACD_TremoloBias", "intensity", 0.5);
+        assert_eq!(param.info.class, crate::param_class::ParamClass::Other);
+        let err = solve_footswitch(3, &[], &[], -20.0, "baked", None, &param, |_, _| {
+            captures += 1;
+            Ok(fs_loud(-20.0))
+        })
+        .expect_err("an Other-classified param must refuse");
+        assert_eq!(captures, 0, "the refusal must precede every device capture");
+        assert!(
+            err.contains("intensity")
+                && err.contains("ACD_TremoloBias")
+                && err.contains("not a level control"),
+            "the refusal must name the param, the block and the cause: {err}"
+        );
+        // The block-scoped override trap rides the same guard: `level` is a level_linear
+        // DEFAULT everywhere, but on the TM Rumble it is an amp knob that must never be swept.
+        let trapped = FsParamTarget::new("ACD_TMRumbleV3", "level", 0.5);
+        assert!(
+            solve_footswitch(3, &[], &[], -20.0, "baked", None, &trapped, |_, _| Ok(
+                fs_loud(-20.0)
+            ))
+            .is_err()
+        );
+    }
+
+    // BOUNDS: params are no longer all `[0,1]`. On a raw-dB `[0, 12]` control the seeds land
+    // at a quarter/three quarters of THAT range (3.0 / 9.0), the secant clamps to it, and a
+    // solved value above 1.0 survives instead of being silently pinned.
+    #[test]
+    fn solve_footswitch_solves_in_the_params_own_db_range() {
+        let param = FsParamTarget::new("ACD_Boost", "gain", 2.5);
+        assert_eq!(param.info.class, crate::param_class::ParamClass::LevelDb);
+        assert_eq!(param.bounds(), (0.0, 12.0));
+        let seen: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+        // ~1:1 dB→LUFS, HW-verified for this block: -30 LUFS at 0 dB.
+        let r = solve_footswitch(0, &[], &[], -22.0, "baked", None, &param, |_, v| {
+            seen.borrow_mut().push(v);
+            Ok(fs_loud(-30.0 + f64::from(v)))
+        })
+        .expect("solve");
+        assert_eq!(
+            seen.borrow()[..2],
+            [3.0, 9.0],
+            "the seeds are a quarter and three quarters ACROSS THE RANGE, not 0.25/0.75"
+        );
+        assert!(
+            (r.final_value - 8.0).abs() < 0.05,
+            "target -22 needs +8 dB, a value the old [0,1] clamp could never return: {r:?}"
+        );
+        assert!(!r.clamped && !r.unconverged, "8 dB is well inside [0,12]");
+    }
+
+    // ...and the bound-hit verdict follows the range too: pinned at 12.0 with the target
+    // still louder is UNREACHABLE, not an exhausted search.
+    #[test]
+    fn solve_footswitch_clamps_at_the_db_range_ceiling() {
+        let param = FsParamTarget::new("ACD_Boost", "gain", 2.5);
+        let r = solve_footswitch(0, &[], &[], -5.0, "baked", None, &param, |_, v| {
+            Ok(fs_loud(-30.0 + f64::from(v)))
+        })
+        .expect("solve");
+        assert!(
+            (r.final_value - 12.0).abs() < 1e-3,
+            "the solve must pin at the param's own ceiling: {r:?}"
+        );
+        assert!(
+            r.clamped && !r.unconverged,
+            "maxed with the target still louder is unreachable, not re-runnable: {r:?}"
+        );
+    }
+
+    // WET FLOOR: a wet/mix control driven toward 0 REMOVES the effect rather than making it
+    // quieter, so `bounds()` raises the low bound to `WET_FLOOR_FRACTION` × authored — the
+    // solve can't even probe below it. The floored row is reported clamped with the
+    // `wet_floor` flag — and deliberately WITHOUT `clamp_reason`, whose contract is "not
+    // reaching USB 1/2" (the UI renders any reason as `offbranch`).
+    #[test]
+    fn solve_footswitch_floors_a_wet_mix_at_a_quarter_of_the_authored_value() {
+        // Authored mix 0.80 ⇒ floor 0.20. The response wants far less to hit target.
+        let param = FsParamTarget::new("ACD_Chorus", "mix", 0.8);
+        assert_eq!(param.info.class, crate::param_class::ParamClass::WetMix);
+        let r = solve_footswitch(0, &[], &[], -40.0, "baked", None, &param, |_, v| {
+            Ok(fs_loud(-20.0 + 10.0 * f64::from(v)))
+        })
+        .expect("solve");
+        assert!(
+            (r.final_value - 0.2).abs() < 1e-6,
+            "the solve must be floored at 25% of the authored 0.8: {r:?}"
+        );
+        assert!(
+            r.clamped && !r.unconverged,
+            "a floored row is an honest clamp, never a re-runnable miss: {r:?}"
+        );
+        assert_eq!(
+            r.clamp_reason, None,
+            "clamp_reason means 'not on USB 1/2' ONLY — a wet floor must not be rendered as \
+             a routing failure: {r:?}"
+        );
+        assert!(
+            r.wet_floor,
+            "the floor's cause rides the wet_floor flag: {r:?}"
+        );
+        // With the floor folded into `bounds()`, the reported loudness is a REAL reading
+        // of the written value — never an estimate at an unwritable point below the floor.
+        assert!(
+            (r.predicted_lufs - (-20.0 + 10.0 * f64::from(r.final_value))).abs() < 1e-9,
+            "predicted_lufs must be the capture AT final_value: {r:?}"
+        );
+    }
+
+    // The floor is RELATIVE, never an absolute 0.25: a solve that lands ABOVE the floor is
+    // untouched and unflagged, and an authored 0.0 (already fully dry) constrains nothing.
+    #[test]
+    fn solve_footswitch_wet_floor_is_relative_and_only_binds_when_crossed() {
+        let unfloored = solve_footswitch(
+            0,
+            &[],
+            &[],
+            -14.0,
+            "baked",
+            None,
+            &FsParamTarget::new("ACD_Chorus", "mix", 0.8),
+            |_, v| Ok(fs_loud(-20.0 + 10.0 * f64::from(v))),
+        )
+        .expect("solve");
+        assert!(
+            (unfloored.final_value - 0.6).abs() < 0.01 && !unfloored.clamped,
+            "0.6 is above the 0.2 floor, so nothing is clamped or flagged: {unfloored:?}"
+        );
+        assert!(!unfloored.wet_floor);
+
+        // Authored 0.0 ⇒ floor 0.0 ⇒ no constraint at all (never a hard 0.25).
+        let dry = solve_footswitch(
+            0,
+            &[],
+            &[],
+            -40.0,
+            "baked",
+            None,
+            &FsParamTarget::new("ACD_Chorus", "mix", 0.0),
+            |_, v| Ok(fs_loud(-20.0 + 10.0 * f64::from(v))),
+        )
+        .expect("solve");
+        assert!(
+            dry.final_value <= 1e-6,
+            "an authored-0.0 mix floors at 0.0, not at an absolute 0.25: {dry:?}"
+        );
+        assert!(
+            !dry.wet_floor,
+            "a floor that never RAISED the low bound is an ordinary range edge, not the \
+             verify-by-ear advisory: {dry:?}"
+        );
+    }
+
+    // The wet floor must anchor on the ENGAGED value, not the switch-OFF base the target was
+    // constructed from — an existing assign's stored valueA is what the player actually dialed
+    // in while engaged, and it reaches the solve as `current_value` (the re-run anchor), which
+    // `solve_footswitch` folds into the target itself (`anchored`) so no call site can forget.
+    // Base 0.05 (near-dry, switch-OFF `valueB`) with an existing engaged valueA of 0.9 must
+    // floor at 0.9 × 25% = 0.225, not 0.05 × 25% = 0.0125 — the exact incident (chorus mix→0)
+    // the anchor exists to prevent.
+    #[test]
+    fn wet_floor_anchors_on_the_existing_assigns_engaged_value_not_the_base() {
+        let param = FsParamTarget::new("ACD_Chorus", "mix", 0.05);
+        let r = solve_footswitch(0, &[], &[], -40.0, "assigned", Some(0.9), &param, |_, v| {
+            Ok(fs_loud(-20.0 + 10.0 * f64::from(v)))
+        })
+        .expect("solve");
+        assert!(
+            (r.final_value - 0.225).abs() < 1e-6,
+            "must floor at 25% of the ENGAGED 0.9, not the base 0.05: {r:?}"
+        );
+        assert!(r.clamped && !r.unconverged && r.wet_floor);
+    }
+
+    // Base-anchoring stays intact when there is no existing assign (`engaged: None`) — a fresh
+    // assign floors on the base value exactly as before the anchor existed.
+    #[test]
+    fn wet_floor_anchor_is_a_noop_with_no_existing_assign() {
+        let param = FsParamTarget::new("ACD_Chorus", "mix", 0.05);
+        assert_eq!(param.anchored(None).authored, 0.05);
+    }
+
+    // The WRITE path must carry a raw-dB solved value VERBATIM: with params no longer all
+    // `[0,1]`, a stray clamp anywhere between the solve and the wire would silently pin a
+    // `+8 dB` boost at `1.0`. Pinned on the BAKE write, which goes out as `changeParameter`
+    // (`proto::change_parameter`'s `field_f32`, no clamp — the only `clamp(0.0, 1.0)` in
+    // `proto.rs` belongs to `setPresetLevel`, a different message). The ASSIGN write's
+    // `valueA` is a plain `serde_json` float in the same function and is likewise unclamped.
+    #[test]
+    fn write_fs_values_carries_a_raw_db_value_past_one_unclamped() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        let pending = vec![FsPendingWrite {
+            switch: 1,
+            lev: ("G1".to_string(), "boost".to_string(), "gain".to_string()),
+            write: FsWrite::Bake {
+                clear_stale: None,
+                mirror_scenes: vec![],
+            },
+            value: 8.0,
+        }];
+        write_fs_values_on_session(&mut s, 30, &pending, None).expect("write");
+        assert_eq!(
+            sim.param_write(crate::sim_device::SCENE_BASE, "G1", "boost", "gain"),
+            Some(8.0),
+            "a raw-dB +8 must reach the device as 8.0, never pinned to 1.0: {:?}",
+            sim.events()
+        );
     }
 
     // The three-state split (was ONE `clamped` flag with `clamp_reason: None` for both the
@@ -7028,7 +7603,7 @@ mod tests {
             ("maxed, target quieter", 1.0, -14.0, (false, true)),
         ] {
             assert_eq!(
-                classify_fs_outcome(best_v, best_lufs, target),
+                classify_fs_outcome(best_v, best_lufs, target, UNIT_BOUNDS),
                 want,
                 "{label}: v={best_v} lufs={best_lufs}"
             );

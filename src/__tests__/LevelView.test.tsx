@@ -216,6 +216,7 @@ function footswitchResultStub(over: Record<string, unknown> = {}) {
     // silently read as `undefined` instead of failing the way the real contract does.
     unconverged: false,
     clamp_reason: null,
+    wet_floor: false,
     saved: true,
     verify_lufs: -22,
     iterations: 1,

@@ -45,6 +45,7 @@ mod lint;
 mod lufs;
 mod migration;
 mod monitor;
+mod param_class;
 mod paramedit;
 mod preset_io;
 mod presetmeta;

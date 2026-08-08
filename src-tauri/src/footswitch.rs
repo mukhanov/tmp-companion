@@ -29,8 +29,11 @@ pub struct FootswitchFn {
     pub is_active: bool,
 }
 
-/// A continuous block parameter the leveler can solve on (numeric `dspUnitParameter` in
-/// `[0,1]`), surfaced so the UI can offer a block+parameter picker per footswitch.
+/// A continuous block parameter the leveler can solve on (a numeric `dspUnitParameter` that
+/// [`crate::param_class::classify`] recognises as a LEVEL or WET/MIX control), surfaced so
+/// the UI can offer a block+parameter picker per footswitch. `current` and the solve run in
+/// the param's OWN units and range — no longer assumed `[0,1]`: `ACD_Boost.gain` is raw dB
+/// over `[0, 12]` (HW-verified fw 1.8.45).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LevelParamCandidate {
     pub group_id: String,
@@ -52,14 +55,23 @@ pub struct FootswitchInfo {
     pub level_params: Vec<LevelParamCandidate>,
 }
 
-/// `dspUnitParameter` keys that are never leveling targets (bool/list controls). Numeric
-/// `[0,1]` continuous params are kept; bool/string params are already excluded by the
-/// `as_f64` filter, so this only documents intent for the bypass family.
-fn is_levelable_param(key: &str, val: &Value) -> bool {
-    !matches!(
-        key,
-        "bypass" | "bypassType" | "clipState" | "muteInput" | "muteOutput"
-    ) && val.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v))
+/// Is `key` on block `fender_id` a leveling candidate? The gate is
+/// [`crate::param_class::classify`]: a param is a candidate iff it classifies as something
+/// OTHER than [`crate::param_class::ParamClass::Other`] — i.e. the table recognises it as a
+/// level or wet/mix control. That table ANNOTATES rather than guesses, so an unlisted param
+/// is silently excluded, which is the safe default.
+///
+/// No belt over the classifier: the per-scene state keys (`bypass`, `clipState`, …) are
+/// absent from the table (⇒ `Other`) AND carry bool/string values (`as_f64` fails) — a
+/// name list here could never change the answer. What is GONE is the old `(0.0..=1.0)`
+/// value filter: it silently dropped `ACD_Boost.gain`, whose base value 2.5 is raw dB
+/// (HW-verified fw 1.8.45, accepted by `changeParameter`, ~1:1 dB→LUFS) — params are no
+/// longer all `[0,1]`, so the RANGE now comes from `ParamInfo.range`, never from the
+/// observed value.
+fn is_levelable_param(fender_id: &str, key: &str, val: &Value) -> bool {
+    val.as_f64().is_some()
+        && crate::param_class::classify(fender_id, key).class
+            != crate::param_class::ParamClass::Other
 }
 
 /// Enumerate the preset's BLOCK-ACTING footswitches (`func:"on-off"` / `func:"param"`),
@@ -171,7 +183,10 @@ pub fn enumerate_block_footswitches(ftsw: &Value, preset: &Value) -> Vec<Footswi
         if functions.is_empty() {
             continue; // not a block-acting switch
         }
-        // Level-param candidates: continuous [0,1] params of each acted-on block (deduped).
+        // Level-param candidates: the classifier-recognised level/wet params of each
+        // acted-on block (deduped). The block's FenderId drives the classification — the
+        // table's block-scoped overrides are keyed on it (`ACD_TMRumbleV3.level` is barred,
+        // `ACD_Boost.gain` is raw dB), so the id must be threaded, not the param name alone.
         let mut level_params: Vec<LevelParamCandidate> = Vec::new();
         let mut seen: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
@@ -181,7 +196,7 @@ pub fn enumerate_block_footswitches(ftsw: &Value, preset: &Value) -> Vec<Footswi
                 keys.sort();
                 for k in keys {
                     let v = &params[k];
-                    if is_levelable_param(k, v) && seen.insert((nid.clone(), k.clone())) {
+                    if is_levelable_param(fid, k, v) && seen.insert((nid.clone(), k.clone())) {
                         level_params.push(LevelParamCandidate {
                             group_id: g.clone(),
                             node_id: nid.clone(),
@@ -743,7 +758,7 @@ mod tests {
     }
 
     // Enumerate block-acting footswitches: on-off + param kept, scene/midi skipped;
-    // level-param candidates resolved from the graph (continuous [0,1] params only).
+    // level-param candidates resolved from the graph and gated by `param_class::classify`.
     #[test]
     fn enumerate_block_footswitches_filters_and_resolves() {
         let preset = serde_json::json!({
@@ -772,14 +787,18 @@ mod tests {
         assert_eq!(sw1.functions.len(), 1);
         assert_eq!(sw1.functions[0].func, "on-off");
         assert_eq!(sw1.functions[0].fender_id, "ACD_OD");
-        // gain + level are levelable; bypass/bypassType are not.
+        // `level` is levelable; bypass/bypassType are not — and neither is `gain`, which on
+        // a generic drive block is DRIVE, not a level control (the classifier annotates only
+        // what it knows: `gain` is `level_db` on `ACD_Boost` alone, everything else `Other`).
+        // Before the param-class gate this list was `["gain", "level"]`, i.e. the picker
+        // offered a distortion knob as a loudness control.
         let params: Vec<&str> = sw1
             .level_params
             .iter()
             .map(|p| p.parameter_id.as_str())
             .collect();
-        assert_eq!(params, vec!["gain", "level"]);
-        assert_eq!(sw1.level_params[0].current, 0.4);
+        assert_eq!(params, vec!["level"]);
+        assert_eq!(sw1.level_params[0].current, 0.7);
 
         let sw2 = &infos[1];
         assert_eq!(sw2.switch, 2);
@@ -859,7 +878,10 @@ mod tests {
             .iter()
             .map(|p| p.parameter_id.as_str())
             .collect();
-        assert_eq!(mythic_params, vec!["gain", "output", "treble"]);
+        // `output` is a level_linear default; `gain` (drive) and `treble` (tone) are not
+        // level controls and the param-class gate now drops them — the list was
+        // `["gain", "output", "treble"]` when any numeric [0,1] param qualified.
+        assert_eq!(mythic_params, vec!["output"]);
 
         // G1 side: switch 3 (ACD_Lightspeed) — the B3 bracketing-fix subject.
         let lightspeed = infos.iter().find(|i| i.switch == 3).expect("switch 3");
@@ -869,10 +891,16 @@ mod tests {
             .iter()
             .map(|p| p.parameter_id.as_str())
             .collect();
-        assert_eq!(lightspeed_params, vec!["drive", "freq", "loudness"]);
+        // `loudness` is a `level_linear` default (it's this pedal's output-level knob —
+        // the B3 bracketing fix leveled it on hardware), so it survives the class gate.
+        // `drive` and `freq` stay TABLE GAPS deliberately: the classifier answers `Other`
+        // for both (they shaped tone, not loudness, and were only ever offered under the
+        // old any-numeric-[0,1] rule, which listed `["drive", "freq", "loudness"]`).
+        assert_eq!(lightspeed_params, vec!["loudness"]);
 
-        // G1 side: switch 11 (ACD_TremoloBias) — ratehz=6.0 is outside [0,1] and excluded,
-        // same shape as UniVibe's speed exclusion below.
+        // G1 side: switch 11 (ACD_TremoloBias) — `intensity` is a depth control, not a level
+        // one, so only `level` survives (`ratehz=6.0` was already excluded before, by the old
+        // [0,1] value filter; the classifier now excludes it on class alone).
         let tremolo = infos.iter().find(|i| i.switch == 11).expect("switch 11");
         assert_eq!(tremolo.functions[0].fender_id, "ACD_TremoloBias");
         let tremolo_params: Vec<&str> = tremolo
@@ -882,8 +910,8 @@ mod tests {
             .collect();
         assert_eq!(
             tremolo_params,
-            vec!["intensity", "level"],
-            "ratehz=6.0 is outside [0,1] and correctly excluded"
+            vec!["level"],
+            "only the level control is a candidate; intensity/ratehz are not"
         );
 
         // G4 side: switch 12 (ACD_UniVibe) resolves in the SAME pass as the G1 switches
@@ -897,8 +925,78 @@ mod tests {
             .collect();
         assert_eq!(
             uni_vibe_params,
-            vec!["intensity", "volume"],
-            "speed=3.85 is outside [0,1] and correctly excluded"
+            vec!["volume"],
+            "only the level control is a candidate; intensity/speed are not"
+        );
+    }
+
+    // Candidate enumeration is now `param_class::classify`, block-scoped: the SAME param
+    // name qualifies on one block and not another, and a value outside [0,1] no longer
+    // disqualifies anything. Drives the picker, so each of the three interesting shapes is
+    // pinned end-to-end through `enumerate_block_footswitches`, not just on the predicate.
+    #[test]
+    fn level_param_candidates_follow_the_param_class_table_not_a_0_1_value_range() {
+        let preset = serde_json::json!({
+            "audioGraph": { "guitarNodes": { "G1": [
+                // Raw dB, HW-verified fw 1.8.45: base 2.5 IS +2.5 dB, so the old
+                // `(0.0..=1.0)` value filter silently dropped this block's only level
+                // control. `gain` is `Other` on every OTHER block (it means drive).
+                { "nodeId": "boost", "FenderId": "ACD_Boost", "dspUnitParameters": {
+                    "gain": 2.5, "level": 0.5, "bypass": false }},
+                // The documented trap: `level` is a level_linear DEFAULT everywhere, but on
+                // the TM Rumble it is an amp knob that must never be swept for loudness.
+                { "nodeId": "rumble", "FenderId": "ACD_TMRumbleV3", "dspUnitParameters": {
+                    "level": 0.5, "bypass": false }},
+                // A wet/mix control IS a candidate — it moves loudness — but it carries the
+                // WetMix class, which is what arms the solver's floor.
+                { "nodeId": "chorus", "FenderId": "ACD_Chorus", "dspUnitParameters": {
+                    "mix": 0.8, "rate": 0.3, "bypass": false }}
+            ]}, "micNodes": {} },
+            "ftsw": [
+                [{ "func": "on-off", "nodes": [{ "groupId": "G1", "nodeId": "boost" }] }],
+                [{ "func": "on-off", "nodes": [{ "groupId": "G1", "nodeId": "rumble" }] }],
+                [{ "func": "on-off", "nodes": [{ "groupId": "G1", "nodeId": "chorus" }] }],
+            ]
+        });
+        let infos = enumerate_block_footswitches(&preset["ftsw"], &preset);
+        let params_of = |sw: u32| -> Vec<&str> {
+            infos
+                .iter()
+                .find(|i| i.switch == sw)
+                .unwrap_or_else(|| panic!("switch {sw}"))
+                .level_params
+                .iter()
+                .map(|p| p.parameter_id.as_str())
+                .collect()
+        };
+
+        assert_eq!(
+            params_of(0),
+            vec!["gain", "level"],
+            "ACD_Boost.gain is a candidate despite its 2.5 (raw dB) base value"
+        );
+        let info = crate::param_class::classify("ACD_Boost", "gain");
+        assert_eq!(info.class, crate::param_class::ParamClass::LevelDb);
+        assert_eq!(
+            info.range,
+            (0.0, 12.0),
+            "the SOLVE's bounds come from the table, never from the observed value"
+        );
+
+        assert!(
+            params_of(1).is_empty(),
+            "ACD_TMRumbleV3.level is an amp knob, not a level control — never a candidate"
+        );
+
+        assert_eq!(
+            params_of(2),
+            vec!["mix"],
+            "a wet/mix control IS a candidate ('rate' is not)"
+        );
+        assert_eq!(
+            crate::param_class::classify("ACD_Chorus", "mix").class,
+            crate::param_class::ParamClass::WetMix,
+            "…and it carries WetMix, which is what arms the solver's wet floor"
         );
     }
 

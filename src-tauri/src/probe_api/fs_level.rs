@@ -140,7 +140,14 @@ pub fn probe_bake_validate(
     let stim = read_stimulus_calibrated(&stim_path, None)?;
     // One read → the node's value, base bypass, switch fn count, engaged force-list, and
     // the saved `lastLoadedScene` (the commit's save must re-stamp it).
-    type Snap = (f64, bool, usize, Vec<(String, String, bool)>, Option<u32>);
+    type Snap = (
+        f64,
+        bool,
+        usize,
+        Vec<(String, String, bool)>,
+        Option<u32>,
+        leveller::FsParamTarget,
+    );
     let snapshot = || -> Result<Snap, String> {
         let (p, _, _) = read_slot_preset_parsed(slot)?;
         let ftsw = p.get("ftsw").cloned().unwrap_or(serde_json::Value::Null);
@@ -151,16 +158,19 @@ pub fn probe_bake_validate(
             .unwrap_or(usize::MAX);
         let engaged = footswitch::engaged_bypass_for_switch(&ftsw, &p, switch);
         let restore = crate::last_loaded_scene(&p);
+        // The classified solve target, off this SAME read — no extra field-8 round trip.
+        let lev_param = leveller::FsParamTarget::from_preset(&p, node, param);
         Ok((
             v,
             footswitch::block_bypassed_in_base(&p, node),
             fns,
             engaged,
             restore,
+            lev_param,
         ))
     };
 
-    let (orig, byp0, fns0, engaged, restore) = snapshot()?;
+    let (orig, byp0, fns0, engaged, restore, lev_param) = snapshot()?;
     let mut out = format!(
         "[probe --bake-validate] slot {} · FS{switch} · {group}/{node}.{param}\n  before: value={orig:.4} bypass={byp0} switch_fns={fns0}\n",
         slot + 1
@@ -183,6 +193,7 @@ pub fn probe_bake_validate(
         true,
         false,
         restore,
+        &lev_param,
     )?;
     out += &format!(
         "  baked: method={} value={:.4}{}\n",
@@ -192,7 +203,7 @@ pub fn probe_bake_validate(
     );
 
     // Verify field-8: the value landed, bypass unchanged, NO param fn added.
-    let (after, byp1, fns1, _, _) = snapshot()?;
+    let (after, byp1, fns1, _, _, _) = snapshot()?;
     let landed = (after - r.final_value as f64).abs() < 1e-3;
     out += &format!(
         "  after : value={after:.4} bypass={byp1} switch_fns={fns1}  ⇒  {}\n",
@@ -217,7 +228,7 @@ pub fn probe_bake_validate(
         s.save_current_preset(slot)?;
     }
     let _ = Session::connect().map(|mut s| s.set_reamp_mode(false));
-    let (restored, _, _, _, _) = snapshot()?;
+    let (restored, _, _, _, _, _) = snapshot()?;
     out += &format!(
         "  restore: value={restored:.4}  ⇒  {}\n",
         if (restored - orig).abs() < 1e-3 {
@@ -635,6 +646,7 @@ pub fn probe_level_footswitch(
         commit,
         true,
         restore,
+        &leveller::FsParamTarget::from_preset(&preset, lev_node, lev_param),
     )?;
     let mut out = format!(
         "[probe --level-footswitch] preset slot {} · FS{switch} · {lev_group}/{lev_node}.{lev_param}  ({})\n",
@@ -800,10 +812,11 @@ pub fn probe_set_param_save(
     value: f32,
     save: bool,
 ) -> Result<String, String> {
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(format!(
-            "refusing value {value}: block parameters are normalised 0.0..=1.0"
-        ));
+    // `changeParameter` carries the value in the block's OWN real units verbatim (dB,
+    // Hz, …) — not all params are `[0,1]` (HW: `ACD_Boost.gain` accepts raw dB; see
+    // `param_class`'s doc). A diagnostic seam only guards a sane wire value.
+    if !value.is_finite() {
+        return Err(format!("refusing non-finite value {value}"));
     }
     let (preset, _, _) = read_slot_preset_parsed(list_index)?;
     let name = preset

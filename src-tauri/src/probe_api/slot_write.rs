@@ -86,10 +86,13 @@ pub fn probe_set_param(
             "refusing --set-param on {slot}: scratch-zone only {SCRATCH_SLOTS:?}"
         ));
     }
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(format!(
-            "refusing value {value}: block parameters are normalised 0.0..=1.0"
-        ));
+    // `changeParameter` carries the value in the block's OWN real units verbatim (dB, Hz,
+    // …), never range-checked by the wire — disproven this session on hardware:
+    // `ACD_Boost.gain` accepts raw dB 0/2.5/5, ~1:1 dB→LUFS (see `param_class`'s doc). This
+    // seam is a scratch-zone diagnostic (the caller), so the only guard that belongs here
+    // is a sane wire value, not a guessed range.
+    if !value.is_finite() {
+        return Err(format!("refusing non-finite value {value}"));
     }
     let mut s = Session::connect()?;
     s.load_preset(slot)?;
@@ -992,7 +995,15 @@ fn scene_count(preset: &serde_json::Value) -> usize {
 }
 
 /// A scene overlay's `outputLevel` for `node_id` (`scenes[i].guitarNodes.<group>.<nodeId>`),
-/// `None` when the scene carries no overlay for that node.
+/// `None` when the scene carries no `outputLevel` under that node.
+///
+/// Deliberately does NOT classify the overlay the way `scene_jobs::scene_overlay` does
+/// (`Full` / `BypassOnly` / `Absent` / `Unknown`): this is a pure VALUE lookup, so it is
+/// the equivalent of that enum's shared `Full | BypassOnly` arm and a bypass-only overlay
+/// correctly reads `None` (no `outputLevel` key to report). Nothing here infers overlay
+/// PRESENCE to gate a `setNodeSceneEdit`: both enable sites in this module
+/// (`write_three_and_save`, `probe_scene_write_cell`) are caller-driven diagnostic axes on
+/// a SCRATCH slot, which is what makes the reseed they exercise safe.
 fn scene_overlay_output_level(
     preset: &serde_json::Value,
     scene_slot: u32,
