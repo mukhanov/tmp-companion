@@ -15,11 +15,11 @@ use crate::session;
 use crate::session::Session;
 use crate::LevelBlockArg;
 
-/// The one engaged/floor criterion the diagnostic arms share: finite chain audio
-/// meaningfully above the stationary floor, with real dynamics (a floor read is
-/// near-flat). NaN comparisons are false, so a failed measure reads "not engaged".
+/// The engaged/floor criterion the diagnostic arms share, delegating to the ONE
+/// definition ([`leveller::is_engaged`]) so this file's FLOOR/SILENT headline and
+/// `validate_log`'s `engaged` verdict can never drift apart.
 fn is_engaged(l: &lufs::Loudness) -> bool {
-    l.integrated_lufs.is_finite() && l.integrated_lufs > -50.0 && l.spread_lu() > 0.5
+    leveller::is_engaged(l)
 }
 
 /// DIAGNOSTIC (reamp-stuck investigation): PASSIVE re-amp state read — zero HID
@@ -206,12 +206,19 @@ pub fn probe_reamp_multi_engage(topology_id: &str, cycles: u32) -> Result<String
 /// capture with everything derived from it): a failed inject reads as the device's
 /// stationary output floor, so the headline is stamped FLOOR/SILENT when the capture
 /// fails `probe_reamp_state`'s engaged criterion instead of being retried.
+///
+/// `target_lufs` + `dump_dir` together arm the P5 external-validation row: the capture
+/// is written to a WAV and one expectation line is appended to `TMP_E2E_VALIDATE_LOG`
+/// (`crate::validate_log`) so `scripts/level-validate.sh` can judge the SAME audio with
+/// ffmpeg's `ebur128`. Without `target_lufs` the `--dump-wav` add-on behaves exactly as
+/// before (a bare WAV, no row) — there is nothing to validate a capture against.
 pub fn probe_measure_current_lufs(
     topology_id: &str,
     slot: Option<u32>,
     scene_slot: Option<u32>,
     calibration_lufs: Option<f32>,
     dump_dir: Option<&str>,
+    target_lufs: Option<f64>,
 ) -> Result<String, String> {
     let stim_path = probe_stimulus_path(topology_id)?;
     let stim = read_stimulus_calibrated(&stim_path, calibration_lufs)?;
@@ -245,12 +252,32 @@ pub fn probe_measure_current_lufs(
     }
     // `--dump-wav <dir>` ADD-ON (pure add-on: `dump_dir` is `None` on every call
     // site that doesn't pass `--dump-wav`, so behaviour is byte-identical then).
-    // Writes BEFORE the `measure_processed` move below — `dump_processed_capture`
-    // only borrows `cap`. Feeds `scripts/meter-parity.sh` real device captures
+    // Both this and `measure_processed` below only BORROW `cap`. Feeds
+    // `scripts/level-validate.sh` / `scripts/meter-parity.sh` real device captures
     // once the device is back online; this write path itself is untested on real
     // hardware (device unavailable at implementation time).
-    let dump_note = match dump_dir {
-        Some(dir) => {
+    // The P5 validation row (below) does its OWN dump into the row's directory, so the
+    // two never both write: `--target` upgrades `--dump-wav` from a bare file to a file
+    // plus an expectation an external meter can judge it against.
+    let validate = match (dump_dir, target_lufs) {
+        (Some(dir), Some(target)) => Some(match (slot, scene_slot) {
+            (Some(s), Some(sc)) if sc != crate::session::BASE_SCENE_SLOT => {
+                crate::validate_log::ValidationRow::scene(s, sc, target).with_wav_dir(dir)
+            }
+            (Some(s), _) => crate::validate_log::ValidationRow::base(s, target).with_wav_dir(dir),
+            // No slot = "whatever is loaded"; there is no stable identity to record, so
+            // this stays a plain dump.
+            (None, _) => {
+                return Err(
+                    "--target needs an explicit slot (use --measure-scene, not --measure-current)"
+                        .to_string(),
+                )
+            }
+        }),
+        _ => None,
+    };
+    let dump_note = match (dump_dir, validate.is_some()) {
+        (Some(dir), false) => {
             let label = format!(
                 "measure_slot-{}_scene-{}",
                 slot.map(|s| s.to_string())
@@ -264,11 +291,19 @@ pub fn probe_measure_current_lufs(
                 Err(e) => format!("  --dump-wav FAILED: {e}\n"),
             }
         }
+        _ => String::new(),
+    };
+    let loud =
+        leveller::measure_processed(&cap).map_err(|e| format!("processed measure failed: {e}"))?;
+    // AFTER the measure: the row carries the engage verdict, which is derived from the
+    // loudness of this very capture (`validate_log::emit`'s doc).
+    let validate_note = match &validate {
+        Some(row) => {
+            crate::validate_log::emit(row, &cap, &loud);
+            format!("  validation row emitted: {}\n", row.label)
+        }
         None => String::new(),
     };
-    // Moves `cap` — everything above that needed it (the per-channel loop, the dump) is done.
-    let loud =
-        leveller::measure_processed(cap).map_err(|e| format!("processed measure failed: {e}"))?;
     // No floor-guard retry on this diagnostic seam, so a silent/failed inject WOULD
     // print the device's stationary floor as if it were a measurement — stamp the
     // headline with `probe_reamp_state`'s engaged/floor criterion instead.
@@ -278,7 +313,7 @@ pub fn probe_measure_current_lufs(
         "  << FLOOR/SILENT — not a valid measurement (failed inject?)"
     };
     Ok(format!(
-        "slot={} topology={topology_id} scene={} integrated_lufs={:.3} short_term_max_lufs={:.3}{verdict}\n{per_channel}{dump_note}",
+        "slot={} topology={topology_id} scene={} integrated_lufs={:.3} short_term_max_lufs={:.3}{verdict}\n{per_channel}{dump_note}{validate_note}",
         slot.map(|s| s.to_string())
             .unwrap_or_else(|| "current".to_string()),
         scene_slot

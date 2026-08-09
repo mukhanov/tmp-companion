@@ -157,6 +157,18 @@ const NO_SIGNAL_CAPTURED: &str = "no signal captured";
 #[derive(Debug, Clone, Serialize)]
 pub struct LevelResult {
     pub slot: u32,
+    /// WHICH sound this row describes, when the row is a SCENE row: the 0-based
+    /// `scenes[]` wire index. `None` on every base / block / footswitch row.
+    ///
+    /// Load-bearing for identity, not decoration. `level_scenes_apply_batched` FILTERS
+    /// failed scenes out of the vec it returns (`commands/level_scenes.rs`), so the
+    /// result vec can be SHORTER than the request's `jobs` array — and a consumer that
+    /// re-derives "which scene is row i?" by position mislabels every row after the
+    /// first failure. The batched runner's outcome carries the slot
+    /// ([`BatchedSceneOutcome::scene_slot`], whose own doc says the same thing about
+    /// positional zips); this forwards it onto the wire so no consumer has to guess.
+    /// Mirrored in `src/lib/types.ts`.
+    pub scene_slot: Option<u32>,
     pub ref_level: f32,
     /// Captured integrated LUFS measured at `ref_level`.
     pub measured_lufs: f64,
@@ -1092,7 +1104,7 @@ pub fn doctor_capture_with_loudness(
     )?;
     let samples = cap.stereo_mix();
     let sample_rate = cap.sample_rate;
-    let loudness = measure_processed(cap)?;
+    let loudness = measure_processed(&cap)?;
     Ok((samples, sample_rate, loudness))
 }
 
@@ -1181,39 +1193,72 @@ pub fn doctor_capture_on_session(
 ///   flip in `force_bypass`, plus `fs_value` re-playing an ASSIGN switch's saved
 ///   `valueA` onto the leveled param (a BAKED switch needs no write — its engaged
 ///   sound IS the base value).
+///
+/// `validate` is the P5 EXTERNAL-VALIDATION add-on (`crate::validate_log`): when it is
+/// `Some` AND `TMP_E2E_VALIDATE_LOG` is set, the capture behind the returned loudness
+/// is ALSO written to a WAV and one expectation row is appended to the log, so an
+/// ffmpeg `ebur128` read this repo did not write can judge the same audio. Pure add-on
+/// — `None` (every production call) is byte-identical to the previous behaviour, and
+/// the env check happens before any extra work. Deliberately emitted HERE rather than
+/// at the solve: the solve captures at its REFERENCE level, so its PCM is not the saved
+/// preset's output.
 pub fn measure_sound_asis_strict(
     slot: u32,
     scene: Option<u32>,
     force_bypass: &[(String, String, bool)],
     fs_value: Option<((String, String, String), f32)>,
     stimulus: &[f32],
+    validate: Option<&crate::validate_log::ValidationRow>,
 ) -> Result<lufs::Loudness, String> {
-    if let Some(((g, n, p), v)) = fs_value {
+    // Resolved ONCE, up front: an unarmed run must not clone a ~2.7 MB capture per
+    // floor-guard attempt just to throw it away.
+    let keep = validate.is_some() && crate::validate_log::log_path().is_some();
+    // The capture the returned loudness was measured from — the LAST attempt the floor
+    // guard made, so the dumped WAV and the reported number always describe one capture.
+    let mut kept: Option<audio::Capture> = None;
+    let measured = if let Some(((g, n, p), v)) = fs_value {
         {
             let mut s = Session::connect_lean()?;
             s.load_preset(slot)?;
             crate::settle(Duration::from_millis(settle_after_load_ms()));
         }
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-        return require_live(
-            || measure_fs_at((&g, &n, &p), force_bypass, stimulus, v),
+        require_live(
+            || {
+                let cap = capture_fs_at((&g, &n, &p), force_bypass, stimulus, v)?;
+                let loud = processed_loudness_of(&cap)?;
+                if keep {
+                    kept = Some(cap);
+                }
+                Ok(loud)
+            },
             stimulus,
-        );
+        )
+    } else {
+        require_live(
+            || {
+                let cap = capture_full_at(
+                    slot,
+                    scene,
+                    force_bypass,
+                    stimulus,
+                    None,
+                    CAPTURE_TAIL_MS,
+                    false,
+                )?;
+                let loud = processed_loudness_of(&cap)?;
+                if keep {
+                    kept = Some(cap);
+                }
+                Ok(loud)
+            },
+            stimulus,
+        )
+    }?;
+    if let (Some(row), Some(cap)) = (validate, kept.as_ref()) {
+        crate::validate_log::emit(row, cap, &measured);
     }
-    require_live(
-        || {
-            processed_loudness(capture_full_at(
-                slot,
-                scene,
-                force_bypass,
-                stimulus,
-                None,
-                CAPTURE_TAIL_MS,
-                false,
-            ))
-        },
-        stimulus,
-    )
+    Ok(measured)
 }
 
 /// MEASURE seam for scene leveling: load `slot`, then for each scene in
@@ -1646,6 +1691,7 @@ pub fn level_preset(
                 }
                 return Ok(LevelResult {
                     slot,
+                    scene_slot: None,
                     ref_level,
                     measured_lufs: MUTE_FLOOR_SILENT_LUFS,
                     constant_c: MUTE_FLOOR_SILENT_LUFS,
@@ -1687,6 +1733,7 @@ pub fn level_preset(
                 restore_saved_preset(slot)?;
                 return Ok(LevelResult {
                     slot,
+                    scene_slot: None,
                     ref_level,
                     measured_lufs: m.measured_lufs,
                     constant_c: m.c,
@@ -1732,6 +1779,7 @@ pub fn level_preset(
 
         Ok(LevelResult {
             slot,
+            scene_slot: None,
             ref_level,
             measured_lufs: m.measured_lufs,
             constant_c: m.c,
@@ -1835,6 +1883,7 @@ pub fn level_setlist(
         )?;
         results.push(LevelResult {
             slot: e.slot,
+            scene_slot: None,
             ref_level,
             measured_lufs: m.measured_lufs,
             constant_c: m.c,
@@ -2305,12 +2354,30 @@ pub(crate) fn processed_lufs(cap: Result<audio::Capture, String>) -> Result<f64,
 /// Like [`processed_lufs`] but keeps the full meter reading (integrated + short-term
 /// max), for paths that report the capture's dynamics spread alongside the level.
 fn processed_loudness(cap: Result<audio::Capture, String>) -> Result<lufs::Loudness, String> {
-    let cap = cap?;
+    processed_loudness_of(&cap?)
+}
+
+/// [`processed_loudness`] on a BORROWED capture — for the one caller that must keep the
+/// PCM alive past the measurement (the strict re-measure's external-validation dump,
+/// `measure_sound_asis_strict`). Same verdict, same sentinel error.
+fn processed_loudness_of(cap: &audio::Capture) -> Result<lufs::Loudness, String> {
     let m = measure_processed(cap)?;
     m.integrated_lufs
         .is_finite()
         .then_some(m)
         .ok_or_else(|| NO_SIGNAL_CAPTURED.to_string())
+}
+
+/// The ONE engaged/floor criterion this crate has: finite chain audio meaningfully
+/// above the stationary floor, with real dynamics (a floor read is near-flat). NaN
+/// comparisons are false, so a failed measure reads "not engaged".
+///
+/// `danger.md`: a silent/failed re-amp inject reads as the device's stationary OUTPUT
+/// FLOOR — a real number for the wrong signal. This is what `probe --measure-current`'s
+/// FLOOR/SILENT headline and `validate_log`'s `engaged` verdict both stamp from, so a
+/// consumer never has to re-derive it (`probe_api::level::is_engaged` delegates here).
+pub(crate) fn is_engaged(l: &lufs::Loudness) -> bool {
+    l.integrated_lufs.is_finite() && l.integrated_lufs > -50.0 && l.spread_lu() > 0.5
 }
 
 /// The metering convention shared by every OUTPUT-side measurement hub in this
@@ -2321,7 +2388,7 @@ fn processed_loudness(cap: Result<audio::Capture, String>) -> Result<lufs::Loudn
 /// calls this — it stays on `measure_mono` directly. `pub(crate)` so a probe
 /// diagnostic headline can share the exact production convention instead of a
 /// parallel per-channel re-check (`probe_api::level::probe_measure_current_lufs`).
-pub(crate) fn measure_processed(cap: audio::Capture) -> Result<lufs::Loudness, String> {
+pub(crate) fn measure_processed(cap: &audio::Capture) -> Result<lufs::Loudness, String> {
     let sample_rate = cap.sample_rate;
     match cap.processed_stereo() {
         Some(stereo) => lufs::measure_stereo(&stereo, sample_rate),
@@ -2345,12 +2412,23 @@ pub(crate) fn engage_measure_disengage(
     s: &mut Session,
     stimulus: &[f32],
 ) -> Result<lufs::Loudness, String> {
+    processed_loudness(engage_capture_disengage(s, stimulus))
+}
+
+/// [`engage_measure_disengage`] stopping one step short — returns the raw capture
+/// instead of its loudness, for the caller that must also write the PCM to disk
+/// (`measure_sound_asis_strict`'s external-validation dump). The engage/settle/capture/
+/// disengage sequence is IDENTICAL: this is an extraction, not a second choreography.
+pub(crate) fn engage_capture_disengage(
+    s: &mut Session,
+    stimulus: &[f32],
+) -> Result<audio::Capture, String> {
     let _ = s.set_reamp_mode(true)?;
     // Same no-early-return rule as `capture_full_at`: re-amp is engaged, the OFF must fire.
     let _ = settle_abortable(SETTLE_AFTER_REAMP_MS);
     let cap = audio::reamp_capture(stimulus, RATE, CAPTURE_TAIL_MS);
     let _ = s.set_reamp_mode(false);
-    processed_loudness(cap)
+    cap
 }
 
 /// GUARANTEED re-amp OFF on a fresh connection — the run-end backstop every
@@ -2823,6 +2901,17 @@ pub(crate) fn measure_fs_at(
     stimulus: &[f32],
     v: f32,
 ) -> Result<lufs::Loudness, String> {
+    processed_loudness(capture_fs_at(lev, engaged_bypass, stimulus, v))
+}
+
+/// [`measure_fs_at`] stopping at the raw capture — the PCM-keeping twin, same
+/// connect/arm/engage sequence, for `measure_sound_asis_strict`'s validation dump.
+pub(crate) fn capture_fs_at(
+    lev: (&str, &str, &str),
+    engaged_bypass: &[(String, String, bool)],
+    stimulus: &[f32],
+    v: f32,
+) -> Result<audio::Capture, String> {
     let mut s = Session::connect_lean()?;
     let knob = LevelKnob::Block {
         group_id: lev.0.to_string(),
@@ -2831,7 +2920,7 @@ pub(crate) fn measure_fs_at(
         scene_slot: None,
     };
     arm_measurement(&mut s, &knob, v, engaged_bypass, None)?;
-    engage_measure_disengage(&mut s, stimulus)
+    engage_capture_disengage(&mut s, stimulus)
 }
 
 /// ONE fresh-connection capture of ONE footswitch STATE (engaged or disengaged) for a
@@ -3771,7 +3860,7 @@ fn coord_to_knob(coord: f32, log_space: bool, lo: f32, hi: f32) -> f32 {
 
 fn live_window_lufs(live: &audio::LiveReamp, window_ms: u64) -> Result<f64, String> {
     let cap = live.recent_capture(window_ms)?;
-    let lufs = measure_processed(cap)?.integrated_lufs;
+    let lufs = measure_processed(&cap)?.integrated_lufs;
     if lufs.is_finite() {
         Ok(lufs)
     } else {
@@ -5936,6 +6025,9 @@ pub fn level_preset_block(
 
         Ok(LevelResult {
             slot,
+            // A block-knob row is not a scene row on the wire — the shipped scene lane is
+            // the BATCHED runner (`outcome_to_level_result`), which stamps the real slot.
+            scene_slot: None,
             ref_level: final_level, // for a block knob, "ref" carries the solved value
             measured_lufs: measured_at_final,
             constant_c: f64::NAN, // no single-constant model for an arbitrary knob

@@ -35,10 +35,19 @@
 //!   probe --measure-wav <wav>      NO-DEVICE: measure a WAV through the PRODUCTION output-side
 //!                                  convention (stereo for ≥2-ch, mono for 1-ch) — the Companion
 //!                                  side of `scripts/meter-parity.sh` (ffmpeg ebur128 ground truth)
-//!   probe --dump-wav <dir>         (ADD-ON flag on --measure-current/--measure-scene) also
-//!                                  writes the captured processed pair to a 32-bit-float WAV in
-//!                                  <dir>, named from slot/scene — feeds real captures into
-//!                                  `scripts/meter-parity.sh`. No effect on any other flag.
+//!   probe --measure-footswitch <slot> <switch> <topology> [--lev <group>:<node>:<param>]
+//!                                  [--target <lufs>] [--dump-wav <dir>]
+//!                                  READ-ONLY footswitch twin of --measure-scene: re-measure ONE
+//!                                  switch's ENGAGED sound through the production capture path
+//!                                  (shared isolation derivation, ASSIGN valueA replay, ONE
+//!                                  engage, guaranteed re-amp OFF). --target + --dump-wav arm the
+//!                                  P5 validation row consumed by `scripts/level-validate.sh`.
+//!   probe --dump-wav <dir>         (ADD-ON flag on --measure-current/--measure-scene/
+//!                                  --measure-footswitch) also writes the captured processed pair
+//!                                  to a 32-bit-float WAV in <dir>, named from slot/scene (or the
+//!                                  validation row's label) — feeds real captures into
+//!                                  `scripts/meter-parity.sh` and `scripts/level-validate.sh`.
+//!                                  No effect on any other flag.
 //!   probe --capture-reference <slot> <topology> <out.wav>
 //!                                  OFFLINE-HARNESS: capture one full ~6.8s re-amp clip
 //!                                  to build the adaptive-tuning corpus (DEVICE OP)
@@ -98,9 +107,12 @@
 //!   probe --measure-current <topology> [sceneSlot] [calibrationLUFS]
 //!                                  measure current live state without changing levels
 //!   probe --measure-scene <slot> <sceneSlot> <topology> [calibrationLUFS]
+//!                                  [--target <lufs>] [--dump-wav <dir>]
 //!                                  load preset+scene, then measure without changing levels
 //!                                  (slot = 0-BASED list index, same convention as
-//!                                  --levelpreset — NOT the 1-based device userSlot)
+//!                                  --levelpreset — NOT the 1-based device userSlot).
+//!                                  --target + --dump-wav also append a P5 validation row
+//!                                  to TMP_E2E_VALIDATE_LOG (scripts/level-validate.sh).
 //!   probe --capture-input [secs]   GATE 1: report USB-Out per-channel levels while
 //!                                  you play (identifies the dry-instrument channel)
 //!   probe --agc-test <slot>        GATE 2: full vs half re-amp inject on a CLEAN
@@ -666,6 +678,66 @@ fn main() {
             after.as_deref(),
             slot,
             commit,
+        ) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--measure-footswitch") {
+        // --measure-footswitch <slot> <switch> <topology> [--lev <group>:<node>:<param>]
+        //                      [--target <lufs> --dump-wav <dir>]
+        // READ-ONLY: the footswitch twin of --measure-scene. slot = 0-based list index.
+        // --lev is the ASSIGN switch's leveled param triple (the same one
+        // --level-footswitch drove); omit it for a BAKED switch, whose engaged sound IS
+        // the base value. --target + --dump-wav together arm the P5 validation row (a
+        // WAV plus one TMP_E2E_VALIDATE_LOG line) — see scripts/level-validate.sh.
+        let slot = args.get(i + 1).and_then(|s| s.parse::<u32>().ok());
+        let switch = args.get(i + 2).and_then(|s| s.parse::<u32>().ok());
+        let topology = args.get(i + 3).cloned().unwrap_or_default();
+        if slot.is_none() || switch.is_none() || topology.is_empty() || topology.starts_with("--") {
+            eprintln!(
+                "usage: probe --measure-footswitch <slot(0-based list index)> <switch> <topology_id> \
+                 [--lev <group>:<node>:<param>] [--target <lufs>] [--dump-wav <dir>]"
+            );
+            std::process::exit(2);
+        }
+        let lev_raw = flag_arg(&args, "--lev");
+        let lev_parts: Vec<String> = lev_raw
+            .as_deref()
+            .map(|s| s.split(':').map(str::to_string).collect())
+            .unwrap_or_default();
+        if lev_raw.is_some() && lev_parts.len() != 3 {
+            eprintln!("[probe] --lev takes <group>:<node>:<param>");
+            std::process::exit(2);
+        }
+        let lev = (lev_parts.len() == 3).then(|| {
+            (
+                lev_parts[0].as_str(),
+                lev_parts[1].as_str(),
+                lev_parts[2].as_str(),
+            )
+        });
+        let target = flag_arg(&args, "--target").and_then(|s| s.parse::<f64>().ok());
+        let dump_dir = flag_arg(&args, "--dump-wav");
+        eprintln!(
+            "[probe] measuring slot={} switch={} topology={topology} lev={lev:?}…",
+            slot.unwrap(),
+            switch.unwrap(),
+        );
+        match tmp_companion_lib::probe_measure_footswitch(
+            slot.unwrap(),
+            switch.unwrap(),
+            &topology,
+            lev,
+            target,
+            dump_dir.as_deref(),
         ) {
             Ok(report) => {
                 print!("{report}");
@@ -2014,12 +2086,15 @@ fn main() {
         eprintln!(
             "[probe] measuring current live LUFS topology={topology} scene={scene_slot:?} calibration={calibration_lufs:?}…"
         );
+        // No `--target` here on purpose: a validation row needs a stable slot identity,
+        // and `--measure-current` measures "whatever is loaded". Use `--measure-scene`.
         match tmp_companion_lib::probe_measure_current_lufs(
             &topology,
             None,
             scene_slot,
             calibration_lufs,
             dump_dir.as_deref(),
+            None,
         ) {
             Ok(report) => {
                 println!("{report}");
@@ -2042,7 +2117,7 @@ fn main() {
         let topology = args.get(i + 3).cloned().unwrap_or_default();
         if slot.is_none() || scene_slot.is_none() || topology.is_empty() {
             eprintln!(
-                "usage: probe --measure-scene <slot(0-based list index)> <sceneSlot> <topology_id> [calibrationLUFS]"
+                "usage: probe --measure-scene <slot(0-based list index)> <sceneSlot> <topology_id> [calibrationLUFS] [--target <lufs>] [--dump-wav <dir>]"
             );
             std::process::exit(2);
         }
@@ -2050,6 +2125,9 @@ fn main() {
         // Optional ADD-ON flag, unrelated to the positional args above: also write
         // the captured processed pair to a WAV in <dir> for `scripts/meter-parity.sh`.
         let dump_dir = flag_arg(&args, "--dump-wav");
+        // `--target <lufs>` + `--dump-wav <dir>` also append a P5 validation row to
+        // TMP_E2E_VALIDATE_LOG for `scripts/level-validate.sh` (see probe_api/level.rs).
+        let target = flag_arg(&args, "--target").and_then(|s| s.parse::<f64>().ok());
         eprintln!(
             "[probe] measuring slot={} scene={} topology={topology} calibration={calibration_lufs:?}…",
             slot.unwrap(),
@@ -2061,6 +2139,7 @@ fn main() {
             scene_slot,
             calibration_lufs,
             dump_dir.as_deref(),
+            target,
         ) {
             Ok(report) => {
                 println!("{report}");

@@ -50,6 +50,31 @@ scene-leveling test doc comments, and `e2e/fixtures/COVERAGE.md` rows 6/20.
 
 Runs the full Level + Copy happy paths against the real unit **non-destructively** (dry `--levelpreset` with no save, `--replace-held` with no commit, `--device-backup` read, `--reamp-off`). Override its `LEVEL_SLOT` / `COPY_*` env vars per unit. It is **attended, not a CI gate**, and acquires the machine-global device lock like the online `e2e.sh` path.
 
+## External validation (P5) — ffmpeg is the only trusted meter here
+
+`scripts/level-validate.sh` judges a leveled-and-saved sound's captured WAV with ffmpeg's `ebur128` filter against the TARGET the leveling run recorded — **never** against that run's own `predicted_lufs`/`verify_lufs`. The point is a meter this repo did not write: a `lufs.rs` regression that fools the Rust unit tests would still fool a self-consistency check, but not an independent BS.1770 implementation.
+
+**Gate semantics (the decided answer — stated identically in `scripts/e2e.sh`'s header):**
+
+- **ffmpeg ABSENT ⇒ advisory.** A loud, VISIBLE skip banner in the lane summary. Never a silent pass, never red either — ffmpeg is not a build or CI dependency of this app.
+- **ffmpeg PRESENT and rows were emitted ⇒ a REAL GATE.** A target miss flips the suite red (`fail=1`).
+- **ffmpeg present, no rows ⇒** nothing was strict-re-measured this run; logged and passed over.
+
+**What runs when:**
+
+- **`scripts/e2e.sh online …`** — exports `TMP_E2E_VALIDATE_LOG` + `TMP_E2E_VALIDATE_WAV_DIR` into the **e2e_server's** environment (that process is what runs the strict re-measures), then after the spec loop runs `level-validate.sh --expectations <log>` over the WAVs the server already dumped. There is deliberately **no post-suite re-capture loop**: re-driving `probe` afterwards opens fresh device sessions inside the 45–100 s lazy-save-commit window from a process whose `SLOT_SAVE_REGISTRY` is empty (`danger.md`), so it would read PRE-save bytes and fail correct runs. `TMP_E2E_VALIDATE_MAX_ROWS` (default 40) caps the pass and prints how many rows were dropped.
+- **`scripts/validate-hbe.sh <preset-file>`** — the attended, standalone Friedman-HBE run: import → level (base + optional scenes/footswitches) → **wait out the commit window (150 s)** → re-measure with `--target`/`--dump-wav` → **completeness check** → `level-validate.sh --expectations` → clear, with a trap-guaranteed re-amp OFF (gap, one retry after a longer quiet, then a loud `probe --reamp-off` banner) on every exit path.
+  The **completeness check is not optional bookkeeping**: a re-measure that dies before its capture emits NO row, and the judge can only grade rows it is handed — a shorter log is invisible to it. The script therefore records the label of every row it ASKS for and greps the log for each by identity (not by count, which a duplicate would mask) before calling the judge; a missing row is exit 1 whatever the judge said, including when the judge skipped for want of ffmpeg.
+- **`scripts/level-validate.sh`** is the shared judge both callers use. `--expectations <jsonl>` (batch, the automated path), `--wav <path>` (one file, with `--probe-log` for the FLOOR/SILENT proof), or `--live <seconds>` (bare avfoundation capture — ATTENDED ONLY: it has no engage-proof, so the caller must verify engagement by other means).
+
+**The emission seam:** `crate::validate_log`, appended to from the **measurement** seams — `leveller::measure_sound_asis_strict` (driven online by `e2e_measure_sound`) and `probe_api::level::probe_measure_current_lufs` (`probe --measure-scene --target … --dump-wav`). Not from the leveling run: the solve captures at its REFERENCE level, so its PCM is not the saved preset's output. Each row is written by the same capture that produced the run's own number, so it carries the WAV path, the engage verdict, and the sound's own **identity** (`slot` + `scene_slot`/`switch`) — never a position. That is why `LevelResult` now carries `scene_slot`: `level_scenes_apply_batched` filters failed scenes out of the array it returns, so index _i_ is not scene _i_ once anything fails.
+
+Footswitch rows are now externally validated too — `probe --measure-footswitch <slot> <switch> <topology> [--lev g:n:p] [--target L] [--dump-wav D]` closed that hole. The **`doctor_apply` path is still NOT externally validated** (no expectation-emitting re-measure exists for it).
+
+**Env vars:** `TMP_E2E_VALIDATE_LOG` (jsonl expectations path — `e2e.sh` sets it when ffmpeg is present; UNSET means every emission seam is a no-op), `TMP_E2E_VALIDATE_WAV_DIR` (WAV dump dir; defaults to a `level-validate-wavs` sibling of the log), `TMP_E2E_VALIDATE_MAX_ROWS` (row cap for the e2e pass, default 40), `TMP_E2E_LEVEL_TOL_LU` (validation tolerance in LU, default **1.0** — it must exceed the solver's own acceptance band of 0.3 LU plus recapture noise, or correct runs fail), `TMP_E2E_AVF_DEVICE` (avfoundation device id for `--live`, default `:0`).
+
+**`level-validate.sh` exit codes, which both callers branch explicitly:** `0` every row passed or skipped · `1` at least one row failed · `2` usage error · `3` ffmpeg absent, nothing checked. A `3` must be reported as SKIPPED, never as a target miss. A `0` over **zero measured rows** (every row clamped or persist-mismatched) is a legitimate but **vacuous** pass and says so in a yellow `PASS (VACUOUS)` banner — a skip is a real verdict, but it is not verification.
+
 ## Fixtures
 
 - The offline `backup-fixture.bin` and `scenario-presets.json` **must stay in sync** — regenerate both from one script.

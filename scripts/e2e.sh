@@ -85,6 +85,30 @@ ONLINE_CFG="e2e/playwright.online.config.ts"
 MANIFEST="src-tauri/Cargo.toml"
 LOG_DIR="${TMPDIR:-/tmp}/tmp-companion-e2e"
 SERVER_LOG="$LOG_DIR/e2e_server.log"
+# ── P5 external validation (ONLINE only) ──────────────────────────────────────────
+# GATE SEMANTICS, stated identically here and in `.claude/rules/e2e.md`:
+#   ffmpeg ABSENT   ⇒ advisory. A loud, VISIBLE skip line in this lane summary. Never a
+#                     silent pass, but never red either — ffmpeg is not a build or CI
+#                     dependency of this app.
+#   ffmpeg PRESENT
+#     + rows emitted ⇒ a REAL GATE. A target miss flips `fail` red (CLAUDE.md: never
+#                      characterize or expected-fail a product bug to keep CI green).
+#     + no rows      ⇒ nothing was leveled+re-measured this run; logged and passed over.
+#
+# The e2e_server PROCESS is what runs the strict re-measures (`e2e_measure_sound` →
+# `leveller::measure_sound_asis_strict`), so these vars are exported into ITS
+# environment: the same capture that produced the run's own number also writes the WAV
+# and appends one identity-carrying line here (`src-tauri/src/validate_log.rs`). There is
+# deliberately NO post-suite re-capture loop — re-driving `probe` afterwards would open
+# fresh device sessions inside the 45–100 s lazy-save-commit window from a process whose
+# save registry is empty (danger.md), reading PRE-save bytes and failing correct runs.
+VALIDATE_LOG="$LOG_DIR/level-validate-expectations.jsonl"
+VALIDATE_WAV_DIR="$LOG_DIR/level-validate-wavs"
+# Budget cap. Each row costs one ffmpeg pass over a ~7 s WAV (fast) plus the disk the
+# server already spent writing it — generous on purpose, but a POLICY rather than an
+# accident: a runaway spec must announce that rows were dropped, not silently truncate.
+VALIDATE_MAX_ROWS="${TMP_E2E_VALIDATE_MAX_ROWS:-40}"
+if command -v ffmpeg >/dev/null 2>&1; then HAVE_FFMPEG=1; else HAVE_FFMPEG=0; fi
 mkdir -p "$LOG_DIR"
 
 # ── parse args: a mode token (online|offline) + zero or more spec names (copy|level|songs|all) ──
@@ -327,6 +351,20 @@ start_online_server() {
 
   log "starting handshake-verified server on :$PORT"
   : > "$SERVER_LOG"
+  # Truncate any PRIOR run's expectations + WAVs before this run's server can append —
+  # a stale row would otherwise ride along into this run's validation pass. Only wired
+  # when ffmpeg is present; UNSET (not merely empty) ⇒ emission stays a no-op and the
+  # server does no extra work at all (`validate_log::log_path`).
+  if [ "$HAVE_FFMPEG" -eq 1 ]; then
+    : > "$VALIDATE_LOG"
+    rm -rf "$VALIDATE_WAV_DIR"
+    mkdir -p "$VALIDATE_WAV_DIR"
+    export TMP_E2E_VALIDATE_LOG="$VALIDATE_LOG"
+    export TMP_E2E_VALIDATE_WAV_DIR="$VALIDATE_WAV_DIR"
+  else
+    unset TMP_E2E_VALIDATE_LOG
+    unset TMP_E2E_VALIDATE_WAV_DIR
+  fi
   TMP_E2E_ONLINE=1 TMP_E2E_PORT="$PORT" \
     cargo run -q --manifest-path "$MANIFEST" --features e2e --bin e2e_server \
     >"$SERVER_LOG" 2>&1 &
@@ -434,5 +472,47 @@ for s in "${SPECS[@]}"; do
   fi
 done
 
-if [ "$fail" -eq 0 ]; then log "all online specs passed"; else err "one or more online specs failed"; fi
+if [ "$fail" -eq 0 ]; then
+  log "all online specs passed"
+  # ── P5 external validation ────────────────────────────────────────────────────
+  # No re-capture here: the WAVs and expectation rows were already written BY THE
+  # SERVER, at the moment each sound was strict-re-measured (see the TMP_E2E_VALIDATE_*
+  # block at the top of this file for the gate semantics and for why re-driving `probe`
+  # afterwards would read PRE-save bytes). All that is left is to judge them with a
+  # meter this repo did not write.
+  if [ "$HAVE_FFMPEG" -eq 0 ]; then
+    log "############################################################"
+    log "#  EXTERNAL VALIDATION SKIPPED — ffmpeg is not on PATH.     #"
+    log "#  Nothing was independently measured. NOT a pass; install  #"
+    log "#  ffmpeg to turn this lane into a real gate.               #"
+    log "############################################################"
+  elif [ ! -s "$VALIDATE_LOG" ]; then
+    log "external validation — no rows emitted this run (nothing was strict-re-measured); skipping"
+  else
+    rows="$(grep -c . "$VALIDATE_LOG" 2>/dev/null || echo 0)"
+    VALIDATE_FEED="$VALIDATE_LOG"
+    if [ "$rows" -gt "$VALIDATE_MAX_ROWS" ]; then
+      VALIDATE_FEED="$LOG_DIR/level-validate-expectations.capped.jsonl"
+      head -n "$VALIDATE_MAX_ROWS" "$VALIDATE_LOG" > "$VALIDATE_FEED"
+      err "external validation CAPPED at $VALIDATE_MAX_ROWS rows — $((rows - VALIDATE_MAX_ROWS)) rows DROPPED (raise TMP_E2E_VALIDATE_MAX_ROWS to check them all)"
+    fi
+    log "external validation — judging $rows recorded row(s) with ffmpeg ebur128…"
+    set +e
+    bash "$REPO/scripts/level-validate.sh" --expectations "$VALIDATE_FEED"
+    vrc=$?
+    set -e
+    # Branch all three codes explicitly: a mid-run SKIP (3) must never be reported as a
+    # target miss, and must never quietly pass either.
+    case "$vrc" in
+      0) log "external validation PASSED" ;;
+      3) log "external validation SKIPPED (exit 3 — ffmpeg vanished mid-run; nothing was checked)" ;;
+      *)
+        err "external validation FAILED (exit $vrc) — a leveled sound missed its target under an independent ffmpeg read"
+        fail=1
+        ;;
+    esac
+  fi
+else
+  err "one or more online specs failed"
+fi
 exit "$fail"

@@ -507,6 +507,10 @@ fn outcome_to_level_result(
     let lufs = o.final_lufs.unwrap_or(f64::NAN);
     leveller::LevelResult {
         slot,
+        // IDENTITY, straight off the outcome — never the row's position. The caller
+        // FILTERS failed outcomes out of the vec it returns, so a positional read
+        // mislabels every row after a mid-batch failure (see `LevelResult::scene_slot`).
+        scene_slot: Some(o.scene_slot),
         ref_level: o.final_level.unwrap_or(0.0),
         measured_lufs: lufs,
         constant_c: f64::NAN,

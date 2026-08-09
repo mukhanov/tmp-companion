@@ -121,6 +121,14 @@ export interface SetlistJobEntry {
 /** Result of leveling one preset (mirrors leveller::LevelResult). */
 export interface LevelResult {
   slot: number;
+  /** WHICH sound this row describes when it is a SCENE row: the 0-based `scenes[]`
+   * wire index. Null on every base / block / footswitch row.
+   *
+   * Identity, not decoration: `level_scenes_apply_batched` FILTERS failed scenes out
+   * of the array it returns, so it can be SHORTER than the `jobs` array that was sent
+   * and reading "which scene is row i?" by position mislabels every row after the
+   * first failure. */
+  scene_slot: number | null;
   ref_level: number;
   measured_lufs: number;
   constant_c: number;

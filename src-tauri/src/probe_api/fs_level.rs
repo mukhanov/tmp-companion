@@ -556,6 +556,66 @@ pub fn probe_measure_forced(slot: u32, group: &str, node: &str) -> Result<String
     Ok(out)
 }
 
+/// READ-ONLY re-measure of ONE footswitch's ENGAGED sound — the footswitch twin of
+/// `probe --measure-scene`, and the flag that closes P5's external-validation hole (a
+/// footswitch row used to be leveled with no independent capture path, so it could only
+/// be reported as "not externally verified").
+///
+/// Composes EXISTING primitives, adding no engage/disengage sequencing of its own:
+/// * `commands::doctor::doctor_force_bypass` over the SAVED doc — the ONE shared
+///   isolation derivation the leveling, Doctor and strict-harness lanes use (siblings
+///   off + this switch's own engaged flip, isActive-aware);
+/// * `footswitch::existing_param_fn_value_a` — an ASSIGN switch's engaged sound is its
+///   leveled param at the saved `valueA`; a BAKED switch (or one with no `param`
+///   function on `lev`) needs no write, its engaged sound IS the base value;
+/// * `leveller::measure_sound_asis_strict` — the same floor-guarded production capture
+///   path (fresh load → base recall → isolation → ONE engage → guaranteed re-amp OFF)
+///   that `e2e_measure_sound` drives online, including its `--dump-wav`-shaped
+///   external-validation add-on.
+///
+/// `lev` is `Some((group, node, param))` for an ASSIGN switch — the same triple the
+/// `--level-footswitch` run used. `dump_dir`/`target_lufs` arm the validation row (a
+/// WAV plus one line in `TMP_E2E_VALIDATE_LOG`) exactly like `--measure-scene`'s dump.
+/// Read-only throughout: every write lands on a throwaway connection's working copy and
+/// nothing is ever saved.
+pub fn probe_measure_footswitch(
+    slot: u32,
+    switch: u32,
+    topology_id: &str,
+    lev: Option<(&str, &str, &str)>,
+    target_lufs: Option<f64>,
+    dump_dir: Option<&str>,
+) -> Result<String, String> {
+    let stim = read_stimulus_calibrated(&super::stimulus::probe_stimulus_path(topology_id)?, None)?;
+    let saved = crate::read_saved_preset(slot)
+        .ok_or_else(|| format!("field-8 read failed for slot {slot}"))?;
+    let force = crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, Some(switch));
+    let fs_value = lev.and_then(|(g, n, p)| {
+        footswitch::existing_param_fn_value_a(&saved["ftsw"], switch, n, p)
+            .map(|v| ((g.to_string(), n.to_string(), p.to_string()), v as f32))
+    });
+    // `--dump-wav <dir>` routes through the SAME validation-log add-on the online lane
+    // uses, so `scripts/level-validate.sh` consumes one row shape from both callers. The
+    // row needs a promised target; without one there is nothing to validate against, so
+    // the dump is simply not armed (the measurement still prints).
+    let row = match (dump_dir, target_lufs) {
+        (Some(dir), Some(target)) => Some(
+            crate::validate_log::ValidationRow::footswitch(slot, switch, target).with_wav_dir(dir),
+        ),
+        _ => None,
+    };
+    let loud =
+        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim, row.as_ref())?;
+    Ok(format!(
+        "slot={slot} switch={switch} topology={topology_id} lev={lev:?} \
+         integrated_lufs={:.3} short_term_max_lufs={:.3} spread_lu={:.3} isolation_blocks={}\n",
+        loud.integrated_lufs,
+        loud.short_term_max_lufs,
+        loud.spread_lu(),
+        force.len(),
+    ))
+}
+
 /// Probe entry: level one footswitch on the active/`slot` preset for HW re-validation.
 /// DRY by default (measure + solve, no write); `commit` writes `valueA` + saves.
 /// Stimulus via `TMP_LEVELLER_STIMULUS` (+ optional `TMP_LEVELLER_CAL_LUFS`).

@@ -2108,3 +2108,177 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         "a searched solve writes once per capture plus the final apply: {o:?}"
     );
 }
+
+// ───────────────── P5 external validation: identity + flags on the emitted rows ─────────
+//
+// The bug class this closes: the first design zipped a scene batch's RESULT vec against
+// its REQUEST array by position to label each row. `level_scenes_apply_batched` FILTERS
+// failed scenes out of that vec (`commands/level_scenes.rs`), so a mid-batch failure
+// either shifted every later label onto the wrong scene or — with a length guard — dropped
+// the ENTIRE batch's expectations silently, which the shell consumer reads as "nothing was
+// leveled" and reports as a pass. Both are false greens.
+//
+// So this gate asserts the two halves of the fix against the offline physics:
+//   (a) a batch WITH a mid-batch failure returns FEWER rows than it was sent, and every
+//       surviving row NAMES ITS OWN scene (`scene_slot`) — no position is involved;
+//   (b) the re-measure seam emits one validation row per sound, carrying that identity plus
+//       the run's `clamped`/`persist_mismatch` verdicts, so the consumer can SKIP a clamped
+//       row instead of failing it against a target it could never reach.
+//
+// Slot 403 (`E2E Parallel`) is the fixture: 4 scenes, of which the amp-at-zero "Clean" scene
+// is the OFF-BRANCH clamp (`level_defaults_403_scenes_solve_and_offbranch` pins that shape).
+// Scene 1 is given a HANDLE naming a param the classifier refuses, which is the documented
+// per-row skip path (`scene_jobs::handle_scene_job` → `skip_scene_job` → a failed outcome
+// the command filters out) — a genuine mid-batch failure driven purely from wire args.
+#[test]
+fn a_mid_batch_failure_keeps_every_surviving_scenes_identity_and_emits_its_row() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+        (
+            "TMP_E2E_BACKUP_FIXTURE",
+            "/../e2e/fixtures/backup-fixture.bin",
+        ),
+        (
+            "TMP_E2E_STIMULUS",
+            "/resources/samples/guitar-humbucker.wav",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            level_scenes_apply_batched,
+            super::e2e_measure_sound
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+
+    let amp = serde_json::json!([
+        {"groupId": "G2", "nodeId": "ampA", "parameterId": "outputLevel", "value": 1.0},
+        {"groupId": "G3", "nodeId": "ampB", "parameterId": "outputLevel", "value": 1.0}
+    ]);
+    // Scene 1 names a control the param classifier refuses (an amp's drive-side knob is
+    // never a loudness handle) — that row skips, the other three level.
+    let jobs = serde_json::json!([
+        {"sceneSlot": 0, "targetLufs": -23.0},
+        {"sceneSlot": 1, "targetLufs": -23.0,
+         "handle": {"groupId": "G2", "nodeId": "ampA", "parameterId": "drive"}},
+        {"sceneSlot": 2, "targetLufs": -23.0},
+        {"sceneSlot": 3, "targetLufs": -23.0}
+    ]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403, "jobs": jobs, "candidates": amp,
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    let rows = res.as_array().expect("results array").clone();
+
+    // (a) SHORTER than the request, and self-naming. If the fixture ever stops refusing
+    // that handle the length assert fails loudly rather than the test passing vacuously.
+    assert_eq!(
+        rows.len(),
+        3,
+        "the refused-handle scene must be filtered out, the other 3 must survive: {rows:?}"
+    );
+    let mut got: Vec<u64> = rows
+        .iter()
+        .map(|r| {
+            r["scene_slot"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("every scene row carries its own scene_slot: {r:?}"))
+        })
+        .collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![0, 2, 3],
+        "identity survives the filter — NOT a positional 0,1,2: {rows:?}"
+    );
+
+    // (b) Each survivor's re-measure emits one row keyed by that same identity. The log is
+    // env-armed; emission ALSO needs a `validate` payload, so no other test can be affected
+    // by this var even though env is process-global (and `serial()` is held throughout).
+    let dir = std::env::temp_dir().join("tmp-companion-p5-midbatch");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let log = dir.join("expect.jsonl");
+    std::env::set_var("TMP_E2E_VALIDATE_LOG", &log);
+    std::env::set_var("TMP_E2E_VALIDATE_WAV_DIR", dir.join("wavs"));
+    for r in &rows {
+        let scene = r["scene_slot"].as_u64().expect("scene_slot");
+        let clamped = r["clamped"].as_bool().unwrap_or(false);
+        invoke(
+            &webview,
+            "e2e_measure_sound",
+            serde_json::json!({
+                "slot": 403,
+                "scene": scene,
+                "footswitch": null,
+                "topologyId": "guitar-humbucker",
+                "lev": null,
+                "validate": {
+                    "targetLufs": r["target_lufs"],
+                    "clamped": clamped,
+                    "persistMismatch": r["persist_mismatch"],
+                },
+            }),
+        )
+        .unwrap_or_else(|e| panic!("e2e_measure_sound scene {scene}: {e:?}"));
+    }
+    std::env::remove_var("TMP_E2E_VALIDATE_LOG");
+    std::env::remove_var("TMP_E2E_VALIDATE_WAV_DIR");
+
+    let body = std::fs::read_to_string(&log).expect("validation log written");
+    let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "one row per surviving scene: {body}");
+    for scene in [0u64, 2, 3] {
+        assert!(
+            body.contains(&format!("\"scene_slot\":{scene}")),
+            "scene {scene} emitted its own row: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"label\":\"scene:slot403:scene{scene}\"")),
+            "scene {scene}'s label is self-describing: {body}"
+        );
+    }
+    assert!(
+        !body.contains("\"scene_slot\":1"),
+        "the FAILED scene must emit no row at all — there is nothing saved to validate: {body}"
+    );
+    // The off-branch "Clean" scene clamps, and its row MUST still be emitted with the flag
+    // set: the consumer reports it SKIP, never a target miss against an unreachable number.
+    let clamped_rows = rows
+        .iter()
+        .filter(|r| r["clamped"] == serde_json::Value::Bool(true))
+        .count();
+    assert_eq!(
+        clamped_rows, 1,
+        "fixture premise: exactly one scene is the amp-at-zero off-branch clamp: {rows:?}"
+    );
+    assert_eq!(
+        body.matches("\"clamped\":true").count(),
+        1,
+        "the clamped row is EMITTED with clamped:true (SKIP downstream), not dropped: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -69,12 +69,27 @@ const SWITCH_JOBS = [
 interface LevelResult {
   saved: boolean;
   clamped: boolean;
+  /** 0-based `scenes[]` wire index on a scene row; null elsewhere. Identity, not
+   * position: `level_scenes_apply_batched` filters failed scenes out of the array it
+   * returns, so index i is NOT scene i once anything fails. */
+  scene_slot: number | null;
+  persist_mismatch: boolean | null;
 }
 interface FootswitchLevelResult {
   switch: number;
   saved: boolean;
   clamped: boolean;
   clamp_reason: string | null;
+}
+/** P5 external validation: what the run PROMISED for the sound about to be re-measured.
+ * The spec owns this because the spec is what drove the leveling lane — the server keeps
+ * no cross-command memory. Inert unless `TMP_E2E_VALIDATE_LOG` is set in the SERVER's
+ * environment (`scripts/e2e.sh` does that when ffmpeg is present), in which case the
+ * re-measure also dumps its WAV and appends one row for `scripts/level-validate.sh`. */
+interface ValidateArg {
+  targetLufs: number;
+  clamped: boolean;
+  persistMismatch: boolean | null;
 }
 interface LevelBlock {
   group_id: string;
@@ -116,6 +131,7 @@ test.describe("Level — strict output harness (Hiwatt corruption-class preset)"
     const measure = (args: {
       scene?: number;
       footswitch?: (typeof SWITCH_JOBS)[number];
+      validate?: ValidateArg;
     }): Promise<number> =>
       invoke(
         page,
@@ -132,6 +148,7 @@ test.describe("Level — strict output harness (Hiwatt corruption-class preset)"
                 parameterId: args.footswitch.levParameterId,
               }
             : null,
+          validate: args.validate ?? null,
         },
         T,
       ) as Promise<number>;
@@ -184,11 +201,16 @@ test.describe("Level — strict output harness (Hiwatt corruption-class preset)"
       },
       T * 3,
     )) as LevelResult[];
-    for (const [i, r] of scenes.entries()) {
-      expect(r.clamped, `scene ${String(i)} must reach target, not clamp`).toBe(
-        false,
-      );
-      expect(r.saved, `scene ${String(i)} must level and save`).toBe(true);
+    // Row identity comes off `scene_slot`, not the array index — a mid-batch failure
+    // shortens this array, so index i is not scene i.
+    expect(
+      scenes.map((r) => r.scene_slot).sort((a, b) => Number(a) - Number(b)),
+      "every requested scene must come back (no silent mid-batch drop)",
+    ).toEqual([0, 1, 2, 3]);
+    for (const r of scenes) {
+      const id = String(r.scene_slot);
+      expect(r.clamped, `scene ${id} must reach target, not clamp`).toBe(false);
+      expect(r.saved, `scene ${id} must level and save`).toBe(true);
     }
 
     // ── Lane 3: all 4 footswitches (one batch, save) ──────────────────────────
@@ -220,13 +242,46 @@ test.describe("Level — strict output harness (Hiwatt corruption-class preset)"
     }
 
     // ── The strict gate: re-measure EVERY sound from the SAVED state ──────────
+    // Each re-measure also carries the run's own promise for that sound (`validate`),
+    // which the server writes to the P5 expectation log alongside the WAV it just
+    // captured — so `scripts/level-validate.sh` can judge the SAME audio with ffmpeg's
+    // ebur128 afterwards. A scene's promise is looked up BY `scene_slot`, never by index:
+    // the batch filters failed scenes out of the array it returns.
+    const sceneRow = (slot: number): LevelResult | undefined =>
+      scenes.find((r) => r.scene_slot === slot);
     const heard: Record<string, number> = {};
-    heard.base = await measure({});
+    heard.base = await measure({
+      validate: {
+        targetLufs: TARGET,
+        clamped: base.clamped,
+        persistMismatch: base.persist_mismatch,
+      },
+    });
     for (const scene of [0, 1, 2, 3]) {
-      heard[`scene${String(scene)}`] = await measure({ scene });
+      const row = sceneRow(scene);
+      expect(
+        row,
+        `scene ${String(scene)} must be present in the batch results`,
+      ).toBeDefined();
+      heard[`scene${String(scene)}`] = await measure({
+        scene,
+        validate: {
+          targetLufs: TARGET,
+          clamped: row?.clamped ?? false,
+          persistMismatch: row?.persist_mismatch ?? null,
+        },
+      });
     }
     for (const j of SWITCH_JOBS) {
-      heard[`fs${String(j.switch)}`] = await measure({ footswitch: j });
+      const row = fs.find((r) => r.switch === j.switch);
+      heard[`fs${String(j.switch)}`] = await measure({
+        footswitch: j,
+        validate: {
+          targetLufs: TARGET,
+          clamped: row?.clamped ?? false,
+          persistMismatch: null,
+        },
+      });
     }
     for (const [sound, lufs] of Object.entries(heard)) {
       const delta = sound.startsWith("fs") ? DELTA_FS : DELTA;

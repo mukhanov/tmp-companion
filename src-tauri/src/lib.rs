@@ -67,6 +67,10 @@ mod spectrum;
 // `pub` so the `gen_samples` bin (a separate crate) can reach the shared
 // catalog as `tmp_companion_lib::topologies`.
 pub mod topologies;
+// P5 external validation: the JSON-lines expectation log the measurement seams append
+// to when `TMP_E2E_VALIDATE_LOG` is set. Inert (and unallocating) otherwise.
+#[allow(dead_code)]
+mod validate_log;
 mod variants;
 mod watcher;
 

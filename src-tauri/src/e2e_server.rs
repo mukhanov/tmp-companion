@@ -613,8 +613,31 @@ struct FsLevRef {
     parameter_id: String,
 }
 
+/// P5 EXTERNAL-VALIDATION metadata for one re-measure (optional; omit and the command
+/// behaves exactly as before). The SPEC supplies it because the spec is what knows the
+/// target it drove the leveling lane with and what that lane reported back — the server
+/// keeps no cross-command memory, and inferring it from a result vec by position is the
+/// mislabeling bug this redesign removed (see `LevelResult::scene_slot`).
+///
+/// Emission still only happens when `TMP_E2E_VALIDATE_LOG` is set, so passing this on an
+/// ordinary `bun run e2e` costs nothing.
+#[cfg(feature = "e2e")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidateArg {
+    /// What the leveling run promised this sound would render at.
+    target_lufs: f64,
+    /// The run's own verdicts, forwarded so the consumer can SKIP (not FAIL) a row that
+    /// was never reachable or whose save did not verify.
+    #[serde(default)]
+    clamped: bool,
+    #[serde(default)]
+    persist_mismatch: Option<bool>,
+}
+
 #[cfg(feature = "e2e")]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn e2e_measure_sound(
     app: tauri::AppHandle<tauri::test::MockRuntime>,
     state: State<'_, AppState>,
@@ -623,13 +646,33 @@ async fn e2e_measure_sound(
     footswitch: Option<u32>,
     topology_id: String,
     lev: Option<FsLevRef>,
+    validate: Option<ValidateArg>,
 ) -> Result<f64, String> {
     let stim_path = resolve_stimulus(&app, None, Some(topology_id))?;
     with_released_seize(state.session.clone(), move || {
         let stim = read_stimulus_calibrated(&stim_path, None)?;
+        // The label/identity is built from THIS call's own coordinates — the sound being
+        // measured names itself, so a mid-batch failure upstream can never shift a row.
+        let row = validate.map(|v| {
+            let base = match (scene, footswitch) {
+                (Some(s), _) => crate::validate_log::ValidationRow::scene(slot, s, v.target_lufs),
+                (None, Some(sw)) => {
+                    crate::validate_log::ValidationRow::footswitch(slot, sw, v.target_lufs)
+                }
+                (None, None) => crate::validate_log::ValidationRow::base(slot, v.target_lufs),
+            };
+            base.with_flags(v.clamped, v.persist_mismatch)
+        });
         if scene.is_some() {
-            return leveller::measure_sound_asis_strict(slot, scene, &[], None, &stim)
-                .map(|l| l.integrated_lufs);
+            return leveller::measure_sound_asis_strict(
+                slot,
+                scene,
+                &[],
+                None,
+                &stim,
+                row.as_ref(),
+            )
+            .map(|l| l.integrated_lufs);
         }
         // Base / footswitch context: the ONE shared isolation derivation the leveling +
         // Doctor lanes use (`doctor_force_bypass` over the SAVED doc) — not a private copy.
@@ -652,7 +695,7 @@ async fn e2e_measure_sound(
             .map(|v| ((l.group_id, l.node_id, l.parameter_id), v as f32)),
             _ => None,
         };
-        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim)
+        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim, row.as_ref())
             .map(|l| l.integrated_lufs)
     })
     .await
