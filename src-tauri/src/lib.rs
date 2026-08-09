@@ -944,6 +944,83 @@ mod fixture_gates {
         }
     }
 
+    /// Every `func == "param"` ftsw entry in `p`, in ONE walk: `(total param entries,
+    /// customLabels of any whose valueType is NOT a JSON number)`. A single traversal
+    /// feeds both the vacuity floor and the gate predicate below so they can't drift
+    /// out of sync if one filter chain is edited and not the other; the same pair also
+    /// proves the negative case actually flips the predicate (forked copy, `valueType`
+    /// deleted). Deliberately does NOT look at the `exp` block: its entries legitimately
+    /// carry the STRING `"valueType": "float"` (verified against a verbatim device
+    /// export) and must not be gated by this shape.
+    fn param_footswitch_value_types(p: &serde_json::Value) -> (usize, Vec<String>) {
+        let params: Vec<&serde_json::Value> = p["ftsw"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|bank| bank.as_array().into_iter().flatten())
+            .filter(|entry| entry["func"] == "param")
+            .collect();
+        let missing = params
+            .iter()
+            .filter(|entry| !entry["valueType"].is_number())
+            .map(|entry| {
+                entry["customLabel"]
+                    .as_str()
+                    .unwrap_or("<unlabeled>")
+                    .to_string()
+            })
+            .collect();
+        (params.len(), missing)
+    }
+
+    /// NON-REGRESSION GATE (HW bisect 2026-08-09, fw 1.8.45): importing a preset whose
+    /// `ftsw` array carries a `func: "param"` entry with NO `valueType` field makes the
+    /// device silently DISCARD the whole imported preset at its lazy commit and
+    /// substitute the factory-default "Guitar" body. Every param-func footswitch entry in
+    /// every committed fixture must therefore carry a NUMERIC `valueType`.
+    #[test]
+    fn every_param_footswitch_in_every_fixture_carries_a_numeric_value_type() {
+        let mut checked = 0usize;
+        for (idx, name, _, p) in fixtures() {
+            let (total, missing) = param_footswitch_value_types(&p);
+            checked += total;
+            assert!(
+                missing.is_empty(),
+                "{name} ({idx}): param-func footswitches missing a numeric valueType: \
+                 {missing:?} — fw 1.8.45 silently replaces the WHOLE imported preset with \
+                 the factory-default body when a param-func switch lacks valueType (HW \
+                 bisect 2026-08-09)"
+            );
+        }
+        assert!(
+            checked >= 4,
+            "expected at least the four known param-func footswitches across the fixture \
+             set ({checked} found) — a schema rename would otherwise make this gate pass \
+             vacuously"
+        );
+
+        // NEGATIVE CHECK: fork E2E Rig's ftsw[9] ("VERB KILL") param entry with
+        // `valueType` deleted and confirm the SAME helper then reports it missing, so
+        // the assert above can't be vacuously true from a predicate that never actually
+        // inspects `valueType`.
+        let (_, _, rig) = fixture(400);
+        let mut forked = rig.clone();
+        let removed = forked["ftsw"][9][0]
+            .as_object_mut()
+            .expect("VERB KILL param entry")
+            .remove("valueType");
+        assert_eq!(
+            removed,
+            Some(serde_json::json!(2)),
+            "E2E Rig ftsw[9] moved or lost its valueType — update this fork's index/value"
+        );
+        let (_, missing) = param_footswitch_value_types(&forked);
+        assert!(
+            !missing.is_empty(),
+            "deleting valueType from a param entry must make the gate condition fail"
+        );
+    }
+
     /// NON-REGRESSION GATE for the fixture-scene corruption class (real 1.8.45 unit,
     /// 2026-07-28). The device silently DROPS a preset's ENTIRE `scenes[]` (and
     /// re-stamps `info.source_id` to its placeholder) the first time a scene is

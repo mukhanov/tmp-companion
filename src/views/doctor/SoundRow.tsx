@@ -209,7 +209,12 @@ export function SoundRow({
     bandLayoutsMatch(referenceSound, sound);
 
   return (
-    <div style={{ borderTop: `0.5px solid ${t.hairline}` }}>
+    <div
+      // e2e hook: count a preset card's rendered sound rows, mirroring
+      // TargetEditCard/BlockEditor's `data-target-card`/`data-candidate`.
+      data-sound-row={sound.key}
+      style={{ borderTop: `0.5px solid ${t.hairline}` }}
+    >
       <div
         onClick={expandable ? onToggle : undefined}
         style={{

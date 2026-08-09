@@ -8416,6 +8416,54 @@ mod tests {
         );
     }
 
+    // THE WRITER side of the param-func-without-valueType HW finding (fw 1.8.45 silently
+    // discards a WHOLE imported preset at its lazy commit when any `func: "param"` ftsw
+    // entry lacks `valueType` — see `notes/gotchas.md`'s entry of the same name). Pins the
+    // ASSIGN branch's composed functionJson (the literal wire string a test can parse, per
+    // `SimEvent::SetFootswitchAssignment`'s own doc) directly, so a refactor that threads
+    // `FootswitchWriteSpec` "faithfully" but drops the field fails HERE instead of only
+    // re-arming the discard on a later export/import cycle.
+    #[test]
+    fn write_fs_values_assign_composes_a_numeric_value_type() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        let pending = vec![FsPendingWrite {
+            switch: 1,
+            lev: ("G1".to_string(), "n1".to_string(), "level".to_string()),
+            write: FsWrite::Assign {
+                value_b: 0.2,
+                spec: FootswitchWriteSpec {
+                    function_index: 0,
+                    color_a: 5,
+                    color_b: 0,
+                    custom_label: "TEST".to_string(),
+                    link_group: 0,
+                    is_active: false,
+                    switch_type: 0,
+                },
+            },
+            value: 0.7,
+        }];
+        write_fs_values_on_session(&mut s, 30, &pending, None).expect("write");
+        let ev = sim.events();
+        let sent = ev
+            .iter()
+            .find_map(|e| match e {
+                crate::sim_device::SimEvent::SetFootswitchAssignment { function_json, .. } => {
+                    Some(function_json.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the assign must send a setFootswitchAssignment: {ev:?}"));
+        let json: serde_json::Value = serde_json::from_str(&sent).expect("valid functionJson");
+        assert!(
+            json["valueType"].is_number(),
+            "the composed param functionJson must carry a NUMERIC valueType, not omit it \
+             or carry a string — its absence makes fw 1.8.45 silently discard the whole \
+             preset on a later import: {sent}"
+        );
+    }
+
     // A bake on a device-authored scened preset is MASKED by every full-param scene overlay
     // (HW, Hiwatt slot 31: the overlays governed the DSP while base stayed untouched), so the
     // solved value must ALSO be written into each overlay that restated the base value —

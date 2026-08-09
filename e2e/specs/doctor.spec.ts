@@ -103,15 +103,46 @@ test.describe("Doctor — select, check, results", () => {
     //    regex tolerates PSD peak-fit wobble in the decimal and skips the Rx
     //    title (which embeds the same phrase); broadband side-effects of the
     //    +12 dB stack (harsh/fizzy) may co-fire and stay unasserted.
-    //  * The two healthy presets must produce NO resonant chip anywhere, so
-    //    exactly ONE renders in Everything view (HW sweep: resonant fired on
-    //    the EQ-ring preset alone — 22 dB, Q 24 — across all scenario presets).
+    //  * AS-PLAYED SEMANTICS: the EQ ring lives in E2E Edge's BASE graph, so it is
+    //    present in every one of Edge's played sounds — base, all 8 scenes, and its
+    //    footswitch rows — not one isolated row. A page-wide `toHaveCount(1)` oracle
+    //    predates the as-played rework (when Doctor forced every diagnosis to a single
+    //    all-off baseline) and is stale under it: the chip legitimately renders once
+    //    PER Edge sound. The oracle below instead asserts (a) ZERO ring chips outside
+    //    Edge's own card — scoped via `data-preset-card`, the same e2e hook
+    //    `copy.spec.ts` uses for per-target scoping — and (b) INSIDE Edge's card the
+    //    chip count equals the count of `data-sound-row`s AFTER expanding the
+    //    collapsed "N sounds check out" healthy bucket (`PresetResultCard.tsx`'s
+    //    `showHealthy` strip, present whenever any sound on the card IS flagged): a
+    //    healthy sound renders NO `data-sound-row` while collapsed, so without the
+    //    expand step a sound that stops ringing would drop out of BOTH sides of the
+    //    equality and a 1–2 sound regression would pass silently. The denominator is
+    //    therefore ALL of Edge's played sounds, not a hardcoded number — any sound
+    //    that goes un-flagged breaks the equality.
     //  * Opening the defect preset's own sound row must surface the RIGHT
     //    prescription — the cut at the EQ-10 band nearest the MEASURED ring
     //    (2.5–2.7 kHz all map log-nearest to the 2 kHz band; the chain owns a
     //    parametric EQ, so the Rx is the point-at-your-EQ advisory).
     if (await isOnline(page)) {
-      await expect(page.getByText(/^Rings at 2\.\d kHz$/)).toHaveCount(1);
+      const ringChip = /^Rings at 2\.\d kHz$/;
+      const edgeCard = page.locator(`[data-preset-card="${picked[2].name}"]`);
+      for (const p of [picked[0], picked[1]]) {
+        const card = page.locator(`[data-preset-card="${p.name}"]`);
+        // Non-vacuous: an attribute/name drift must not make the zero-count check
+        // below pass trivially against a card that doesn't exist.
+        await expect(card).toHaveCount(1);
+        await expect(card.getByText(ringChip)).toHaveCount(0);
+      }
+      // Expand the collapsed healthy bucket (if the strip is present) BEFORE
+      // counting — see the AS-PLAYED SEMANTICS note above.
+      const healthySummary = edgeCard.getByText(/\d+ sounds? checks? out/);
+      if (await healthySummary.isVisible().catch(() => false)) {
+        await healthySummary.click();
+      }
+      const edgeRowCount = await edgeCard.locator("[data-sound-row]").count();
+      expect(edgeRowCount).toBeGreaterThanOrEqual(9);
+      await expect(edgeCard.getByText(ringChip)).toHaveCount(edgeRowCount);
+
       await page.getByText(picked[2].name).last().click();
       await expect(
         page.getByText(/Rings at 2\.\d kHz — cut the 2 kHz band/).first(),

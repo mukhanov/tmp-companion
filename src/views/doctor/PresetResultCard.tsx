@@ -134,6 +134,9 @@ export function PresetResultCard({
 
   return (
     <div
+      // e2e hook: scope per-preset selectors (e.g. diagnosis chip counts) to one
+      // preset's card, mirroring TargetEditCard's `data-target-card`.
+      data-preset-card={presetName}
       style={{
         flexShrink: 0,
         borderRadius: 14,

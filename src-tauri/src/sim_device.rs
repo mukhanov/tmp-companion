@@ -3208,8 +3208,10 @@ mod ftsw_tests {
     use crate::session::Session;
 
     /// The `param` functionJson shape the leveler's Assign branch writes, trimmed to the keys
-    /// the read-back helpers match on.
-    const PARAM_FN: &str = r#"{"func":"param","groupId":"G1","nodeId":"n1","parameterId":"level","valueA":0.7,"valueB":0.2}"#;
+    /// the read-back helpers match on. Carries `valueType` (numeric) because the real
+    /// composer (`leveller.rs`) does too — its absence makes fw 1.8.45 silently discard the
+    /// whole IMPORTED preset at its lazy commit (see `notes/gotchas.md`).
+    const PARAM_FN: &str = r#"{"func":"param","groupId":"G1","nodeId":"n1","parameterId":"level","valueA":0.7,"valueB":0.2,"valueType":2}"#;
 
     /// The field-3 body the fake would push for the current slot, parsed.
     fn rendered(sim: &SimDevice) -> serde_json::Value {
