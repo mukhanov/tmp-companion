@@ -166,6 +166,13 @@ impl ValidationRow {
     }
 }
 
+/// A finite integrated loudness at or below this is genuinely down at the device's
+/// stationary output floor — no leveled sound lands anywhere near it (the shipped targets
+/// are −23/−21/−19 LUFS, and even the deliberately-quiet fixture scene models ≈ −58). Above
+/// it, a `floor` stamp is far more likely to be [`crate::leveller::is_engaged`]'s
+/// spread criterion misfiring than a failed inject — see [`engaged_verdict`].
+const FLOOR_SUSPECT_FLOOR_LUFS: f64 = -55.0;
+
 /// The engage verdict the consumer keys its "failed inject, not a level miss" FAIL on.
 ///
 /// `danger.md`: a silent/failed re-amp inject reads as the device's STATIONARY OUTPUT
@@ -173,11 +180,31 @@ impl ValidationRow {
 /// noise the shell cannot possibly filter on its own. Stamping the verdict here (from
 /// the same criterion `probe --measure-current`'s FLOOR/SILENT headline uses) is what
 /// keeps the shell from ever having to grep a probe log.
+///
+/// FOUR verdicts, not three, because the criterion has a KNOWN false positive.
+/// `is_engaged`'s `spread > 0.5` arm (documented in `CLAUDE.md`) stamps FLOOR on perfectly
+/// valid captures of the stationary stimulus through a COMPRESSED chain — the sound is
+/// loud, on-target and real, but its short-term-max sits within 0.5 LU of its integrated
+/// reading. Failing those hard is a FALSE RED that would sink a correct 45-minute online
+/// run, and softening the criterion itself would re-open the failed-inject hole it exists
+/// to close. So the two cases are SPLIT by absolute level:
+///
+/// * `floor` — flat AND down at the floor (≤ [`FLOOR_SUSPECT_FLOOR_LUFS`]). The genuine
+///   failed-inject signature; still a hard FAIL downstream.
+/// * `floor_suspect` — flat but LOUD. The consumer WARNs and still grades the row against
+///   its target with ffmpeg, so the independent meter stays the authority on whether the
+///   leveling was right; only the engage proof is downgraded to advisory.
+///
+/// ORDER IS LOAD-BEARING: the `is_finite` arm comes first, so a `-inf` integrated is
+/// `silent` and never reaches the level comparison below (which would read `-inf <= -55`
+/// as a floor and lose the distinction). Do not "simplify" the ordering.
 fn engaged_verdict(loud: &lufs::Loudness) -> &'static str {
     if !loud.integrated_lufs.is_finite() {
         "silent"
     } else if crate::leveller::is_engaged(loud) {
         "engaged"
+    } else if loud.integrated_lufs > FLOOR_SUSPECT_FLOOR_LUFS {
+        "floor_suspect"
     } else {
         "floor"
     }
@@ -229,14 +256,43 @@ pub(crate) fn emit(row: &ValidationRow, cap: &audio::Capture, loud: &lufs::Loudn
 /// [`emit`] with the destinations resolved — the env-free seam the unit tests drive
 /// (setting `TMP_E2E_VALIDATE_LOG` in a test would arm emission for every OTHER test
 /// running in parallel, since env is process-global).
+/// A `<dir>/<stem>.wav` that does not exist yet — `stem`, else `stem-2`, `stem-3`, …
+///
+/// `dump_processed_capture` deliberately OVERWRITES on a repeated label (its own doc says
+/// so; the probe's `--dump-wav` A/B relies on it). That is wrong for the expectation log:
+/// two rows CAN legitimately share a label within one run — an operator asking for the
+/// same sound twice, a spec re-measuring after a retry — and the second dump would then
+/// silently replace the audio the FIRST row's line already points at, so the judge would
+/// grade one capture twice and never see the other. Rows are cheap; a silently-substituted
+/// capture is the false-green this whole file exists to prevent.
+///
+/// The counter is bounded: past the cap the base stem is returned and the overwrite is
+/// accepted rather than spinning (a run producing 999 same-label rows has a bigger
+/// problem, and a dump is never worth an unbounded loop).
+fn unique_wav_stem(dir: &str, stem: &str) -> String {
+    const MAX_TRIES: u32 = 999;
+    let taken = |s: &str| std::path::Path::new(dir).join(format!("{s}.wav")).exists();
+    if !taken(stem) {
+        return stem.to_string();
+    }
+    for n in 2..=MAX_TRIES {
+        let candidate = format!("{stem}-{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    stem.to_string()
+}
+
 fn emit_to(log: &str, dir: &str, row: &ValidationRow, cap: &audio::Capture, loud: &lufs::Loudness) {
-    let (wav, wav_error) =
-        match crate::probe_api::stimulus::dump_processed_capture(cap, dir, &sanitize(&row.label)) {
-            Ok(path) => (json_str(&path), "null".to_string()),
-            // A dump failure must still produce a ROW: a swallowed row is an empty log, and
-            // an empty log reads to the consumer as "nothing was leveled", i.e. a pass.
-            Err(e) => ("null".to_string(), json_str(&e)),
-        };
+    let stem = unique_wav_stem(dir, &sanitize(&row.label));
+    let (wav, wav_error) = match crate::probe_api::stimulus::dump_processed_capture(cap, dir, &stem)
+    {
+        Ok(path) => (json_str(&path), "null".to_string()),
+        // A dump failure must still produce a ROW: a swallowed row is an empty log, and
+        // an empty log reads to the consumer as "nothing was leveled", i.e. a pass.
+        Err(e) => ("null".to_string(), json_str(&e)),
+    };
     // `tol_lu: null` = "the consumer's own default applies". Emitted explicitly so the
     // field exists in every row and a future per-row override needs no shape change.
     let line = format!(
@@ -304,11 +360,30 @@ mod tests {
     }
 
     #[test]
-    fn engage_verdict_separates_silent_floor_and_engaged() {
+    fn engage_verdict_separates_silent_floor_floor_suspect_and_engaged() {
         assert_eq!(engaged_verdict(&loud(f64::NEG_INFINITY, 0.0)), "silent");
-        // Finite but flat and near the floor: the failed-inject signature.
+        // Finite but flat and DOWN AT THE FLOOR: the failed-inject signature, hard FAIL.
         assert_eq!(engaged_verdict(&loud(-70.0, -69.9)), "floor");
         assert_eq!(engaged_verdict(&loud(-17.0, -12.0)), "engaged");
+        // Flat but LOUD — `is_engaged`'s spread>0.5 arm misfiring on a compressed capture
+        // of the stationary stimulus. A real sound at a real level, so the consumer WARNs
+        // and still grades it with ffmpeg rather than failing the run outright.
+        assert_eq!(engaged_verdict(&loud(-17.0, -16.8)), "floor_suspect");
+        // The boundary is exclusive on the floor side: exactly at the constant stays hard.
+        assert_eq!(
+            engaged_verdict(&loud(
+                FLOOR_SUSPECT_FLOOR_LUFS,
+                FLOOR_SUSPECT_FLOOR_LUFS + 0.1
+            )),
+            "floor"
+        );
+        assert_eq!(
+            engaged_verdict(&loud(
+                FLOOR_SUSPECT_FLOOR_LUFS + 0.5,
+                FLOOR_SUSPECT_FLOOR_LUFS + 0.6
+            )),
+            "floor_suspect"
+        );
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -382,6 +457,36 @@ mod tests {
         );
         // One row per emit, newline-terminated: the consumer reads this line by line.
         assert_eq!(body.lines().count(), 1, "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Two rows sharing a label must NOT share a WAV: the second dump would overwrite the
+    // audio the first row's line names, so ffmpeg would grade one capture twice.
+    #[test]
+    fn a_repeated_label_gets_its_own_wav_rather_than_overwriting_the_first() {
+        let dir = scratch("dupelabel");
+        let log = dir.join("expect.jsonl");
+        let wavs = dir.join("wavs");
+        for _ in 0..2 {
+            emit_to(
+                log.to_str().expect("utf8"),
+                wavs.to_str().expect("utf8"),
+                &ValidationRow::base(400, -23.0),
+                &cap(2),
+                &loud(-23.1, -18.0),
+            );
+        }
+        let body = std::fs::read_to_string(&log).expect("log written");
+        assert_eq!(body.lines().count(), 2, "one row per emit: {body}");
+        assert!(wavs.join("base_slot400.wav").is_file(), "the first take");
+        assert!(
+            wavs.join("base_slot400-2.wav").is_file(),
+            "the second take got its OWN file, not the first one's"
+        );
+        assert!(
+            body.contains("base_slot400-2.wav"),
+            "the second row points at its own capture: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

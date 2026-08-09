@@ -33,6 +33,7 @@ import { SceneLevelPick } from "./SceneLevelPick";
 import { useSceneHandles } from "../level/useSceneHandles";
 import {
   defaultParamIndex,
+  footswitchNameForCandidate,
   instCalState,
   setupRowHookKey,
   targetFromCandidate,
@@ -460,6 +461,17 @@ export function SetupBody({
           footswitch: picked
             ? targetFromCandidate(o.footswitch.switchIndex, picked)
             : verifyFootswitchTarget(o.footswitch.switchIndex),
+          // LABEL PROVENANCE. `sceneName` is not display-only for a footswitch row: it
+          // becomes `displayLabel`, which the backend writes as the switch's on-device
+          // `customLabel` when an assign appends a function to an UNLABELED switch. The
+          // name was chosen back in `chosenFrom`, which only knew the tone-safe DEFAULT
+          // candidate — so a user who overrode that pick here would have had the unit
+          // renamed after a block the run never touched. Re-derive it from the candidate
+          // actually being leveled. A LABELED switch keeps its own name: that string is
+          // the player's, and nothing about picking a different knob makes it wrong.
+          ...(o.fsUnlabeled === true && picked
+            ? { sceneName: footswitchNameForCandidate(picked) }
+            : {}),
         };
       } else if (o.sceneSlot != null && !o.isBase) {
         option = {

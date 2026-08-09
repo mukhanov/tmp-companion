@@ -599,6 +599,83 @@ pub fn existing_param_fn_value_a(
         .and_then(Value::as_f64)
 }
 
+/// What a switch's `ftsw` entry can tell a RE-MEASURE about replaying an assign's engaged
+/// state — [`existing_param_fn_value_a`]'s three outcomes, kept apart.
+///
+/// The plain `Option` collapses two very different situations into `None`, and a re-measure
+/// caller cannot act correctly on the collapsed answer:
+/// * "no `param` function for this node at all" is the BAKED (or never-assigned) switch —
+///   the solved value lives in the block, the engaged sound IS the saved state, and writing
+///   nothing is exactly right. Every `on-off`-only switch in the Hiwatt fixture is this.
+/// * "there ARE `param` functions on this node, just not the one you named" — or "the right
+///   one is there but its `valueA` is unusable" — means the caller asked for a sound this
+///   switch cannot produce. Replaying nothing then measures the BASE sound while the row is
+///   still labelled with the switch's identity: the wrong sound under the right name, which
+///   an external validator has no way to catch.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg(any(test, feature = "e2e"))]
+pub enum FsAssignAnchor {
+    /// A matching `param` function with a usable `valueA` — replay this value.
+    Value(f64),
+    /// No `param` function targets `node_id` on this switch. Baked or never assigned:
+    /// nothing to replay, and that is correct.
+    NoAssignment,
+    /// The switch is assign-shaped on this node but cannot produce the named sound. Carries
+    /// a human-readable reason for the caller's error message.
+    Mismatch(String),
+}
+
+/// Resolve `switch`'s assign anchor for `(node_id, param)` — [`existing_param_fn_value_a`]
+/// with its `None` split into "nothing assigned here" vs "assigned, but not what you asked
+/// for". See [`FsAssignAnchor`] for why the distinction matters.
+#[cfg(any(test, feature = "e2e"))]
+pub fn resolve_assign_anchor(
+    ftsw: &Value,
+    switch: u32,
+    node_id: &str,
+    param: &str,
+) -> FsAssignAnchor {
+    let fns: Vec<&Value> = ftsw
+        .as_array()
+        .and_then(|a| a.get(switch as usize))
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|f| {
+                    f.get("func").and_then(Value::as_str) == Some("param")
+                        && f.get("nodeId").and_then(Value::as_str) == Some(node_id)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fns.is_empty() {
+        return FsAssignAnchor::NoAssignment;
+    }
+    match fns
+        .iter()
+        .find(|f| f.get("parameterId").and_then(Value::as_str) == Some(param))
+    {
+        Some(f) => match f.get("valueA").and_then(Value::as_f64) {
+            Some(v) => FsAssignAnchor::Value(v),
+            None => FsAssignAnchor::Mismatch(format!(
+                "switch {switch}'s `param` function on {node_id}.{param} has no usable \
+                 numeric `valueA` (got {:?}) — its engaged value cannot be replayed",
+                f.get("valueA")
+            )),
+        },
+        None => {
+            let have: Vec<&str> = fns
+                .iter()
+                .filter_map(|f| f.get("parameterId").and_then(Value::as_str))
+                .collect();
+            FsAssignAnchor::Mismatch(format!(
+                "switch {switch} assigns {node_id} on {have:?}, not {param:?} — replaying \
+                 nothing would measure the BASE sound under this switch's identity"
+            ))
+        }
+    }
+}
+
 /// One leveling job's key for planning (the device-independent fields the decision needs).
 pub struct FsJobKey<'a> {
     pub switch: u32,
@@ -893,6 +970,53 @@ mod tests {
         assert_eq!(anchor(3), None, "no existing function (fresh assign)");
         assert_eq!(anchor(1), None, "function present but valueA missing");
         assert_eq!(anchor(2), None, "non-numeric valueA");
+    }
+
+    // The same four cases through `resolve_assign_anchor`, which exists to SPLIT that single
+    // `None`. A re-measure caller writes nothing on all three of them, but only one of the
+    // three is correct to write nothing on — the other two measure the BASE sound and file
+    // it under the switch's identity, which reads as a plausible number on a correctly
+    // named row and is exactly what an external validator cannot catch.
+    #[test]
+    fn resolve_assign_anchor_splits_no_assignment_from_a_mismatch() {
+        let pf = |value_a: Value| serde_json::json!({ "func": "param", "nodeId": "amp1", "parameterId": "outputLevel", "valueA": value_a });
+        let ftsw = serde_json::json!([
+            [pf(0.42.into())],
+            [{ "func": "param", "nodeId": "amp1", "parameterId": "outputLevel" }],
+            [pf("loud".into())],
+            // A BAKED switch: on-off only, no `param` function anywhere. Every switch in
+            // the `E2E Hiwatt 3S` fixture is this shape, and its engaged sound IS the saved
+            // block value — writing nothing is the right answer, not a swallowed failure.
+            [{ "func": "on-off", "nodes": [{ "groupId": "G1", "nodeId": "amp1" }] }],
+            // Assign-shaped on the SAME node, but on a different parameter.
+            [serde_json::json!({ "func": "param", "nodeId": "amp1", "parameterId": "gain", "valueA": 0.9 })],
+        ]);
+        let anchor = |sw| resolve_assign_anchor(&ftsw, sw, "amp1", "outputLevel");
+        assert_eq!(anchor(0), FsAssignAnchor::Value(0.42), "replay this value");
+        assert_eq!(
+            anchor(3),
+            FsAssignAnchor::NoAssignment,
+            "baked / never assigned → nothing to replay, and that is CORRECT"
+        );
+        assert_eq!(
+            anchor(9),
+            FsAssignAnchor::NoAssignment,
+            "switch index past the end of ftsw → treated as unassigned, never a panic"
+        );
+        // The three that must NOT be silently `None`.
+        for (sw, needle) in [
+            (1, "no usable numeric `valueA`"),
+            (2, "no usable numeric `valueA`"),
+            (4, "not \"outputLevel\""),
+        ] {
+            match anchor(sw) {
+                FsAssignAnchor::Mismatch(why) => assert!(
+                    why.contains(needle),
+                    "switch {sw}: {why:?} should name {needle:?}"
+                ),
+                other => panic!("switch {sw}: expected a Mismatch, got {other:?}"),
+            }
+        }
     }
 
     // AC — flag assignments that can't bind (scene out of range).

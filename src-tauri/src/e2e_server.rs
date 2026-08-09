@@ -685,14 +685,32 @@ async fn e2e_measure_sound(
         // from the CALLER — the spec owns the same pinned coordinates it fed the leveling
         // lane — so there is no second in-server param picker to diverge from the wizard's
         // `defaultParamIndex` choice.
+        //
+        // The two ways of writing nothing are NOT the same, so this resolves the anchor
+        // through `FsAssignAnchor` rather than a bare `Option`: writing nothing because the
+        // switch has no assignment on this node is correct (every `on-off` switch in the
+        // Hiwatt fixture bakes, and its engaged sound IS the saved state), but writing
+        // nothing because the switch assigns some OTHER parameter — or because the matching
+        // function's `valueA` is unusable — silently measures the BASE sound and files it
+        // under the switch's identity. An external validator sees a plausible number on a
+        // correctly-named row and cannot tell. Fail loudly instead.
         let fs_value = match (footswitch, lev) {
-            (Some(sw), Some(l)) => footswitch::existing_param_fn_value_a(
-                &saved["ftsw"],
-                sw,
-                &l.node_id,
-                &l.parameter_id,
-            )
-            .map(|v| ((l.group_id, l.node_id, l.parameter_id), v as f32)),
+            (Some(sw), Some(l)) => {
+                match footswitch::resolve_assign_anchor(
+                    &saved["ftsw"],
+                    sw,
+                    &l.node_id,
+                    &l.parameter_id,
+                ) {
+                    footswitch::FsAssignAnchor::Value(v) => {
+                        Some(((l.group_id, l.node_id, l.parameter_id), v as f32))
+                    }
+                    footswitch::FsAssignAnchor::NoAssignment => None,
+                    footswitch::FsAssignAnchor::Mismatch(why) => {
+                        return Err(format!("slot {slot}: {why}"))
+                    }
+                }
+            }
             _ => None,
         };
         leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim, row.as_ref())

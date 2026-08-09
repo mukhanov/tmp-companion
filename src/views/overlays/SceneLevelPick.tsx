@@ -60,14 +60,31 @@ export function SceneLevelPick({
 }: SceneLevelPickProps) {
   const { t } = useTheme();
   const cardRef = useContext(DialogCardCtx);
-  const { open, anchor, pos, cardEl, menuRef, triggerRef, openMenu, close } =
-    usePickAnchor(cardRef, { onOpen });
-
   const list = candidates.status === "resolved" ? candidates.candidates : [];
+  const { open, anchor, pos, cardEl, menuRef, triggerRef, openMenu, close } =
+    usePickAnchor(cardRef, {
+      onOpen,
+      // This menu is the one that grows AFTER it opens: `onOpen` fires the lazy per-preset
+      // candidate read, so the first paint is the one-line "Loading controls…" and the real
+      // body arrives a moment later. Without this key the placement stays the skeleton's
+      // and a long candidate list renders off the bottom of the card, unclamped and
+      // unflipped. Status + row count is enough — every content change that alters the
+      // menu's height moves one of the two.
+      contentKey: `${candidates.status}:${String(list.length)}`,
+    });
+  // Match on the FULL submitted identity — `groupId` included. `SceneHandlePick` carries
+  // all three and all three go to the backend, so a two-field match can bind the trigger's
+  // art/label to a same-named node in a DIFFERENT group (a parallel preset's two lanes each
+  // holding an `outputLevel`) while the run writes the other one. That is `danger.md`'s
+  // "UI values" rule verbatim: the UI showing one thing while the submitted value is
+  // another. It also keeps `stale` honest — a handle whose group no longer exists must read
+  // as removed, not silently re-point at its namesake.
   const matched = handle
     ? list.find(
         (c) =>
-          c.nodeId === handle.nodeId && c.parameterId === handle.parameterId,
+          c.groupId === handle.groupId &&
+          c.nodeId === handle.nodeId &&
+          c.parameterId === handle.parameterId,
       )
     : undefined;
   // DANGER-rule guard: the stored `handle` (from a re-level round, or a preset re-read
@@ -97,8 +114,12 @@ export function SceneLevelPick({
 
   const candidateRow = (c: SceneHandleCandidate) => {
     const disabled = c.scope === "shared_with_base" || c.scope === "unknown";
+    // Same full-identity rule as `matched` above — the tick must mark the row that IS the
+    // submitted handle, not a same-named node in another group.
     const on =
-      handle?.nodeId === c.nodeId && handle.parameterId === c.parameterId;
+      handle?.groupId === c.groupId &&
+      handle.nodeId === c.nodeId &&
+      handle.parameterId === c.parameterId;
     return (
       <BlockParamRow
         key={`${c.nodeId}:${c.parameterId}`}

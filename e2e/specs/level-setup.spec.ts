@@ -179,6 +179,14 @@ test.describe("Level Setup — scene handle picker (isolated / shared_with_base 
     const boostCandidate = page.locator(
       '[data-block-param-pick="ACD_Boost:gain"]',
     );
+    // EXISTENCE FIRST. The warning assertion below is absence-only, and `toHaveCount(0)`
+    // is equally satisfied by a Boost row that never rendered — a candidate-enumeration
+    // regression, or a `data-block-param-pick` rename, would turn this into a test that
+    // asserts nothing while staying green. Pin the row's presence, then its cleanliness.
+    await expect(
+      boostCandidate,
+      "the Boost candidate row must be in the menu at all",
+    ).toHaveCount(1);
     await expect(
       boostCandidate.getByText(/shared with the base preset/),
     ).toHaveCount(0);
@@ -297,7 +305,19 @@ test.describe("Level — footswitch opted-in write path (raw invoke, command-lev
     await page.close();
   });
 
-  // COVERAGE rows 3, 17, 20's write-path half. 400/switch 2 (Boost) routes through
+  // COVERAGE rows 3, 17, 20's WRITE-PATH half — and row 3 ONLY that half. Stated plainly
+  // because the honest scope is narrower than it looks: 400's `scenario-loudness.json`
+  // entry declares `leveledParams` for `ACD_TMSpring63.mix` and NOTHING ELSE, so the
+  // offline model is FLAT in `ACD_Boost.gain` — `model_lufs` returns the same C at every
+  // probe of it. What that makes provable here is the plumbing: the solve terminates, a
+  // resolved `valueA`/`valueB` reaches the wire through the Assign path, the fake confirms
+  // by read-back, and the save persists. What it does NOT prove is that the solved gain
+  // TRACKS loudness — any target converges against a flat response, so the dry run's
+  // `predicted_lufs` is a constant this test then feeds back to itself. Row 3's
+  // solve-tracking half is online-only. Do not read a green here as "the block-knob solve
+  // is correct"; read it as "the block-knob WRITE lands and persists".
+  //
+  // 400/switch 2 (Boost) routes through
   // `FsLevelPlan::Assign` (`footswitch.rs`): `ACD_Boost.bypass = false` in base — it's
   // part of the base sound, so a bare block-value bake would change the ALWAYS-ON signal,
   // not just an engaged-only state. SimDevice implements `setFootswitchAssignment`(54) /

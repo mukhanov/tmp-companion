@@ -225,6 +225,20 @@ export function instrumentName(
  *  row after the tone-safe DEFAULT level param (the same one Set up recommends), and
  *  only falls further back to the switch's own toggled/adjusted block (its first
  *  function's `fender_id`) when there is no classifiable level param at all. */
+/** The fallback row name for an UNLABELED switch, given the candidate that will actually
+ *  be leveled — the block that candidate lives on.
+ *
+ *  Split out of [`footswitchName`] because the name is chosen TWICE at different moments:
+ *  once at list-build time (`chosenFrom`, which only knows the tone-safe DEFAULT candidate)
+ *  and again at run-start, if the user overrode that default in Set up. The second call is
+ *  not cosmetic — the string reaches `displayLabel`, which the backend writes as the
+ *  switch's on-device `customLabel` when an assign appends a function to an unlabeled
+ *  switch. Naming it after the default while leveling something else is a WIRE WRITE that
+ *  mislabels the player's pedalboard. */
+export function footswitchNameForCandidate(c: LevelParamCandidate): string {
+  return shortFallback(c.fender_id);
+}
+
 export function footswitchName(f: FootswitchInfo): string {
   const label = f.label.trim();
   if (label) return label;
@@ -235,7 +249,7 @@ export function footswitchName(f: FootswitchInfo): string {
     // instead of silently naming the row after `level_params[0]`.
     const idx = defaultParamIndex(f.level_params);
     const picked = idx >= 0 ? f.level_params[idx] : undefined;
-    if (picked) return shortFallback(picked.fender_id);
+    if (picked) return footswitchNameForCandidate(picked);
   }
   if (f.functions.length > 0) return shortFallback(f.functions[0].fender_id);
   return "Footswitch";
@@ -279,6 +293,16 @@ export interface SetupOption {
    *  picker). Present only on footswitch rows; the chosen one is baked into
    *  `footswitch` when the run starts. */
   levelParams?: LevelParamCandidate[];
+  /** Footswitch rows only: the switch carries NO `customLabel` on the device, so
+   *  `sceneName` above is a derived fallback naming the DEFAULT candidate's block — not
+   *  the player's own name for the switch.
+   *
+   *  Load-bearing at run-start, not display: `sceneName` becomes `displayLabel`, which the
+   *  backend writes as the switch's on-device `customLabel`. If the user picks a different
+   *  candidate in Set up, the row must be RE-NAMED after the block actually being leveled
+   *  (`SetupBody.start`), or the unit ends up labelled after a block the run never touched.
+   *  A LABELED switch is never renamed: that string is the player's, not ours. */
+  fsUnlabeled?: boolean;
   /** Scene rows only: this row's target-mode pick ("match" every scene solves to the
    *  named target — the default when absent; "offset" preserves the scene's authored
    *  loudness RELATIONSHIP). Undefined for Base/footswitch rows. */
@@ -378,6 +402,7 @@ export function chosenFrom(
             hasScenes: true,
             footswitch: target,
             levelParams: f.level_params,
+            fsUnlabeled: f.label.trim() === "",
           });
         }
       });

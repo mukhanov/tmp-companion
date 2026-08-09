@@ -358,11 +358,19 @@ mod fixture_gates {
                     if is_cab_merged_amp(&node.model) {
                         continue;
                     }
+                    // The cab must also be LIVE. A `bypassed: true` cabinet satisfies a
+                    // presence-only check while the player hears the amp bare — the exact
+                    // sound the standing cab rule exists to forbid — so bypass state is part
+                    // of the predicate, not decoration. (Base state only: this walks the base
+                    // graph, and a scene that bypasses a cab is a per-scene authoring choice,
+                    // not a fixture-wide violation.)
                     assert!(
-                        path[i + 1..].iter().any(|n| cabs.contains(&n.model)),
-                        "{name} ({idx}): amp {} ({}) is a BARE HEAD with no cabinet \
+                        path[i + 1..]
+                            .iter()
+                            .any(|n| cabs.contains(&n.model) && !n.bypassed),
+                        "{name} ({idx}): amp {} ({}) has no UN-BYPASSED cabinet \
                          downstream in its lane [{}] — every fixture amp must be a \
-                         combo, a cab-merged model, or a head + cab block",
+                         combo, a cab-merged model, or a head + a live cab block",
                         node.node_id,
                         node.model,
                         path.iter()
@@ -485,6 +493,22 @@ mod fixture_gates {
             1.0,
             "scene 2 'Ceiling' is the headroom lowers_only / scene-clamp row"
         );
+        // COVERAGE rows 6/8/9's real load-bearing fact — NOT "four distinct ceilings" (two of
+        // the sidecar Cs are equal on purpose). What every spec keys on is that scene 2 is the
+        // UNIQUE clamper: it alone sits at the knob's top with zero boost headroom, so it alone
+        // clamps at every shipped target, and the other three keep room to be re-levelled into
+        // (the redistribution fixture). Equalise another scene to 1.0 and the redistribution
+        // gate stops having a single rescuable row.
+        for s in [0usize, 1, 3] {
+            let ol = overlay(s, "ACD_JC120").expect("amp overlay")["outputLevel"]
+                .as_f64()
+                .expect("outputLevel is a float");
+            assert!(
+                ol < 1.0,
+                "scene {s} must keep boost headroom — scene 2 'Ceiling' is the ONLY \
+                 zero-headroom scene (got outputLevel {ol})"
+            );
+        }
         // The Boost: a picker-visible isolated handle in scenes 0-2, Scene-Edit
         // DISABLED (bypass-only ⇒ shared_with_base refusal) in scene 3.
         for s in 0..3 {
@@ -640,6 +664,18 @@ mod fixture_gates {
         assert!(
             p["outputMixerSettings"].is_object(),
             "a split-output preset keeps its outputMixerSettings"
+        );
+        // COVERAGE row 21's LOAD-BEARING fact, pinned explicitly rather than left to the
+        // `is_object()` shape check: OUT 2 is routed AWAY from USB 1/2, which is the only
+        // reason an isolated capture of the OUT-2 lane's footswitch (`ACD_KingOfTone`,
+        // declared to the offline model as `offbranchSwitchNode`) reads dead air and the
+        // leveller returns its routing clamp. Flip this to `true` and the off-branch gate
+        // (`e2e_server_tests.rs::level_defaults_base_clamps_and_the_split_lane_footswitch_is_offbranch`)
+        // stops testing anything, silently.
+        assert_eq!(
+            p["outputMixerSettings"]["USB12Input"]["out2"],
+            serde_json::json!(false),
+            "E2E Edge routes OUT 2 away from USB 1/2 — the off-branch routing-clamp case"
         );
         // THE ORACLE: filters 3 and 4 both ring at 2.6 kHz, +12 dB, Q 14. Doctor's
         // online `harsh`/`fizzy` diagnosis is measured against exactly these values.
@@ -1042,8 +1078,22 @@ mod fixture_gates {
                 .unwrap_or_else(|| panic!("sidecar slot {idx} has no fixture at that list index"));
 
             // (b) a sidecar `scenes` array's length matches the fixture's own scene count.
-            if let Some(sidecar_scenes) = entry.get("scenes").and_then(|v| v.as_array()) {
-                let fixture_scenes = p["scenes"].as_array().map_or(0, Vec::len);
+            //
+            // NON-VACUITY FLOOR: the length check only fires when the sidecar HAS a
+            // `scenes` array, so a slot that simply drops its scene C table would sail
+            // through — the fixture's scenes would then all model at the flat base C, a
+            // silently flat response of exactly the kind COVERAGE row 18's corrected cause
+            // was. So a fixture that carries scenes MUST have a sidecar array (the converse
+            // is not required: a scene-free fixture legitimately declares none).
+            let fixture_scenes = p["scenes"].as_array().map_or(0, Vec::len);
+            let sidecar_scenes = entry.get("scenes").and_then(|v| v.as_array());
+            assert!(
+                fixture_scenes == 0 || sidecar_scenes.is_some(),
+                "{name:?} ({idx}): the fixture carries {fixture_scenes} scenes but the \
+                 sidecar declares no `scenes` C array — every scene would model at the flat \
+                 base C (a silently flat response, not a loud failure)"
+            );
+            if let Some(sidecar_scenes) = sidecar_scenes {
                 assert_eq!(
                     sidecar_scenes.len(),
                     fixture_scenes,
@@ -1109,15 +1159,55 @@ mod fixture_gates {
                 );
             }
         }
+
+        // (e) NON-VACUITY FLOOR for `leveledParams`. Everything above only checks entries
+        // that EXIST — delete a slot's whole `leveledParams` array and every assertion here
+        // passes while the offline model silently reverts to the flat C law for that slot.
+        // That is not hypothetical: it is COVERAGE row 18's corrected cause verbatim (400
+        // declared none, `model_lufs` returned the same C at every probe, and the solve took
+        // its no-authority `flat_response` exit without ever probing the wet floor).
+        //
+        // The two slots whose SPECS depend on a knob-driven curve are pinned by name:
+        //   400 — `ACD_TMSpring63.mix` on the `wetMix` curve (row 18's wet-floor gates).
+        //   405 — the four drive pedals' own level knobs on `saturatedPedal` (row 16's BAKE
+        //         lane, `level-fs-preset24.spec.ts`'s whole premise).
+        // The other slots deliberately declare none (the flat law IS their model), so this
+        // is an explicit allowlist rather than a blanket "every slot must declare one".
+        for want in [400u32, 405] {
+            let declared = slots
+                .get(&want.to_string())
+                .and_then(|e| e.get("leveledParams"))
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
+            assert!(
+                declared > 0,
+                "sidecar slot {want} must declare at least one `leveledParams` entry — \
+                 without it `sim_device::model_lufs` returns the same C at every probe and \
+                 that slot's knob-driven specs pass against a flat response"
+            );
+        }
     }
 
     /// Every row `COVERAGE.md`'s coverage matrix marks as covered by a Playwright spec
     /// (its Spec cell names a `.spec.ts` file, parsed loosely — a drift alarm, not a
-    /// parser) must be CITED by at least one `// COVERAGE row(s) N[, M...]` comment in
-    /// some `e2e/specs/*.spec.ts` file. Without this, the matrix's own claim ("every
-    /// structural fact is pinned by a test") is unverifiable prose — a row and the spec
-    /// that's supposed to prove it can drift apart with nothing failing.
-    fn coverage_matrix_rows_citing_a_spec_ts(md: &str) -> std::collections::HashSet<u32> {
+    /// parser) must be CITED by a `// COVERAGE row(s) N[, M...]` comment in **one of the
+    /// spec files that row's OWN Spec cell names**. Without this, the matrix's own claim
+    /// ("every structural fact is pinned by a test") is unverifiable prose — a row and the
+    /// spec that's supposed to prove it can drift apart with nothing failing.
+    ///
+    /// PER-ROW, NOT UNIONED. The gate used to pool every citation in `e2e/specs/` into one
+    /// set, so row N passed as long as ANY spec file mentioned N — a row whose Spec cell
+    /// named `a.spec.ts` while only `b.spec.ts` cited it read green, which is precisely the
+    /// drift the gate exists to catch (row 16 was in that state: cell → `level-fs-preset24
+    /// .spec.ts`, citation → `level-setup.spec.ts`).
+    ///
+    /// Returns row → the spec filenames its cell names. A cell may name SEVERAL (rows 18
+    /// and 37 legitimately do), and one may sit inside a parenthetical sentence rather
+    /// than leading the cell (row 30), so filenames are pulled by pattern from anywhere in
+    /// the cell and the requirement is "at least one of them cites the row".
+    fn coverage_matrix_rows_citing_a_spec_ts(
+        md: &str,
+    ) -> std::collections::HashMap<u32, Vec<String>> {
         md.lines()
             .filter_map(|line| {
                 let cells: Vec<&str> = line.split('|').map(str::trim).collect();
@@ -1125,10 +1215,33 @@ mod fixture_gates {
                     return None;
                 }
                 let row: u32 = cells[1].parse().ok()?;
-                let spec_cell = cells[cells.len() - 2];
-                spec_cell.contains(".spec.ts").then_some(row)
+                let files = spec_filenames_in(cells[cells.len() - 2]);
+                (!files.is_empty()).then_some((row, files))
             })
             .collect()
+    }
+
+    /// Every `<name>.spec.ts` filename mentioned anywhere in one Spec cell. A filename is
+    /// the longest run of filename-ish characters ending at a `.spec.ts` occurrence —
+    /// tolerant of the backticks, parentheses and prose the cells actually carry.
+    fn spec_filenames_in(cell: &str) -> Vec<String> {
+        const SUFFIX: &str = ".spec.ts";
+        let mut out: Vec<String> = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = cell.get(from..).and_then(|s| s.find(SUFFIX)) {
+            let end = from + rel + SUFFIX.len();
+            let stem_end = from + rel;
+            let start = cell[..stem_end]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+                .map_or(0, |i| i + 1);
+            let name = &cell[start..end];
+            // A bare ".spec.ts" with no stem names no file — skip rather than record it.
+            if name.len() > SUFFIX.len() && !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
+            }
+            from = end;
+        }
+        out
     }
 
     /// Row numbers cited by `// COVERAGE row N` / `// COVERAGE rows N, M, ...` comments in
@@ -1175,38 +1288,66 @@ mod fixture_gates {
 
         let specs_dir = std::path::Path::new("../e2e/specs");
         assert!(specs_dir.is_dir(), "{} is missing", specs_dir.display());
-        let mut cited: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        let mut spec_files_seen = 0usize;
+        // filename → the rows THAT file cites. Kept per-file (not pooled) so each row can
+        // be checked against its own Spec cell's files.
+        let mut cited_by_file: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        let mut all_cited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for entry in std::fs::read_dir(specs_dir).expect("read e2e/specs") {
             let path = entry.expect("dir entry").path();
-            if !path.to_string_lossy().ends_with(".spec.ts") {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".spec.ts") {
                 continue;
             }
-            spec_files_seen += 1;
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            cited.extend(coverage_row_citations(&content));
+            let rows = coverage_row_citations(&content);
+            all_cited.extend(rows.iter().copied());
+            cited_by_file.insert(name.to_string(), rows);
         }
+        let spec_files_seen = cited_by_file.len();
         assert!(
             spec_files_seen > 10,
             "expected many *.spec.ts files under e2e/specs ({spec_files_seen} found) — a \
              directory layout change would otherwise make this gate pass vacuously"
         );
         assert!(
-            cited.len() >= 8,
+            all_cited.len() >= 8,
             "expected a healthy number of distinct cited rows ({} found) across every \
              spec file — a comment-format drift would otherwise pass this gate vacuously",
-            cited.len()
+            all_cited.len()
         );
 
-        let mut missing: Vec<u32> = covered_rows.difference(&cited).copied().collect();
-        missing.sort_unstable();
+        // Each row must be cited BY ONE OF THE FILES ITS OWN CELL NAMES. A cell naming a
+        // file that doesn't exist is its own failure (a rename that left the matrix behind).
+        let mut missing: Vec<String> = Vec::new();
+        let mut rows: Vec<(&u32, &Vec<String>)> = covered_rows.iter().collect();
+        rows.sort_by_key(|(r, _)| **r);
+        for (row, files) in rows {
+            for f in files {
+                assert!(
+                    cited_by_file.contains_key(f),
+                    "COVERAGE.md row {row}'s Spec cell names {f}, which does not exist \
+                     under e2e/specs — fix the cell or the filename"
+                );
+            }
+            if !files
+                .iter()
+                .any(|f| cited_by_file.get(f).is_some_and(|c| c.contains(row)))
+            {
+                missing.push(format!("row {row} → {}", files.join(" | ")));
+            }
+        }
         assert!(
             missing.is_empty(),
-            "COVERAGE.md marks row(s) {missing:?} as covered by a Playwright spec, but \
-             no e2e/specs/*.spec.ts file cites it with a `// COVERAGE row(s) N` comment \
-             — either add the citation next to the covering test, or fix COVERAGE.md's \
-             Spec cell"
+            "COVERAGE.md marks these rows as covered by a named Playwright spec, but NONE \
+             of the files that row's own Spec cell names carries a `// COVERAGE row(s) N` \
+             comment for it: {missing:?} — either add the citation inside the named spec, \
+             or fix COVERAGE.md's Spec cell to name the file that actually covers it. (A \
+             citation in some OTHER spec file no longer counts: that is the drift this \
+             gate exists to catch.)"
         );
     }
 }

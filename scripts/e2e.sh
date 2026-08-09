@@ -108,6 +108,32 @@ VALIDATE_WAV_DIR="$LOG_DIR/level-validate-wavs"
 # server already spent writing it — generous on purpose, but a POLICY rather than an
 # accident: a runaway spec must announce that rows were dropped, not silently truncate.
 VALIDATE_MAX_ROWS="${TMP_E2E_VALIDATE_MAX_ROWS:-40}"
+# Row-count FLOOR for the strict lane. `level-strict.spec.ts` re-measures exactly nine
+# sounds from the saved state — 1 base + 4 scenes (`for scene of [0,1,2,3]`) + 4
+# footswitches (`SWITCH_JOBS`) — and each one is supposed to append a row here. Anything
+# short means re-measures died before their capture, which emits NO row at all: the judge
+# can only grade what it is handed, so a truncated log used to sail through as "fewer rows,
+# all green". Keep in step with that spec if its sound set ever changes.
+VALIDATE_STRICT_MIN_ROWS=9
+# The validation tolerance the JUDGE will use, PINNED for this lane. `level-validate.sh`
+# reads TMP_E2E_LEVEL_TOL_LU as its default tolerance, so an ambient export of, say, 50
+# would make every row pass by arithmetic — a rubber stamp wearing a gate's clothes. The
+# ceiling is generous (the documented default is 1.0 LU; the solver's own band is 0.3 plus
+# recapture noise), so anything above it is a mistake, not a preference. CLAMP rather than
+# refuse: aborting a 45-minute attended online run over an env var is the worse failure.
+VALIDATE_TOL_CEILING=2.0
+VALIDATE_TOL="${TMP_E2E_LEVEL_TOL_LU:-1.0}"
+if ! awk -v t="$VALIDATE_TOL" 'BEGIN { exit !(t + 0 == t && t + 0 > 0) }' 2>/dev/null; then
+  printf '\033[31m✗ TMP_E2E_LEVEL_TOL_LU=%s is not a positive number — using 1.0\033[0m\n' \
+    "$VALIDATE_TOL" >&2
+  VALIDATE_TOL=1.0
+fi
+if awk -v t="$VALIDATE_TOL" -v c="$VALIDATE_TOL_CEILING" 'BEGIN { exit !(t + 0 > c + 0) }'; then
+  printf '\033[31m✗ TMP_E2E_LEVEL_TOL_LU=%s exceeds the %s LU ceiling this lane allows — CLAMPING to %s. A tolerance that wide cannot fail a real target miss.\033[0m\n' \
+    "$VALIDATE_TOL" "$VALIDATE_TOL_CEILING" "$VALIDATE_TOL_CEILING" >&2
+  VALIDATE_TOL="$VALIDATE_TOL_CEILING"
+fi
+export TMP_E2E_LEVEL_TOL_LU="$VALIDATE_TOL"
 if command -v ffmpeg >/dev/null 2>&1; then HAVE_FFMPEG=1; else HAVE_FFMPEG=0; fi
 mkdir -p "$LOG_DIR"
 
@@ -201,11 +227,31 @@ recover_device() {
   # the next run to re-import all 5 — ~2 min of device churn per run). Set
   # TMP_E2E_CLEAR_SCENARIO=1 for the on-demand net-zero clean.
   if [ "${TMP_E2E_CLEAR_SCENARIO:-}" = "1" ]; then
-    post '{"cmd":"e2e_clear_preset","args":{"slot":400,"expectName":"E2E Reference"}}'
-    post '{"cmd":"e2e_clear_preset","args":{"slot":401,"expectName":"E2E Target 1"}}'
-    post '{"cmd":"e2e_clear_preset","args":{"slot":402,"expectName":"E2E Target 2"}}'
-    post '{"cmd":"e2e_clear_preset","args":{"slot":403,"expectName":"E2E Realistic"}}'
-    post '{"cmd":"e2e_clear_preset","args":{"slot":404,"expectName":"E2E Hiwatt 3S"}}'
+    # `e2e_clear_preset` is NAME-GUARDED and fail-closed (danger.md: a destructive op keyed
+    # on a slot mapping must be confirmed against the slot's own contents). A stale name
+    # therefore does not clobber anything — it just makes the clear a silent no-op, which
+    # is worse than loud: the "net-zero" run leaves the fixtures resident. That is exactly
+    # what happened here (this list still said `E2E Reference`/`Target 1`/`Target 2`/
+    # `Realistic` after the P4-A rename, and never mentioned 405 at all).
+    #
+    # SINGLE SOURCE: derive both the slot and the name from the fixture file itself, so a
+    # rename or a seventh fixture can never leave this list behind again. The parse is a
+    # line-oriented grep over the two adjacent keys `scenario-presets.json` actually emits
+    # (`"listIndex": N,` then `"name": "…",`) — jq is not a dependency of this repo.
+    scenario_pairs="$(awk '
+      /"listIndex"/ { if (match($0, /[0-9]+/)) idx = substr($0, RSTART, RLENGTH); next }
+      /"name"/ { if (idx != "" && match($0, /"name"[ \t]*:[ \t]*"[^"]*"/)) {
+          s = substr($0, RSTART, RLENGTH); sub(/^"name"[ \t]*:[ \t]*"/, "", s); sub(/"$/, "", s)
+          print idx "\t" s; idx = "" } }
+    ' "$REPO/e2e/fixtures/scenario-presets.json")"
+    if [ -z "$scenario_pairs" ]; then
+      err "TMP_E2E_CLEAR_SCENARIO=1 but no slot/name pairs parsed out of $REPO/e2e/fixtures/scenario-presets.json — refusing to guess; nothing cleared"
+    else
+      printf '%s\n' "$scenario_pairs" | while IFS="$(printf '\t')" read -r cslot cname; do
+        [ -n "$cslot" ] || continue
+        post "{\"cmd\":\"e2e_clear_preset\",\"args\":{\"slot\":$cslot,\"expectName\":\"$cname\"}}"
+      done
+    fi
   fi
   # Sweep stray scenario imports an aborted seed stranded elsewhere in the bank
   # (imports land at the first EMPTY slot anywhere; guarded, fail-closed). Long
@@ -486,31 +532,54 @@ if [ "$fail" -eq 0 ]; then
     log "#  Nothing was independently measured. NOT a pass; install  #"
     log "#  ffmpeg to turn this lane into a real gate.               #"
     log "############################################################"
-  elif [ ! -s "$VALIDATE_LOG" ]; then
-    log "external validation — no rows emitted this run (nothing was strict-re-measured); skipping"
   else
-    rows="$(grep -c . "$VALIDATE_LOG" 2>/dev/null || echo 0)"
-    VALIDATE_FEED="$VALIDATE_LOG"
-    if [ "$rows" -gt "$VALIDATE_MAX_ROWS" ]; then
-      VALIDATE_FEED="$LOG_DIR/level-validate-expectations.capped.jsonl"
-      head -n "$VALIDATE_MAX_ROWS" "$VALIDATE_LOG" > "$VALIDATE_FEED"
-      err "external validation CAPPED at $VALIDATE_MAX_ROWS rows — $((rows - VALIDATE_MAX_ROWS)) rows DROPPED (raise TMP_E2E_VALIDATE_MAX_ROWS to check them all)"
+    # NB a bare `[ -s f ] && rows=…` would ABORT under `set -e` on an empty log (the
+    # compound list's non-zero status is not in a condition context) — hence the `if`.
+    rows=0
+    if [ -s "$VALIDATE_LOG" ]; then
+      rows="$(grep -c . "$VALIDATE_LOG" 2>/dev/null || echo 0)"
     fi
-    log "external validation — judging $rows recorded row(s) with ffmpeg ebur128…"
-    set +e
-    bash "$REPO/scripts/level-validate.sh" --expectations "$VALIDATE_FEED"
-    vrc=$?
-    set -e
-    # Branch all three codes explicitly: a mid-run SKIP (3) must never be reported as a
-    # target miss, and must never quietly pass either.
-    case "$vrc" in
-      0) log "external validation PASSED" ;;
-      3) log "external validation SKIPPED (exit 3 — ffmpeg vanished mid-run; nothing was checked)" ;;
-      *)
-        err "external validation FAILED (exit $vrc) — a leveled sound missed its target under an independent ffmpeg read"
-        fail=1
-        ;;
-    esac
+    # ROW FLOOR — the false-green this branch used to be. "No rows emitted" was logged and
+    # passed over unconditionally, which is only honest when nothing in the run was
+    # SUPPOSED to emit any. When level-strict ran, nine rows were promised (see
+    # VALIDATE_STRICT_MIN_ROWS at the top of this file); zero — or four — means captures
+    # died before they could be recorded and the judge silently graded a subset. The floor
+    # only applies when the strict spec actually ran, so `scripts/e2e.sh online songs`
+    # keeps its legitimate skip, as does an ffmpeg-less box (handled above).
+    ran_strict=0
+    for s in "${SPECS[@]:-}"; do
+      [ "$s" = "level-strict" ] && ran_strict=1
+    done
+    if [ "$ran_strict" -eq 1 ] && [ "$rows" -lt "$VALIDATE_STRICT_MIN_ROWS" ]; then
+      err "external validation ROW FLOOR: level-strict ran but only $rows expectation row(s) were emitted, expected at least $VALIDATE_STRICT_MIN_ROWS (1 base + 4 scenes + 4 footswitches)"
+      err "  → $((VALIDATE_STRICT_MIN_ROWS - rows)) sound(s) were never independently measured; a re-measure died before its capture. See $SERVER_LOG"
+      fail=1
+    fi
+    if [ "$rows" -eq 0 ]; then
+      log "external validation — no rows emitted this run (nothing was strict-re-measured); skipping the ffmpeg pass"
+    else
+      VALIDATE_FEED="$VALIDATE_LOG"
+      if [ "$rows" -gt "$VALIDATE_MAX_ROWS" ]; then
+        VALIDATE_FEED="$LOG_DIR/level-validate-expectations.capped.jsonl"
+        head -n "$VALIDATE_MAX_ROWS" "$VALIDATE_LOG" > "$VALIDATE_FEED"
+        err "external validation CAPPED at $VALIDATE_MAX_ROWS rows — $((rows - VALIDATE_MAX_ROWS)) rows DROPPED (raise TMP_E2E_VALIDATE_MAX_ROWS to check them all)"
+      fi
+      log "external validation — judging $rows recorded row(s) with ffmpeg ebur128 (tolerance ${TMP_E2E_LEVEL_TOL_LU} LU)…"
+      set +e
+      bash "$REPO/scripts/level-validate.sh" --expectations "$VALIDATE_FEED"
+      vrc=$?
+      set -e
+      # Branch all three codes explicitly: a mid-run SKIP (3) must never be reported as a
+      # target miss, and must never quietly pass either.
+      case "$vrc" in
+        0) log "external validation PASSED" ;;
+        3) log "external validation SKIPPED (exit 3 — ffmpeg vanished mid-run; nothing was checked)" ;;
+        *)
+          err "external validation FAILED (exit $vrc) — a leveled sound missed its target under an independent ffmpeg read"
+          fail=1
+          ;;
+      esac
+    fi
   fi
 else
   err "one or more online specs failed"

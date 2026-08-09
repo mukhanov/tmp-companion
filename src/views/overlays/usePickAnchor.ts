@@ -30,6 +30,21 @@ export interface UsePickAnchorOptions {
   /** Fired once the menu has opened (SceneLevelPick's lazy per-preset candidate
    *  fetch — idempotent, safe to call on every open). */
   onOpen?: () => void;
+  /** A value that changes whenever the menu's CONTENT changes size — included in the
+   *  measure/place effect's deps.
+   *
+   *  Why it exists: the effect measures `menuRef.current.offsetHeight` and depends only
+   *  on `[open, anchor]`, both of which are fixed at `openMenu` time. A menu whose body
+   *  arrives AFTER the open — `SceneLevelPick` opens on "Loading controls…" and fires a
+   *  device read (`onOpen`) that lands a moment later with N candidate rows — therefore
+   *  keeps the placement computed for the one-line skeleton: the grown menu never
+   *  re-clamps and never flips above the trigger, so it renders off the bottom of the
+   *  card with its rows unreachable.
+   *
+   *  Pass something derived from what is rendered (a fetch status plus a row count is
+   *  enough; the height need not be known). Omit it for a menu whose content is fixed at
+   *  open time (`Pick`, `FsParamPick`). */
+  contentKey?: string | number;
 }
 
 export interface UsePickAnchorResult {
@@ -52,7 +67,7 @@ export interface UsePickAnchorResult {
  *  mounted inside a card, so that branch is unreached for them in practice. */
 export function usePickAnchor(
   cardRef: React.RefObject<HTMLDivElement | null> | null | undefined,
-  { guard, onOpen }: UsePickAnchorOptions = {},
+  { guard, onOpen, contentKey }: UsePickAnchorOptions = {},
 ): UsePickAnchorResult {
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<PickAnchor | null>(null);
@@ -62,7 +77,10 @@ export function usePickAnchor(
   const menuRef = useRef<HTMLDivElement>(null);
 
   // Two-pass: render hidden to measure, then place (clamped horizontally, flipped
-  // above when it would overflow the card bottom).
+  // above when it would overflow the card bottom). `contentKey` is in the deps so a menu
+  // that GROWS after opening (a lazy fetch landing) is re-measured and re-placed — see
+  // its doc above. Converges: the effect only ever writes `pos`, which changes no
+  // measured dimension, so a re-run with an unchanged key re-derives the same numbers.
   useLayoutEffect(() => {
     if (!open || !anchor || !menuRef.current) return;
     const mw = menuRef.current.offsetWidth;
@@ -74,7 +92,7 @@ export function usePickAnchor(
     let top = anchor.below;
     if (top + mh > anchor.cardH - 8) top = Math.max(8, anchor.above - mh - 4);
     setPos({ left, top });
-  }, [open, anchor]);
+  }, [open, anchor, contentKey]);
 
   const openMenu = (e: React.MouseEvent) => {
     if (guard && !guard()) return;

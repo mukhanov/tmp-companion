@@ -21,9 +21,16 @@
 #
 # PER-ROW VERDICTS
 #   FAIL  — the independent read missed `target_lufs` by more than the tolerance.
-#   FAIL  — `engaged` is not "engaged" ⇒ a FAILED INJECT, not a level miss. `danger.md`:
-#           a silent/failed re-amp inject reads as the device's stationary output floor,
-#           which ebur128 happily measures as a plausible-looking wrong number.
+#   FAIL  — `engaged` is "silent" or "floor" ⇒ a FAILED INJECT, not a level miss.
+#           `danger.md`: a silent/failed re-amp inject reads as the device's stationary
+#           output floor, which ebur128 happily measures as a plausible-looking wrong
+#           number.
+#   WARN  — `engaged` is "floor_suspect": the capture is FLAT but LOUD. That is the known
+#           false positive of `leveller::is_engaged`'s spread>0.5 arm on a compressed
+#           chain (CLAUDE.md), not a failed inject, and failing it hard would sink a
+#           correct 45-minute online run. The row is still MEASURED and still PASS/FAILs
+#           on ffmpeg's own number — only the engage proof is downgraded to advisory, and
+#           the verdict column carries `[WARN engage floor_suspect]`.
 #   FAIL  — `wav` is null / the file is missing (named distinctly from a target miss).
 #   FAIL  — the WAV is MONO. `dump_processed_capture` writes mono only when the capture
 #           carried no processed PAIR, refusing to fake dual-mono; the leveler solved
@@ -140,8 +147,18 @@ row_skip() { # label target tol verdict
 # `probe_log` (optional, single mode) is the same proof read out of a probe headline.
 measure_row() { # label wav target tol [engaged] [probe_log]
   local label="$1" wav="$2" target="$3" tol="$4" engaged="${5:-}" probe_log="${6:-}"
+  local warn_note=""
   ROWS_SEEN=$((ROWS_SEEN + 1))
-  if [ -n "$engaged" ] && [ "$engaged" != "engaged" ]; then
+  # `floor_suspect` is a WARN, not a FAIL: the emitter stamps it when the capture is flat
+  # (is_engaged's spread>0.5 arm) but LOUD — the documented false positive of that
+  # criterion on a compressed chain, not a failed inject (`validate_log.rs`'s
+  # `engaged_verdict`). ffmpeg stays the authority: the row still gets measured and still
+  # PASSes/FAILs on its own number, with the doubt carried into the verdict string.
+  # `silent` and a genuine near-silence `floor` stay hard FAILs.
+  if [ "$engaged" = "floor_suspect" ]; then
+    warn "$label: engage verdict 'floor_suspect' — flat but loud (is_engaged's spread arm, not a failed inject); grading it on the ffmpeg number anyway"
+    warn_note=" [WARN engage floor_suspect]"
+  elif [ -n "$engaged" ] && [ "$engaged" != "engaged" ]; then
     row_fail "$label" "$target" "$tol" \
       "FAIL (engage verdict '$engaged' — failed inject, not a level miss)"
     return
@@ -181,7 +198,7 @@ measure_row() { # label wav target tol [engaged] [probe_log]
   local delta verdict
   delta="$(awk -v a="$measured" -v b="$target" 'BEGIN { d = a - b; if (d < 0) d = -d; printf "%.3f", d }')"
   verdict="$(awk -v d="$delta" -v tol="$tol" 'BEGIN { print (d <= tol) ? "PASS" : "FAIL" }')"
-  row_out "$label" "$measured" "$target" "$tol" "$delta" "$verdict"
+  row_out "$label" "$measured" "$target" "$tol" "$delta" "$verdict$warn_note"
   if [ "$verdict" = "FAIL" ]; then
     ROW_FAILED=1
   fi

@@ -228,7 +228,15 @@ pub fn probe_measure_current_lufs(
     // argmax (broadband RMS across ALL channels incl. the ch2 dry DI tap) stays
     // observable per measurement even though it no longer drives the headline.
     // No floor-guard retry (diagnostic seam).
-    let cap = leveller::capture_asis_full(slot, scene_slot, &stim)?;
+    let capture = leveller::capture_asis_full(slot, scene_slot, &stim);
+    // Run-end backstop, success or failure (see `reamp_off_guaranteed`: the device DROPS
+    // an in-session OFF sent on a session that has idled >~1 s, and this ~7 s capture
+    // always has). Fired HERE, immediately after the one engage, rather than at the tail:
+    // every path below this line — the `?`, the `--target`-without-slot refusal, a
+    // `measure_processed` failure — is an early return that would otherwise leave the unit
+    // input-muted. Same shape as `probe --levelpreset` below: bind, back off, then `?`.
+    leveller::reamp_off_guaranteed("probe --measure-current");
+    let cap = capture?;
     let (win, _) = cap.loudest_channel();
     let mut per_channel = String::new();
     for c in 0..cap.channels {

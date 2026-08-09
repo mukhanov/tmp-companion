@@ -604,8 +604,17 @@ pub fn probe_measure_footswitch(
         ),
         _ => None,
     };
-    let loud =
-        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim, row.as_ref())?;
+    let result =
+        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim, row.as_ref());
+    // Run-end backstop, success or failure (see `reamp_off_guaranteed`: the device DROPS
+    // an in-session OFF sent on a session that has idled >~1 s, and this lane's capture
+    // idles ~7 s — so `engage_capture_disengage`'s in-session disengage cannot be trusted
+    // as the last word). A standalone `probe --measure-footswitch` would otherwise be able
+    // to leave the unit input-muted. Bound BEFORE the `?` for exactly that reason: an Err
+    // path is the one that most needs the OFF. Same shape as `probe --levelpreset`
+    // (`probe_api/level.rs`) — no added gap, so the two probe arms behave identically.
+    leveller::reamp_off_guaranteed("probe --measure-footswitch");
+    let loud = result?;
     Ok(format!(
         "slot={slot} switch={switch} topology={topology_id} lev={lev:?} \
          integrated_lufs={:.3} short_term_max_lufs={:.3} spread_lu={:.3} isolation_blocks={}\n",

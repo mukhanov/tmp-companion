@@ -362,6 +362,21 @@ EXPECTED_LABELS=""
 expect_row() { EXPECTED_LABELS="$EXPECTED_LABELS$1
 "; }
 
+# The label the EMITTER will write for wire scene slot $1 on $SLOT. Not a formatting
+# nicety: `validate_log::ValidationRow` branches on `BASE_SCENE_SLOT` and writes
+# `base:slotN` for it, `scene:slotN:sceneS` for everything else (`probe --measure-scene`
+# hands the slot straight through). The completeness ledger below greps for these strings
+# verbatim, so an operator's `--scene-verify 8=T` predicting `scene:…:scene8` produced a
+# guaranteed MISSING row — plus a second measure of the base sound writing over the base
+# row's own WAV. One function, so the prediction cannot drift from the emitter again.
+row_label_for_scene() {
+  if [ "$1" -ge "$BASE_SCENE_SLOT" ]; then
+    printf 'base:slot%s' "$SLOT"
+  else
+    printf 'scene:slot%s:scene%s' "$SLOT" "$1"
+  fi
+}
+
 measure_scene_row() {
   local label="$1" scene="$2" target="$3"
   local mlog="$OUT_DIR/measure-scene-$scene.log"
@@ -387,11 +402,24 @@ measure_fs_row() {
 }
 
 if [ "$FAILED" -eq 0 ]; then
-  measure_scene_row "base:slot$SLOT" "$BASE_SCENE_SLOT" "$TARGET"
+  measure_scene_row "$(row_label_for_scene "$BASE_SCENE_SLOT")" "$BASE_SCENE_SLOT" "$TARGET"
   for sv in "${SCENE_VERIFY[@]:-}"; do
     [ -n "$sv" ] || continue
     sidx="${sv%%=*}"; starget="${sv#*=}"
-    measure_scene_row "scene:slot${SLOT}:scene${sidx}" "$sidx" "$starget"
+    case "$sidx" in
+      ''|*[!0-9]*)
+        err "--scene-verify '$sv' — the scene index must be a non-negative integer"
+        exit 2 ;;
+    esac
+    # `--scene-verify 8=T` names the BASE sound, which the base row above already measured.
+    # Re-measuring it would duplicate the label (the ledger greps by identity, so a
+    # duplicate masks nothing, but the WAV would be re-dumped) — and worse, it costs a
+    # whole extra device capture for a sound already covered. Say so and move on.
+    if [ "$sidx" -ge "$BASE_SCENE_SLOT" ]; then
+      log "[6] --scene-verify $sidx names the BASE sound (BASE_SCENE_SLOT=$BASE_SCENE_SLOT), already re-measured above — skipping the duplicate"
+      continue
+    fi
+    measure_scene_row "$(row_label_for_scene "$sidx")" "$sidx" "$starget"
   done
   for fs in "${FOOTSWITCHES[@]:-}"; do
     [ -n "$fs" ] || continue

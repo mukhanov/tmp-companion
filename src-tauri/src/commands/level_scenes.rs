@@ -510,7 +510,13 @@ fn outcome_to_level_result(
         // IDENTITY, straight off the outcome — never the row's position. The caller
         // FILTERS failed outcomes out of the vec it returns, so a positional read
         // mislabels every row after a mid-batch failure (see `LevelResult::scene_slot`).
-        scene_slot: Some(o.scene_slot),
+        //
+        // BASE MAPS TO `None`, at the wire. A batch carries the whole preset's sounds, base
+        // included, and base rides the runner as the `BASE_SCENE_SLOT` (8) SENTINEL — which
+        // is not a `scenes[]` index at all. Forwarding it verbatim contradicted the field's
+        // own contract ("None on every base row"), the TS mirror, and `validate_log`'s
+        // base/scene labelling, and would have let a consumer look up `scenes[8]`.
+        scene_slot: (o.scene_slot != session::BASE_SCENE_SLOT).then_some(o.scene_slot),
         ref_level: o.final_level.unwrap_or(0.0),
         measured_lufs: lufs,
         constant_c: f64::NAN,

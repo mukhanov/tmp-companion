@@ -131,7 +131,9 @@ fn table() -> &'static RawTable {
             .expect(
                 "param-class.json is a checked-in fixture; include_str! embeds it at compile \
                  time but this parse is lazy — a malformed table panics at RUNTIME on first \
-                 classify() call, and it's the Rust and TS test suites that catch it",
+                 classify() call, and it's the Rust and TS test suites that catch it (this \
+                 module's own tests, plus src/__tests__/param-class-table.test.ts, which \
+                 parses the same file and pins its class spellings against the TS union)",
             );
         // A dB param has NO universal range (`ACD_Boost.gain` is [0,12], `makeupgaindb`
         // [0,24]) — a missing `range` would otherwise fall back to a degenerate (0,0),

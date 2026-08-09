@@ -14,7 +14,10 @@ import {
   reampOff,
 } from "../fixtures/scenario";
 
-// COVERAGE row 36 — lazy-save (stale-load) incident.
+// COVERAGE rows 36, 16 — the lazy-save (stale-load) incident, and the FS level opt-in
+// BAKE lane it runs on: 405's four drive switches each declare the pedal's own
+// `level`/`volume` in `scenario-loudness.json`'s `leveledParams`, so `saturated_pedal_lufs`
+// (not the flat C law) drives every solve this file asserts.
 // BUG→GATE (2026-08-02 HW incident): `saveCurrentPreset` commits LAZILY (T+45-100s on the
 // real unit) — a same-slot `loadPreset` inside that window materializes the PRE-save preset.
 // The incident: base saved presetLevel 0.4377, the footswitch batch's own load 2s later
