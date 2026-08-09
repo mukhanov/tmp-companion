@@ -17,15 +17,18 @@ export interface Preset {
 
 // Role-based names (not slot numbers): the device stores these at userSlot = listIndex + 1
 // (401/402/403/404/405/406), so a slot-numbered name would read off-by-one in the backup view.
-// The Reference is the Copy source; Target 1/2 are the edited presets; Realistic (gtrParallel1,
-// scenes + an off-branch footswitch) is the physics-spec fixture (level-defaults.spec.ts);
-// Preset24 (4 drive pedals into a saturated amp, no scenes) is the stale-load-incident fixture
-// (level-fs-preset24.spec.ts) — see e2e/fixtures/scenario-loudness.json's "405" entry.
+// WHICH USE CASE EACH FIXTURE CARRIES: e2e/fixtures/COVERAGE.md (the matrix), pinned by
+// `fixture_gates` in src-tauri/src/lib.rs. In brief — Rig: scene overlays, footswitch classes
+// and the two Doctor damage signatures; Pedalboard: scene-free, the Copy source, EXP + link
+// groups + a second-bank switch; Edge: gtrSplit, 8 scenes, the baked 2.6 kHz EQ-ring Doctor
+// oracle and the off-USB lane; Parallel: both lane amps live (joint-k / rebalance);
+// Hiwatt 3S: a VERBATIM device export (the scene-conformance oracle — do not edit);
+// Preset24: the stale-load / saturated-pedal footswitch fixture (level-fs-preset24.spec.ts).
 export const SCENARIO: Preset[] = [
-  { slot: 400, name: "E2E Reference" },
-  { slot: 401, name: "E2E Target 1" },
-  { slot: 402, name: "E2E Target 2" },
-  { slot: 403, name: "E2E Realistic" },
+  { slot: 400, name: "E2E Rig" },
+  { slot: 401, name: "E2E Pedalboard" },
+  { slot: 402, name: "E2E Edge" },
+  { slot: 403, name: "E2E Parallel" },
   { slot: 404, name: "E2E Hiwatt 3S" },
   { slot: 405, name: "E2E Preset24" },
 ];
@@ -60,7 +63,7 @@ export async function listPresets(page: Page): Promise<Preset[]> {
  *  fixture + snapshot, so a name check suffices (SimDevice state is disposable).
  *  ONLINE: always route through the ownership-verified seed — it verifies every
  *  occupied target by fixture CONTENT MARKER (not name; a user preset coincidentally
- *  named "E2E Target 1" fails the seed loudly instead of being blessed and later
+ *  named "E2E Pedalboard" fails the seed loudly instead of being blessed and later
  *  saved-over / cleared), imports only what's missing, and fast-no-ops when the
  *  server's verified-seed flag is armed (the runner's `e2e_mark_seeded` POST after its
  *  fresh-process seed, or a prior verified call this run — cleared by a STRUCTURAL
@@ -87,6 +90,53 @@ export async function ensureScenario(page: Page): Promise<void> {
   // The seed sweeps strays + imports over minutes, so it gets a long request
   // timeout (ordinary commands keep the default).
   await invoke(page, "e2e_seed_scenario", {}, 240_000);
+}
+
+/** Open the Level tab on a fresh page and wait for the connected header. Dismisses the
+ *  one-shot startup backup disclaimer when present (localStorage-gated — only the first
+ *  load). Shared by every spec that opens Level cold (was a byte-identical local copy in
+ *  level-defaults.spec.ts and level-setup.spec.ts). */
+export async function openLevel(page: Page): Promise<void> {
+  await page.goto("/");
+  const disclaimer = page.getByRole("button", { name: /backed up/i });
+  if (await disclaimer.isVisible().catch(() => false)) await disclaimer.click();
+  await expect(page.getByText(/connected · \d+\.\d+/)).toBeVisible({
+    timeout: 20_000,
+  });
+}
+
+/** Select ONLY a preset's Base row (never its scenes/footswitches) — expand the caret, then
+ *  tick the "Base Preset" child row alone. Every scenario fixture now carries children, so the
+ *  top-level whole-preset checkbox is no longer "Base only" for any of them — this helper is
+ *  what keeps a base-clamp test isolated to exactly one selected row (one
+ *  `data-pick="target:NAME"]` element, no strict-mode collision). */
+export async function selectBaseOnly(page: Page, name: string): Promise<void> {
+  const filter = page.getByPlaceholder(/Filter by name or slot/i);
+  await filter.fill(name);
+  await page
+    .getByTitle(/Show Base/)
+    .first()
+    .click();
+  await page.getByText("Base Preset", { exact: true }).click();
+  await filter.fill("");
+}
+
+/** Pick a per-preset target by its option id ("Rhythm"/"Crunch"/"Lead") on a Base-only
+ *  selection. Uses `data-pick-option="target:<name>:<id>"` (Pick.tsx) rather than the
+ *  option's TEXT — a text-based `getByText(label,{exact:true}).last()` proved unreliable
+ *  once a SECOND preset's picker opens while an earlier preset is already bound to the same
+ *  label: Playwright's own actionability wait ("visible, enabled, stable" all pass) still
+ *  hung on click, retried hundreds of times, and eventually timed out with "<div></div>
+ *  subtree intercepts pointer events" — `.last()`'s re-resolved match apparently isn't a
+ *  stable target across retries. The attribute selector is unique per (row, option) pair by
+ *  construction, so there is never more than one match to begin with. */
+export async function pickBaseTarget(
+  page: Page,
+  name: string,
+  label: string,
+): Promise<void> {
+  await page.locator(`[data-pick="target:${name}"]`).click();
+  await page.locator(`[data-pick-option="target:${name}:${label}"]`).click();
 }
 
 /** Best-effort invoke: swallow errors (offline lacks some commands; online a teardown

@@ -121,7 +121,7 @@ pub fn probe_reamp_multi_engage(topology_id: &str, cycles: u32) -> Result<String
             // anything on the known scenario preset — a unit without the seeded
             // fixture at 400 (empty slot, or some unrelated user preset) could
             // invert it. Name-confirm in the same list space before loading.
-            super::slot_write::confirm_slot_name(400, "E2E Reference")?;
+            super::slot_write::confirm_slot_name(400, "E2E Rig")?;
             let mut s = Session::connect_lean()?;
             s.load_preset(400)?;
             std::thread::sleep(std::time::Duration::from_millis(500));

@@ -19,11 +19,32 @@ Tauri's `tauri-driver`/WebdriverIO cannot drive this app — macOS WKWebView has
 
 The specs **regex-match user-facing strings** (`doctor.spec.ts` matches `/presets? need a look|All clear/`). Before rewording any view label or heading — especially on a design handoff — **grep `e2e/specs/` for the old phrase first**.
 
+## The Channel-streaming seam (deliberate, not a bug)
+
+Per-scene/per-footswitch leveling **results stream via a Tauri `Channel`**, and the offline
+HTTP bridge (`bin/e2e_server.rs`) **no-ops it** — so a rendered "leveled"/"measured only" row
+outcome (Summary or per-row UI state) is **not UI-observable offline**, even though the
+underlying command completes and persists. This is a **deliberate, permanent seam** — not a
+harness gap to close opportunistically — until someone bridges the Channel offline. The
+**sanctioned observation path** for an offline spec that needs to prove such an outcome is the
+same command over a raw `invoke()` (reading its RETURN value directly) plus the SimDevice event
+log (`/sim/events`, offline-only) for the wire write — never a hand-rolled re-derivation through
+the rendered UI. The Playwright specs that exercise this path exist to prove the HTTP bridge +
+command-registration layer works end to end, as the **twin** of the Rust-only gates
+(`e2e_server_tests.rs`) that prove the underlying physics/outcome — not to duplicate what the
+Rust gate already covers.
+
+Every other site that needs this fact states it in ONE line and points here — see
+`level-setup.spec.ts`'s and `level-defaults.spec.ts`'s file headers, `e2e_server_tests.rs`'s
+scene-leveling test doc comments, and `e2e/fixtures/COVERAGE.md` rows 6/20.
+
 ## Seeding and list reads
 
 - Seed-path list reads are **TOLERANT plus a completeness floor, never `list_my_presets_strict`**. Strict decodes only terminal-frame streams and fails or garbles on back-to-back lean sessions (HW: tolerant returned 504/504 while strict returned truncated 190–236 fallbacks), and its re-arm retries themselves arm the HID open lockout.
 - Online seeding runs a **FRESH `probe --seed-scenario` process BEFORE the server starts**, dodging the in-process `0xe00002c5` open lockout that aborted in-spec seeds. The seed self-repairs by sweeping stray imports — an aborted seed strands copies at the first empty slot anywhere in the bank.
-- The six scenario presets live in the scratch zone at list indices 400–405 and **stay resident between runs by default** — the pristine-checking seed re-imports any drifted or stale-rev slot. Teardown unconditionally disables re-amp, sweeps strays and recalls preset 001, but clears the scenario slots **only** with `TMP_E2E_CLEAR_SCENARIO=1`, for an on-demand net-zero run. Their shapes are deliberate: `E2E Reference` (400) carries scenes AND block-acting footswitches; `Target 1/2` (401/402) are plain; `E2E Realistic` (403) is the physics-spec fixture; `E2E Hiwatt 3S` (404) backs the wipe/bake/measurement-context gates; `E2E Preset24` (405) is the stale-load / saturated-pedal footswitch fixture (`level-fs-preset24.spec.ts`) and deliberately carries **no cab** — five `G1` blocks (4 drives → `ACD_TwinReverb65NoFx`), unlike its `E2E Realistic` sibling, so adding a cab/IR to it means re-deriving `scenario-loudness.json`'s `"405"` C value.
+- The six scenario presets live in the scratch zone at list indices 400–405 and **stay resident between runs by default** — the pristine-checking seed re-imports any drifted or stale-rev slot. Teardown unconditionally disables re-amp, sweeps strays and recalls preset 001, but clears the scenario slots **only** with `TMP_E2E_CLEAR_SCENARIO=1`, for an on-demand net-zero run. **Their shapes are deliberate and the per-use-case map is [`e2e/fixtures/COVERAGE.md`](../../e2e/fixtures/COVERAGE.md)** — read it before changing a fixture, and update it in the same commit. In brief: `E2E Rig` (400) is the scene-overlay + footswitch + Doctor-damage fixture; `E2E Pedalboard` (401) is the scene-free copy/import + EXP/link-group fixture; `E2E Edge` (402) is the split-output 8-scene fixture that also carries the Doctor's baked 2.6 kHz EQ-ring oracle; `E2E Parallel` (403) is the both-lane-amps joint-k fixture; `E2E Hiwatt 3S` (404) is a **verbatim device export** backing the wipe/bake/measurement-context gates (its exact byte length is pinned — do not edit it); `E2E Preset24` (405) is the stale-load / saturated-pedal footswitch fixture (`level-fs-preset24.spec.ts`).
+- **THE CAB RULE (standing user directive):** every guitar amp in every fixture is a combo, an amp+cab-merged model (a cab/IR-suffixed id), or a bare head with a cabinet block DOWNSTREAM IN ITS OWN LANE. Enforced by `fixture_gates::every_guitar_amp_in_every_fixture_reaches_a_cab`, which walks the production routing decoder's signal paths — so a trunk head with a cab in each parallel lane passes and a lane-less cab does not. `E2E Preset24` used to be the exception (four drives into a naked `ACD_TwinReverb65NoFx`); P4-A appended a cab to it. Its `scenario-loudness.json` `"405"` C was deliberately LEFT AT `-21`: offline the C table _is_ the model, so keeping it preserves every committed pedal-curve outcome; the real unit's own loudness is measured, never read from the table.
+- **Fixtures are generated, not hand-edited in place, and every regen bumps `FIXTURE_SOURCE_STAMP`'s `#rN` suffix** (`probe_api/seed_scenario.rs`) — a resident copy of an older rev must fail the pristine check and self-migrate. A regen also means rerunning `cargo test build_scenario_fixture -- --ignored` to rebuild `backup-fixture.bin`.
 
 ## `scripts/hw-e2e.sh` — the attended on-device layer
 

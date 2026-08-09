@@ -14,6 +14,7 @@ import {
   reampOff,
 } from "../fixtures/scenario";
 
+// COVERAGE row 36 — lazy-save (stale-load) incident.
 // BUG→GATE (2026-08-02 HW incident): `saveCurrentPreset` commits LAZILY (T+45-100s on the
 // real unit) — a same-slot `loadPreset` inside that window materializes the PRE-save preset.
 // The incident: base saved presetLevel 0.4377, the footswitch batch's own load 2s later

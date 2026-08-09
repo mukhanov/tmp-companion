@@ -12,6 +12,8 @@ import {
   reampOff,
 } from "../fixtures/scenario";
 
+// COVERAGE row 37 — scene wipe / bake / conformance oracle (the online half; see
+// level.spec.ts for the offline enumeration half).
 // STRICT HARNESS (online-only): leveling must be judged by what the player HEARS,
 // not by the run reporting success. Level the corruption-class preset (E2E Hiwatt
 // 3S — 4 scenes incl. a real "Base Scene" overlay + 4 block-acting footswitches)

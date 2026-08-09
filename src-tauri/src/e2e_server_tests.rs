@@ -82,19 +82,19 @@ fn offline_copy_journey_through_real_backend() {
     let presets = vec![
         crate::session::PresetEntry {
             slot: 400,
-            name: "E2E Reference".into(),
+            name: "E2E Rig".into(),
         },
         crate::session::PresetEntry {
             slot: 401,
-            name: "E2E Target 1".into(),
+            name: "E2E Pedalboard".into(),
         },
         crate::session::PresetEntry {
             slot: 402,
-            name: "E2E Target 2".into(),
+            name: "E2E Edge".into(),
         },
         crate::session::PresetEntry {
             slot: 403,
-            name: "E2E Realistic".into(),
+            name: "E2E Parallel".into(),
         },
         crate::session::PresetEntry {
             slot: 404,
@@ -156,7 +156,7 @@ fn offline_copy_journey_through_real_backend() {
     // any structural edit, so the nodeId need not match a fixture node.
     let jobs = serde_json::json!([{
         "listIndex": 401,
-        "name": "E2E Target 1",
+        "name": "E2E Pedalboard",
         "ops": [{
             "kind": "replace",
             "group": "G1",
@@ -247,7 +247,7 @@ fn offline_level_preset_runs_against_the_fake_audio() {
 /// member and leaves it untouched for anything else — pins the set's intent in BOTH
 /// directions. Root cause (2026-08-01, `notes/user-journeys.md` bug→gate registry):
 /// online `copy.spec.ts` saved a structural edit (dropping a block) over the resident
-/// `E2E Target 2` fixture with nothing clearing `SCENARIO_VERIFIED`, so the next spec's
+/// `E2E Edge` fixture with nothing clearing `SCENARIO_VERIFIED`, so the next spec's
 /// `ensureScenario` hit the fast path, skipped the device re-verify, and asserted on the
 /// mutilated fixture. Value-only leveling saves are deliberately excluded from the set
 /// (within-run value drift is handled by spec ORDERING — doctor before level-strict —
@@ -282,15 +282,17 @@ fn note_structural_save_flags_structural_saves_only() {
     );
 }
 
-/// The physics that drives `level-defaults.spec.ts`: slot 403 (E2E Realistic) at a
-/// SHIPPED DEFAULT target (Crunch -24) produces the first-session outcome set — a Base that
-/// CLAMPS at its ceiling (headroom, reason-less) and an off-branch footswitch (its block sits
-/// on the muted parallel branch → silence → the "no signal on USB 1/2" routing clamp). Fast
-/// backend gate for the sidecar authoring, independent of the Playwright UI flow: a sidecar
-/// C perturbation or an `offbranch_switch_node` regression flips these here (mutation-check
-/// #2/#4). Uses the committed fixture + sidecar via their env overrides.
+/// The physics that drives `level-defaults.spec.ts`, split across the two fixtures that
+/// now carry it: slot 403 (E2E Parallel) at a SHIPPED DEFAULT target produces the
+/// first-session Base CLAMP (headroom, reason-less), and slot 402 (E2E Edge) carries the
+/// OFF-BRANCH footswitch — its block sits on the `gtrSplit` OUT-2 lane, which this preset
+/// routes away from USB 1/2, so an isolated engaged capture reads dead air → the
+/// "no signal on USB 1/2" routing clamp. Fast backend gate for the sidecar authoring,
+/// independent of the Playwright UI flow: a sidecar C perturbation or an
+/// `offbranch_switch_node` regression flips these here (mutation-check #2/#4). Uses the
+/// committed fixture + sidecar via their env overrides.
 #[test]
-fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
+fn level_defaults_base_clamps_and_the_split_lane_footswitch_is_offbranch() {
     let _serial = serial();
     set_e2e_env(&[
         (
@@ -308,33 +310,44 @@ fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
     crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
     let stim = test_stim();
 
-    // The fixture must actually put the off-branch node on a SPLIT lane (not the trunk), else
-    // the ONLINE footswitch off-branch would break while this flag-driven offline gate stayed
-    // green (the drift-lock keeps JSON↔fixture in sync but doesn't assert node-on-muted-branch).
+    // The fixture must actually put the off-branch node on the OUT-2 SPLIT LANE (G3), not
+    // the trunk, else the ONLINE footswitch off-branch would break while this flag-driven
+    // offline gate stayed green (the drift-lock keeps JSON↔fixture in sync but doesn't
+    // assert node-on-a-lane-that-misses-USB).
     let spec = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
-    let realistic = spec
+    let edge = spec
         .iter()
-        .find(|p| p.list_index == 403)
-        .expect("403 present");
-    let pj: serde_json::Value = serde_json::from_str(&realistic.preset_json).expect("403 json");
+        .find(|p| p.list_index == 402)
+        .expect("402 present");
+    let pj: serde_json::Value = serde_json::from_str(&edge.preset_json).expect("402 json");
+    assert_eq!(
+        pj.pointer("/audioGraph/template").and_then(|v| v.as_str()),
+        Some("gtrSplit"),
+        "the off-branch case needs a SPLIT-OUTPUT preset"
+    );
     let g3 = pj
         .pointer("/audioGraph/guitarNodes/G3")
         .and_then(|v| v.as_array());
     assert!(
         g3.is_some_and(|arr| arr
             .iter()
-            .any(|n| n.get("FenderId").and_then(|v| v.as_str()) == Some("ACD_TubeScreamer"))),
-        "403's off-branch node ACD_TubeScreamer must sit on the split lane G3, not the trunk"
+            .any(|n| n.get("FenderId").and_then(|v| v.as_str()) == Some("ACD_KingOfTone"))),
+        "402's off-branch node ACD_KingOfTone must sit on the OUT-2 lane G3, not the trunk"
+    );
+    assert_eq!(
+        pj.pointer("/outputMixerSettings/USB12Input/out2"),
+        Some(&serde_json::Value::Bool(false)),
+        "OUT 2 must be routed AWAY from USB 1/2 — that is what makes the lane dead air \
+         for the capture"
     );
 
-    // Base at Crunch (-21, PR2 re-baseline: +3 from the mono-era -24) → CLAMP at
-    // the ceiling (~-25, +3 from ~-28), headroom (reason-less).
+    // Base at Lead (-19) on 403 → CLAMP at its ceiling (-20), headroom (reason-less).
     let opts = crate::leveller::LevelOptions {
         save: false,
         verify: true,
         ..Default::default()
     };
-    let base = crate::leveller::level_preset(403, &stim, -21.0, opts, &[], None, || false)
+    let base = crate::leveller::level_preset(403, &stim, -19.0, opts, &[], None, || false)
         .expect("level 403 base");
     assert!(
         base.clamped,
@@ -345,17 +358,17 @@ fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
         "403 Base is a headroom clamp (reason-less), not a routing clamp: {base:?}"
     );
     assert!(
-        (base.predicted_lufs - (-25.0)).abs() < 0.5,
-        "403 Base clamps at its ~-25 ceiling: {base:?}"
+        (base.predicted_lufs - (-20.0)).abs() < 0.5,
+        "403 Base clamps at its ~-20 ceiling: {base:?}"
     );
 
-    // FS1 (BRANCH B) toggles ACD_TubeScreamer on the muted parallel branch (G3): engaging it
-    // (bypass=false) routes to a dead branch → off-branch silence → the routing clamp.
+    // 402's OUT2 switch toggles ACD_KingOfTone on the off-USB lane: engaging it
+    // (bypass=false) routes to dead air → off-branch silence → the routing clamp.
     let fs = crate::leveller::level_footswitch(
-        403,
-        0,
-        ("G3", "ACD_TubeScreamer", "level"),
-        &[("G3".into(), "ACD_TubeScreamer".into(), false)],
+        402,
+        2,
+        ("G3", "ACD_KingOfTone", "volume"),
+        &[("G3".into(), "ACD_KingOfTone".into(), false)],
         &crate::leveller::FsWrite::Bake {
             clear_stale: None,
             mirror_scenes: vec![],
@@ -365,10 +378,10 @@ fn level_defaults_403_base_clamps_and_footswitch_is_offbranch() {
         false,
         true,
         None,
-        // `level` on a TubeScreamer is a plain level_linear control over [0,1].
-        &crate::leveller::FsParamTarget::new("ACD_TubeScreamer", "level", 0.5),
+        // `volume` on a (non-amp) pedal is a plain level_linear control over [0,1].
+        &crate::leveller::FsParamTarget::new("ACD_KingOfTone", "volume", 0.5),
     )
-    .expect("level 403 fs");
+    .expect("level 402 fs");
     assert!(fs.clamped, "the off-branch footswitch clamps");
     assert_eq!(
         fs.clamp_reason.as_deref(),
@@ -448,15 +461,556 @@ fn verify_only_footswitch_row_measures_a_delta_and_writes_nothing() {
     );
 }
 
+/// The ASSIGN write path end-to-end offline — the DOMINANT footswitch shape (any block
+/// engaged in base plans as `Assign`; `footswitch::plan_footswitch_jobs`), and the one the
+/// offline suite could not prove at all until `SimDevice` learned
+/// `setFootswitchAssignment`(54). Slot 400's Boost switch (2) is the fixture: `ACD_Boost` is
+/// `bypass: false` in base, so its plan is `Assign`, and its `gain` is the raw-dB `[0, 12]`
+/// param the write must carry unclamped.
+///
+/// Four things are pinned, each of which was silently unprovable offline before:
+/// 1. the run COMPLETES (it used to die at "footswitch assignment not confirmed" — the fake
+///    swallowed field 54 and answered no `currentPresetDataRequest`),
+/// 2. the wire op sequence carries the field-54 write with the solved `valueA` and the
+///    resolved `valueB` at the appended function index,
+/// 3. the CONFIRM came from the read-back, not from an echo: the working-copy `ftsw` a
+///    `Session::live_ftsw` reads renders the new `param` function (the fake deliberately
+///    answers field 54 with nothing, exactly as the schema's no-dedicated-echo model says),
+/// 4. the assign SURVIVES the save — `leveller::verify_fs_persisted_writes` re-reads field 8
+///    and finds the solved value as `ftsw`'s `valueA`, so an offline Assign row can report an
+///    honest `persist_mismatch: Some(false)`.
+///
+/// NOT pinned here (and deliberately): the loudness RESPONSE. Slot 400 declares no
+/// `leveledParams`, so the sim's capture model is flat in `gain` — the target below is the
+/// fixture's own base C so the solve converges on its first seed instead of chasing a curve
+/// that the offline model doesn't have. See this test's sibling note in the report on the
+/// wet-floor gap.
+#[test]
+fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    crate::leveller::clear_slot_save_registry();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    let spec_json = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec_json
+        .iter()
+        .find(|p| p.list_index == 400)
+        .expect("400 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
+    let ftsw = preset["ftsw"].clone();
+
+    const SWITCH: u32 = 2; // the Boost switch
+    const NODE: &str = "ACD_Boost";
+    const PARAM: &str = "gain";
+    // Base C for slot 400 (`scenario-loudness.json`) at the fixture's own presetLevel — see
+    // the note above on why the target sits exactly there.
+    const TARGET: f64 = -15.0;
+
+    // The plan really is Assign — if the fixture ever bypasses ACD_Boost in base this test
+    // would quietly become a second Bake gate.
+    let plans = crate::footswitch::plan_footswitch_jobs(
+        &ftsw,
+        &preset,
+        &[crate::footswitch::FsJobKey {
+            switch: SWITCH,
+            lev_node: NODE,
+            lev_param: PARAM,
+            target_bits: TARGET.to_bits(),
+        }],
+    );
+    let engaged = match &plans[0] {
+        crate::footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
+        other => panic!("400 switch {SWITCH} must plan as Assign, got {other:?}"),
+    };
+
+    // The production resolution (`valueB` = the param's base value, spec = APPEND at the next
+    // free index, inheriting the switch's own display fields).
+    let job = crate::commands::level_footswitch::FootswitchLevelJob {
+        switch: SWITCH,
+        lev_group_id: "G1".into(),
+        lev_node_id: NODE.into(),
+        lev_parameter_id: PARAM.into(),
+        target_lufs: TARGET,
+        mode: Default::default(),
+        display_label: None,
+    };
+    let (value_b, write_spec) =
+        crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
+            .expect("resolve the Boost job");
+    assert!(
+        (value_b - 2.5).abs() < 1e-6,
+        "valueB is ACD_Boost's authored base gain: {value_b}"
+    );
+    let function_index = write_spec.function_index;
+    assert_eq!(
+        function_index, 1,
+        "the leveling param fn APPENDS after the switch's existing on-off"
+    );
+
+    let r = crate::leveller::level_footswitch(
+        400,
+        SWITCH,
+        ("G1", NODE, PARAM),
+        &engaged,
+        &crate::leveller::FsWrite::Assign {
+            value_b,
+            spec: write_spec,
+        },
+        &stim,
+        TARGET,
+        true,  // save
+        false, // no re-measure verify
+        crate::last_loaded_scene(&preset),
+        &crate::leveller::FsParamTarget::new(NODE, PARAM, value_b),
+    )
+    .expect("the Assign run must COMPLETE — it used to fail its confirm gate offline");
+    assert_eq!(r.method, "assigned");
+    assert!(r.saved, "save: true must persist the assign: {r:?}");
+    assert!(
+        r.clamp_reason.is_none(),
+        "ACD_Boost is on the trunk — no routing clamp: {r:?}"
+    );
+
+    // (2) the field-54 write, with the solved valueA and the resolved valueB.
+    let events = sim.events();
+    let assign = events
+        .iter()
+        .find_map(|e| match e {
+            crate::sim_device::SimEvent::SetFootswitchAssignment {
+                addr,
+                index,
+                function_json,
+                swap,
+            } if *addr == SWITCH => Some((*index, function_json.clone(), *swap)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no field-54 write for switch {SWITCH}: {events:?}"));
+    assert_eq!(assign.0, function_index, "written at the resolved index");
+    assert!(!assign.2, "production never sets the swap flag");
+    let func: serde_json::Value = serde_json::from_str(&assign.1).expect("functionJson parses");
+    assert_eq!(func["func"], "param");
+    assert_eq!(func["nodeId"], NODE);
+    assert_eq!(func["parameterId"], PARAM);
+    assert!(
+        (func["valueA"].as_f64().expect("valueA") - f64::from(r.final_value)).abs() < 1e-6,
+        "valueA must be the SOLVED value {}: {func}",
+        r.final_value
+    );
+    assert!(
+        (func["valueB"].as_f64().expect("valueB") - f64::from(value_b)).abs() < 1e-6,
+        "valueB must be the switch-OFF base value: {func}"
+    );
+    // A raw-dB param must reach the wire unclamped (the `[0, 12]` range's own 0.25 seed).
+    assert!(
+        r.final_value > 1.0,
+        "a raw-dB gain solve must not be pinned inside [0,1]: {r:?}"
+    );
+
+    // (3) the CONFIRM channel: the working copy a `live_ftsw` read renders carries the new
+    // function. Asserted through the same session call the leveler's read-back branch uses,
+    // so a future field-54 echo can't silently retire this coverage.
+    {
+        let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(400).expect("load 400");
+        let live = s.live_ftsw().expect("the field-2 re-prompt must answer");
+        let value_a = crate::footswitch::existing_param_fn_value_a(&live, SWITCH, NODE, PARAM)
+            .unwrap_or_else(|| panic!("no param fn on switch {SWITCH} in the live ftsw: {live}"));
+        assert!(
+            (value_a - f64::from(r.final_value)).abs() < 1e-6,
+            "the live ftsw must render the solved valueA, got {value_a}"
+        );
+    }
+
+    // (4) the save round trip, through the production persist verify (field-8 → ftsw valueA).
+    // `base_expect: None` keeps `base_reverted` out of it, so this isolates the ftsw path.
+    let mut results = vec![Some(r.clone())];
+    crate::leveller::verify_fs_persisted_writes(
+        400,
+        &[(0, NODE.to_string(), PARAM.to_string(), r.final_value, true)],
+        None,
+        &mut results,
+    );
+    assert_eq!(
+        results[0].as_ref().and_then(|x| x.persist_mismatch),
+        Some(false),
+        "the saved preset must hold the assign's valueA: {:?}",
+        results[0]
+    );
+
+    // (5) the STALE-LOAD barrier can see it. The write session registered a
+    // `SaveWitness::Param` carrying the solved value, and for an Assign
+    // `leveller::witness_value_in_doc` can only match it against `ftsw`'s `valueA` (the
+    // block's own `dspUnitParameters` still holds the switch-OFF value and never can). An
+    // `ftsw` that doesn't survive the save would leave the witness unharvestable, and the
+    // barrier would silently fall out through its ~2-minute time gate on every offline
+    // Assign — so the elapsed bound, not just the `Ok`, is the assertion.
+    assert!(
+        crate::leveller::slot_save_pending_commit(400),
+        "the write session must have REGISTERED a witness — without an entry the barrier \
+         below is a no-op and asserts nothing"
+    );
+    let start = std::time::Instant::now();
+    assert!(
+        crate::leveller::ensure_fresh_load(400, &mut || false).is_ok(),
+        "the barrier must clear on the assign's own witness"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the witness must harvest on the FIRST load, not via the time gate: {:?}",
+        start.elapsed()
+    );
+}
+
+/// COVERAGE row 18 — the WET-FLOOR outcome, end to end offline. 400's SPRING switch (3)
+/// toggles `ACD_TMSpring63`, which is `bypass: false` in base, so its plan is `Assign` and
+/// its `mix` (authored 0.42) classifies `wet_mix`: `FsParamTarget::bounds` raises the solve's
+/// LOW bound to `WET_FLOOR_FRACTION` (0.25) x 0.42 = 0.105, because driving a reverb's mix
+/// toward 0 to hit a loudness target doesn't make the effect quieter, it DELETES it.
+///
+/// Two runs, one gate:
+/// * an UNREACHABLE target pins at that floor and reports `wet_floor: true` — the honest
+///   "quieter ON than OFF, verify it by ear" outcome the UI renders from this flag
+///   (`useLevelingFlow.ts`'s `verifyByEar`), and NOT a routing clamp (`clamp_reason` stays
+///   `None`, whose contract is "no signal on USB 1/2" alone),
+/// * a REACHABLE target converges inside the band with `wet_floor: false`, proving the flag
+///   tracks the outcome rather than the param's class.
+///
+/// This was unprovable offline until two things landed together (either alone leaves it
+/// red): the sidecar's `leveledParams` entry for `400 / G1 / ACD_TMSpring63 / mix` on the
+/// `wetMix` curve, and `model_lufs`'s widened activation predicate — an Assign's isolation
+/// (`siblings_off_excluding`) forces only the OTHER switches' blocks off, so the LEVELED
+/// block gets no bypass write and the old `bypass_writes[node] == Some(false)` predicate
+/// never fired. With a flat capture model both seeds read the same C, `solve_param_secant`
+/// took its no-authority `flat_response` exit at the low SEED (`at_fraction(0.25)` = 0.32875)
+/// and never reached the floor at all — which is what row 18 previously mis-attributed to
+/// the Assign path skipping the floor.
+///
+/// `save: false` on BOTH runs, deliberately: the sim's `preset_level` starts at 1.0 and a
+/// load only restores the fixture's own 0.32 once the slot has been saved this run, so a
+/// saving first run would shift every later capture by -9.9 LU and the second assertion
+/// would fail for a reason that looks nothing like its cause. The Assign save round trip is
+/// `assign_path_footswitch_confirms_by_readback_and_persists_its_value_a`'s job.
+#[test]
+fn wet_mix_footswitch_pins_at_the_wet_floor_on_an_unreachable_target() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let (r, param) = solve_400_spring(-70.0);
+    assert_eq!(r.method, "assigned");
+    assert!(r.clamped, "an unreachable target must clamp: {r:?}");
+    assert!(
+        r.wet_floor,
+        "the clamp's cause is the WET FLOOR, and that flag is the whole UI advisory: {r:?}"
+    );
+    assert!(
+        r.clamp_reason.is_none(),
+        "a wet-floor clamp is not a routing clamp — that reason means 'no signal on USB 1/2' \
+         only: {r:?}"
+    );
+    let floor = 0.42 * crate::leveller::WET_FLOOR_FRACTION;
+    assert!(
+        (floor - 0.105).abs() < 1e-6,
+        "the fixture's authored mix must still be 0.42: floor {floor}"
+    );
+    assert!(
+        (r.final_value - floor).abs() < 1e-4,
+        "the written value must BE the floor ({floor}), never below it: {r:?}"
+    );
+    assert!(
+        (r.final_value - param.bounds().0).abs() < 1e-6,
+        "the floor IS the solve's low bound, so no probe ever went under it: {r:?}"
+    );
+    assert!(!r.saved, "save: false must write nothing: {r:?}");
+}
+
+/// The companion half of the row-18 gate: the SAME switch at a target the wet-mix curve can
+/// actually reach converges inside `FS_TOL_LU` with `wet_floor: false`. -16 is the pick
+/// because the curve puts the wet floor at -17.18 and the authored mix at -15, so -16 solves
+/// near mix 0.27 — a 1.18 LU margin over the floor's own reading, ~12x the 0.1 LU tolerance,
+/// so an epsilon in the model can't flip this row into a floor clamp and quietly retire the
+/// discrimination this pair exists to prove.
+#[test]
+fn wet_mix_footswitch_converges_and_stays_off_the_floor_on_a_reachable_target() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    const TARGET: f64 = -16.0;
+    let (r, param) = solve_400_spring(TARGET);
+    assert_eq!(r.method, "assigned");
+    assert!(
+        !r.clamped && !r.unconverged,
+        "a reachable target must SOLVE: {r:?}"
+    );
+    assert!(
+        !r.wet_floor,
+        "wet_floor tracks the OUTCOME, not the param's class: {r:?}"
+    );
+    assert!(
+        (r.predicted_lufs - TARGET).abs() <= 0.1,
+        "the achieved loudness must land within FS_TOL_LU of {TARGET}: {r:?}"
+    );
+    let (lo, hi) = param.bounds();
+    assert!(
+        r.final_value > lo + 1e-3 && r.final_value < hi,
+        "the solved mix must sit strictly inside ({lo}, {hi}): {r:?}"
+    );
+}
+
+/// Shared body of the two wet-floor gates: install a fresh sim, prove 400's SPRING switch
+/// really plans as `Assign` (a fixture edit that bypasses `ACD_TMSpring63` in base would
+/// otherwise silently turn both gates into Bake tests), resolve the production `valueB` /
+/// write spec, and run the single-switch seam DRY. Returns the result plus the classified
+/// target, so each caller can assert against the same `bounds()` the solve used.
+fn solve_400_spring(
+    target_lufs: f64,
+) -> (
+    crate::leveller::FootswitchLevelResult,
+    crate::leveller::FsParamTarget,
+) {
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    crate::leveller::clear_slot_save_registry();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    const SWITCH: u32 = 3; // SPRING
+    const NODE: &str = "ACD_TMSpring63";
+    const PARAM: &str = "mix";
+
+    let spec_json = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec_json
+        .iter()
+        .find(|p| p.list_index == 400)
+        .expect("400 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
+    let ftsw = preset["ftsw"].clone();
+
+    let plans = crate::footswitch::plan_footswitch_jobs(
+        &ftsw,
+        &preset,
+        &[crate::footswitch::FsJobKey {
+            switch: SWITCH,
+            lev_node: NODE,
+            lev_param: PARAM,
+            target_bits: target_lufs.to_bits(),
+        }],
+    );
+    let engaged = match &plans[0] {
+        crate::footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
+        other => panic!("400 switch {SWITCH} must plan as Assign, got {other:?}"),
+    };
+    assert!(
+        !engaged.iter().any(|(_, n, _)| n == NODE),
+        "an Assign isolates only the SIBLINGS — the leveled block must get no bypass write, \
+         which is exactly what the widened `model_lufs` predicate exists to handle: {engaged:?}"
+    );
+
+    let job = crate::commands::level_footswitch::FootswitchLevelJob {
+        switch: SWITCH,
+        lev_group_id: "G1".into(),
+        lev_node_id: NODE.into(),
+        lev_parameter_id: PARAM.into(),
+        target_lufs,
+        mode: Default::default(),
+        display_label: None,
+    };
+    let (value_b, write_spec) =
+        crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
+            .expect("resolve the SPRING job");
+    assert!(
+        (value_b - 0.42).abs() < 1e-6,
+        "valueB is ACD_TMSpring63's authored base mix: {value_b}"
+    );
+
+    let param = crate::leveller::FsParamTarget::new(NODE, PARAM, value_b);
+    assert_eq!(
+        param.info.class,
+        crate::param_class::ParamClass::WetMix,
+        "the whole gate rests on `mix` classifying wet_mix"
+    );
+    let r = crate::leveller::level_footswitch(
+        400,
+        SWITCH,
+        ("G1", NODE, PARAM),
+        &engaged,
+        &crate::leveller::FsWrite::Assign {
+            value_b,
+            spec: write_spec,
+        },
+        &stim,
+        target_lufs,
+        false, // dry — see the gate's own doc for why a save would poison the capture model
+        false,
+        crate::last_loaded_scene(&preset),
+        &param,
+    )
+    .expect("the SPRING solve must complete");
+    (r, param)
+}
+
+/// The `ftsw` working-copy semantics of `setFootswitchAssignment`(54) /
+/// `clearFootswitchAssignment`(55) at the WIRE level, one fact per step: APPEND at an index
+/// past the switch's function count, REPLACE at an existing one, SPLICE (shift down) on a
+/// clear, an unsaved edit is discarded by a fresh load, and a saved one survives it. The
+/// clear side has no coverage in the Assign gate above — production only reaches it through
+/// `FsWrite::Bake`'s `clear_stale` — and its read-back confirm
+/// (`footswitch::existing_param_fn_index(..).is_none()`) was ALSO dead offline before the
+/// field-2 re-prompt existed, since `live_ftsw` returned `None` for every caller.
+#[test]
+fn footswitch_assignment_set_and_clear_edit_the_working_copy_and_survive_only_a_save() {
+    let _serial = serial();
+    set_e2e_env(&[(
+        "TMP_E2E_SCENARIO_PRESETS",
+        "/../e2e/fixtures/scenario-presets.json",
+    )]);
+    let sim = crate::sim_device::SimDevice::new();
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+
+    // Slot 400 switch 3 (SPRING) ships exactly ONE function, an on-off.
+    const SWITCH: u32 = 3;
+    let func = |value_a: f64| {
+        serde_json::json!({
+            "func": "param", "groupId": "G1", "nodeId": "ACD_TMSpring63",
+            "parameterId": "mix", "valueA": value_a, "valueB": 0.42, "valueType": 2,
+            "colorA": 1, "colorB": 0, "customLabel": "SPRING", "switchType": 0,
+            "isActive": false, "linkGroup": 0
+        })
+        .to_string()
+    };
+    let fn_count = |s: &mut crate::session::Session| {
+        s.live_ftsw()
+            .and_then(|f| {
+                f.as_array()
+                    .and_then(|a| a.get(SWITCH as usize))
+                    .and_then(|sw| sw.as_array())
+                    .map(Vec::len)
+            })
+            .expect("the field-2 re-prompt must answer with an ftsw")
+    };
+
+    let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+    s.load_preset(400).expect("load 400");
+    assert_eq!(
+        fn_count(&mut s),
+        1,
+        "the fixture ships one on-off on SPRING"
+    );
+
+    // APPEND: index 1 is past the switch's single function.
+    s.set_footswitch_assignment(SWITCH, 1, &func(0.30), false, None)
+        .expect("set");
+    assert_eq!(fn_count(&mut s), 2, "an index past the end APPENDS");
+
+    // REPLACE: the same index now exists.
+    s.set_footswitch_assignment(SWITCH, 1, &func(0.55), false, None)
+        .expect("re-set");
+    assert_eq!(
+        fn_count(&mut s),
+        2,
+        "an existing index REPLACES, never grows"
+    );
+    let live = s.live_ftsw().expect("live ftsw");
+    assert_eq!(
+        crate::footswitch::existing_param_fn_value_a(&live, SWITCH, "ACD_TMSpring63", "mix"),
+        Some(0.55),
+        "the working copy holds the LAST write: {live}"
+    );
+
+    // A fresh load discards the UNSAVED edit (the device's own edit-buffer semantics).
+    s.load_preset(400).expect("reload 400");
+    assert_eq!(
+        fn_count(&mut s),
+        1,
+        "an unsaved ftsw edit must not survive a load"
+    );
+
+    // SPLICE: re-add, then clear the on-off at index 0 — the param fn shifts down to 0.
+    s.set_footswitch_assignment(SWITCH, 1, &func(0.55), false, None)
+        .expect("set again");
+    s.clear_footswitch_assignment(SWITCH, 0).expect("clear");
+    let live = s.live_ftsw().expect("live ftsw");
+    assert_eq!(
+        fn_count(&mut s),
+        1,
+        "a clear removes the slot, leaving no hole"
+    );
+    assert_eq!(
+        crate::footswitch::existing_param_fn_index(&live, SWITCH, "ACD_TMSpring63", "mix"),
+        Some(0),
+        "the surviving function SHIFTED down to index 0: {live}"
+    );
+
+    // Saved, it survives the load — the `SavedDoc::ftsw` round trip.
+    s.save_current_preset(400).expect("save");
+    s.load_preset(400).expect("reload after save");
+    let live = s.live_ftsw().expect("live ftsw");
+    assert_eq!(
+        fn_count(&mut s),
+        1,
+        "the saved switch keeps its single function"
+    );
+    assert_eq!(
+        crate::footswitch::existing_param_fn_value_a(&live, SWITCH, "ACD_TMSpring63", "mix"),
+        Some(0.55),
+        "a SAVED ftsw edit survives the load: {live}"
+    );
+
+    // Both wire ops are recorded, in order, with their decoded addressing.
+    let ops: Vec<String> = sim
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            crate::sim_device::SimEvent::SetFootswitchAssignment { addr, index, .. } => {
+                Some(format!("set({addr},{index})"))
+            }
+            crate::sim_device::SimEvent::ClearFootswitchAssignment { addr, index } => {
+                Some(format!("clear({addr},{index})"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        vec!["set(3,1)", "set(3,1)", "set(3,1)", "clear(3,0)"],
+        "the fake must record every ftsw wire op in order"
+    );
+}
+
 /// The SCENE-leveling physics for slot 403 through the REAL `level_scenes_apply_batched`
-/// command over mock IPC — the same path the offline UI drives, minus the per-scene Channel
-/// stream the HTTP bridge no-ops (so the UI can't render these outcomes offline; this gate
-/// asserts them on the command's RETURN value instead). At the shipped default target (-23,
+/// command over mock IPC — the same path the offline UI drives, minus the Channel-streaming
+/// seam (`.claude/rules/e2e.md`'s "The Channel-streaming seam"): this gate asserts the
+/// outcomes on the command's RETURN value instead. At the shipped default target (-23,
 /// PR2 re-baseline: +3 from the mono-era -26) the 4 scenes produce the level-defaults outcome
 /// set: 3 SOLVABLE (amp `outputLevel` converged to ~-23) + 1 OFF-BRANCH ("Clean", saved with
-/// the amp output at zero → no
+/// BOTH lane amps' output at zero → no
 /// authority over the USB capture → the routing clamp). Proves the graph-echo fix (the prepass
-/// classifies gtrParallel1 and picks the trunk amp) AND the sidecar scene C authoring.
+/// classifies gtrParallel1 and picks BOTH lane amps for the joint-k solve) AND the sidecar
+/// scene C authoring.
 #[test]
 fn level_defaults_403_scenes_solve_and_offbranch() {
     let _serial = serial();
@@ -490,11 +1044,12 @@ fn level_defaults_403_scenes_solve_and_offbranch() {
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
         .build()
         .expect("wv");
-    // The trunk amp candidate (the backup scan / list_level_blocks resolves the same one).
-    let amp = serde_json::json!([{
-        "groupId": "G1", "nodeId": "ACD_TwinReverb65NoFx",
-        "parameterId": "outputLevel", "value": 0.5
-    }]);
+    // BOTH lane amps (the backup scan / list_level_blocks resolves the same pair) — this
+    // preset re-merges two parallel amps, so the solve is joint-k over the two knobs.
+    let amp = serde_json::json!([
+        {"groupId": "G2", "nodeId": "ampA", "parameterId": "outputLevel", "value": 1.0},
+        {"groupId": "G3", "nodeId": "ampB", "parameterId": "outputLevel", "value": 1.0}
+    ]);
     let res = invoke(
         &webview,
         "level_scenes_apply_batched",
@@ -540,10 +1095,11 @@ fn level_defaults_403_scenes_solve_and_offbranch() {
 }
 
 /// Gain-budget redistribution (PR5) end-to-end through the real command against the offline
-/// physics: slot 400 (E2E Reference) is the loud class — Base C=-15 solves, scene 0 C=-27
-/// clamps (PR2 re-baseline: +3 from the mono-era -18/-30). `redistribute_headroom` raises
+/// physics: slot 400 (E2E Rig) is the loud class — Base C=-15 solves, and scene 2
+/// ("Ceiling", C=-14 with its amp saved at `outputLevel` 1.0) clamps at EVERY shipped
+/// default because it has no boost headroom at all. `redistribute_headroom` raises
 /// presetLevel by the solved delta and re-levels the base amp + BOTH scenes back to −23, so the
-/// previously-clamped scene 0 reaches target (done, not clamped) and every sound lands near −23
+/// previously-clamped scene 2 reaches target (done, not clamped) and every sound lands near −23
 /// — AND it records the pre-values (presetLevel + touched knobs) for the Summary's Restore.
 /// This is the offline half of "clamped run →
 /// redistribute → all done"; the base-scene skip + save-persistence idempotency are online
@@ -582,15 +1138,15 @@ fn redistribute_400_gives_the_clamped_scene_headroom() {
         .build()
         .expect("wv");
     let amp = serde_json::json!([{
-        "groupId": "G1", "nodeId": "ACD_DeluxeReverb65BlondeVibratoNoFxCabIR",
-        "parameterId": "outputLevel", "value": 0.5
+        "groupId": "G1", "nodeId": "ACD_JC120",
+        "parameterId": "outputLevel", "value": 0.35
     }]);
-    // Base (wire slot 8) + scene 0 (the clamped one) + scene 1, all to −23 (PR2 re-baseline: +3
-    // from the mono-era −26). `worstClampedDeficitDb` = scene 0's deficit at presetLevel 0.32
-    // (≈5.9); 6.0 is enough to fully rescue it.
+    // Base (wire slot 8) + scene 2 (the clamped "Ceiling" one) + scene 1, all to −23 (PR2
+    // re-baseline: +3 from the mono-era −26). `worstClampedDeficitDb` 6.0 is more than
+    // enough to rescue scene 2's ~0.9 dB deficit.
     let jobs = serde_json::json!([
         {"sceneSlot": 8, "targetLufs": -23.0},
-        {"sceneSlot": 0, "targetLufs": -23.0},
+        {"sceneSlot": 2, "targetLufs": -23.0},
         {"sceneSlot": 1, "targetLufs": -23.0}
     ]);
     let res = invoke(
@@ -685,8 +1241,8 @@ fn redistribute_aborts_and_saves_nothing_on_a_dropped_capture() {
         .build()
         .expect("wv");
     let amp = serde_json::json!([{
-        "groupId": "G1", "nodeId": "ACD_DeluxeReverb65BlondeVibratoNoFxCabIR",
-        "parameterId": "outputLevel", "value": 0.5
+        "groupId": "G1", "nodeId": "ACD_JC120",
+        "parameterId": "outputLevel", "value": 0.35
     }]);
     let jobs = serde_json::json!([
         {"sceneSlot": 8, "targetLufs": -23.0},
@@ -921,7 +1477,7 @@ fn sim_answers_the_field8_saved_preset_read() {
     assert_eq!(scenes.len(), 4, "403 has 4 scenes: {scenes:?}");
     assert!(
         matches!(
-            crate::scene_overlay(&saved, 1, "ACD_TwinReverb65NoFx"),
+            crate::scene_overlay(&saved, 1, "ampA"),
             crate::SceneOverlay::Full(_)
         ),
         "the per-node overlay accessor resolves against the read document"

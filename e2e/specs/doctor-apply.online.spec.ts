@@ -7,10 +7,13 @@ import {
   isOnline,
 } from "../fixtures/scenario";
 
+// COVERAGE row 30 — Doctor's `BypassOnly` prescription refusal: `doctor_apply` cannot
+// run at all offline (this file's own header, below), so its UI path is proven only
+// here, online.
 // ONLINE-ONLY suite member: exercises the doctor_apply → doctor_save and
 // doctor_apply → doctor_discard command paths end-to-end on the REAL device
 // with a deterministic hand-built job (an EQ-10 cut inserted into E2E
-// Target 1's known G1 chain), independent of which verdicts the diagnosis
+// Pedalboard's known G1 chain), independent of which verdicts the diagnosis
 // happens to fire — UI-driven Apply can't be asserted deterministically
 // (prescription content is sound-dependent). Net-zero: the scenario slots
 // are cleared in teardown. Adds ~1–2 min to the attended online run; skipped
@@ -38,7 +41,7 @@ test.describe("Doctor apply/save/discard — one-off HW validation", () => {
     await ensureScenario(page);
     await page.goto("/");
 
-    // Target 1's chain, mirrored from e2e/fixtures/scenario-presets.json.
+    // E2E Pedalboard's chain, mirrored from e2e/fixtures/scenario-presets.json.
     const nodes = [
       {
         group_id: "G1",
@@ -48,14 +51,14 @@ test.describe("Doctor apply/save/discard — one-off HW validation", () => {
       },
       {
         group_id: "G1",
-        node_id: "ACD_PhaserP90",
-        model: "ACD_PhaserP90",
+        node_id: "ACD_KingOfTone",
+        model: "ACD_KingOfTone",
         bypassed: true,
       },
       {
         group_id: "G1",
-        node_id: "ACD_TMLargePlate",
-        model: "ACD_TMLargePlate",
+        node_id: "ACD_MarshallPlexi",
+        model: "ACD_MarshallPlexi",
         bypassed: false,
       },
     ];
@@ -80,7 +83,7 @@ test.describe("Doctor apply/save/discard — one-off HW validation", () => {
       footswitches: [],
     });
 
-    // (1) APPLY on Target 1 → both A/B clips come back as WAV data URLs.
+    // (1) APPLY on E2E Pedalboard → both A/B clips come back as WAV data URLs.
     const t1 = SCENARIO[1];
     const applied = (await invoke(page, "doctor_apply", {
       job: job(t1.slot, t1.name),
@@ -95,7 +98,7 @@ test.describe("Doctor apply/save/discard — one-off HW validation", () => {
       ops,
     });
 
-    // (3) APPLY on Target 2, then DISCARD (reloads the stored preset).
+    // (3) APPLY on E2E Edge, then DISCARD (reloads the stored preset).
     const t2 = SCENARIO[2];
     await invoke(page, "doctor_apply", { job: job(t2.slot, t2.name) });
     await invoke(page, "doctor_discard", { listIndex: t2.slot });

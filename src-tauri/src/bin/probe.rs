@@ -2260,7 +2260,7 @@ fn main() {
         // --redistribute-persist-check <scratchSlot> <expectedName>
         // PR5 go/no-go: do presetLevel + base amp outputLevel + scene overlay all
         // persist through ONE save? Point at a prepared scratch preset with an amp +
-        // ≥1 scene (e.g. E2E Reference at 400 after --seed-scenario). 0-based list index;
+        // ≥1 scene (e.g. E2E Rig at 400 after --seed-scenario). 0-based list index;
         // name-guarded; restores the slot afterward.
         let slot: u32 = args
             .get(i + 1)

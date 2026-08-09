@@ -73,6 +73,7 @@ export function FsParamPick({ params, index, onChange }: FsParamPickProps) {
         return (
           <BlockParamRow
             key={`${c.node_id}:${c.parameter_id}`}
+            pickKey={`${c.node_id}:${c.parameter_id}`}
             art={blockArtTile(c.fender_id)}
             paramLabel={paramLabel(c.parameter_id)}
             selected={on}

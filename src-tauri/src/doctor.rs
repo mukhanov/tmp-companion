@@ -5909,8 +5909,8 @@ mod tests {
         };
         let rows: Vec<Value> = serde_json::from_str(&raw).unwrap();
         let preset: Value = serde_json::from_str(rows[0]["presetJson"].as_str().unwrap()).unwrap();
-        // The reference preset (TweedDeluxe + pedals, no cab) exercises the
-        // insert paths with REAL device JSON, through the SAME graph decoder
+        // The first scenario preset ("E2E Rig": two amps + cab + pedals) exercises
+        // the insert paths with REAL device JSON, through the SAME graph decoder
         // the backup scan uses (so the DoctorNode mapping is exercised too).
         let nodes: Vec<DoctorNode> = crate::session::extract_active_graph(&preset, None)
             .nodes

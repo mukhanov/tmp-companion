@@ -32,6 +32,12 @@ export interface BlockParamRowProps {
   /** Shown as the row's `title` while disabled. */
   disabledTitle?: string;
   onPick: () => void;
+  /** e2e hook: `${nodeId}:${parameterId}` — both this row's callers (FsParamPick,
+   *  SceneLevelPick) render their menu through a PORTAL, so a spec can't scope a
+   *  query to the picker's own trigger the way `PresetOptionRow`'s `data-setup-row`
+   *  scopes a Setup row; this is the portal-content equivalent. Optional: neither
+   *  caller is required to pass it. */
+  pickKey?: string;
 }
 
 const TILE = 38;
@@ -45,10 +51,12 @@ export function BlockParamRow({
   disabled,
   disabledTitle,
   onPick,
+  pickKey,
 }: BlockParamRowProps) {
   const { t } = useTheme();
   return (
     <div
+      data-block-param-pick={pickKey}
       onClick={(e) => {
         e.stopPropagation();
         if (disabled) return;

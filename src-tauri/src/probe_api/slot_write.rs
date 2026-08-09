@@ -793,8 +793,8 @@ pub fn probe_save_load_test(
 /// the go/no-go gate the plan mandates running FIRST.
 ///
 /// Point it at a prepared SCRATCH preset that carries an amp (a guitarNodes node with
-/// an `outputLevel` control) and ≥1 footswitch scene — e.g. the e2e "E2E Reference"
-/// after `probe --seed-scenario` (e.g. "E2E Realistic" at 403, whose amp id is short
+/// an `outputLevel` control) and ≥1 footswitch scene — e.g. the e2e "E2E Rig"
+/// after `probe --seed-scenario` (e.g. "E2E Parallel" at 403, whose amp id is short
 /// enough to fit a single-report `changeParameter`). It reads the slot's current values,
 /// applies three DISTINCTIVE test values (base 0.30, scene[1] 0.66, presetLevel 0.42) all
 /// on ONE live-edit session, saves ONCE, reconnects, reads back, and asserts. Then —

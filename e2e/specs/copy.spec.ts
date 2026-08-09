@@ -7,6 +7,7 @@ import {
   tileLabels,
 } from "../fixtures/scenario";
 
+// COVERAGE row 38 — import / copy chain.
 // Copy scenario — runs identically offline (SimDevice + backup fixture) and online (real
 // device). Reference = P400; targets = P401 + P402 (all at slots 400/401/402, sharing a
 // block so same-block replace always has a candidate). It drives EVERY edit op (delete,

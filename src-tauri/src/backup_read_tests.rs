@@ -479,7 +479,7 @@ fn build_scenario_fixture() {
     let reference = decoded
         .presets
         .iter()
-        .find(|r| r.name == "E2E Reference")
+        .find(|r| r.name == "E2E Rig")
         .expect("Reference present");
     assert!(
         !reference.graph.stages.is_empty(),

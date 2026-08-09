@@ -9,6 +9,7 @@ import {
   isOnline,
   reampCounters,
   reampOff,
+  selectBaseOnly,
   simEvents,
   baseLevelJob,
   LEVEL_T,
@@ -79,10 +80,11 @@ test.describe("Level re-run — base skip-branch idempotency", () => {
       await expect(page.getByText(/connected · \d+\.\d+/)).toBeVisible({
         timeout: 20_000,
       });
-      const filter = page.getByPlaceholder(/Filter by name or slot/i);
-      await filter.fill(preset.name);
-      await page.getByTitle("Select preset to level").first().click();
-      await filter.fill("");
+      // Base-only, not the whole-preset checkbox: 401 now carries footswitches of its own
+      // (P4-B fixture rebuild — see level-defaults.spec.ts's header), and a whole-preset
+      // tick would sweep those in too, colliding on the shared `data-pick="target:NAME"]`
+      // trigger below (every selected row of one preset shares it).
+      await selectBaseOnly(page, preset.name);
       await page.getByRole("button", { name: /Level 1 preset/ }).click();
       await page.getByText(/I.ve backed up with Pro Control/i).click();
       await page.locator(`[data-pick="target:${preset.name}"]`).click();
@@ -182,7 +184,7 @@ test.describe("Level re-run — online skip-branch idempotency", () => {
   });
 
   // Footswitch lane: the switch_at_target idempotency fix (this PR). Run 1 levels the
-  // switch's engaged state (Assign path — E2E Reference has scenes); run 2 probes the
+  // switch's engaged state (Assign path — E2E Rig has scenes); run 2 probes the
   // stored valueA, finds it on target, and rewrites nothing. WITHOUT the fix this is RED
   // (the lane re-solved in-tolerance switches every run — the PR #74 deferred gap).
   test("footswitch: run 2 rewrites nothing in-tolerance (switch_at_target)", async ({
@@ -200,7 +202,7 @@ test.describe("Level re-run — online skip-branch idempotency", () => {
     test.setTimeout(1_200_000);
     await ensureScenario(page);
     const reampBase = await reampCounters(page);
-    // E2E Reference switch 1 (GREENBOX) toggles ACD_TubeScreamer; level its `level` param.
+    // E2E Rig switch 1 (DRIVE) toggles ACD_TubeScreamer; level its `level` param.
     // The switch's block controls only a slice of the chain loudness, so a fixed LUFS target
     // can be out of its reach (→ clamp, nothing to skip). Learn the reachable value with a
     // dry run and target THAT — then run 1 always truly levels and the skip is real.

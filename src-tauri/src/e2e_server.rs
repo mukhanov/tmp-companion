@@ -60,7 +60,7 @@ static SCENARIO_VERIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// must run before level-strict — see `scripts/e2e.sh`). A structural save invalidates
 /// [`SCENARIO_VERIFIED`] so the NEXT spec's `ensureScenario` re-verifies the device and
 /// re-imports only what drifted, rather than trusting a fixture that's since been
-/// mutilated (root cause: `copy.spec.ts` stripping E2E Target 2's trailing EQ block,
+/// mutilated (root cause: `copy.spec.ts` stripping E2E Edge's trailing EQ block,
 /// then `doctor.spec.ts` asserting on the resonance that block used to carry).
 ///
 /// Any new command that saves structural edits to a fixture slot must join this list —
@@ -245,19 +245,19 @@ fn e2e_install_offline_fake() {
     let presets = vec![
         session::PresetEntry {
             slot: 400,
-            name: "E2E Reference".into(),
+            name: "E2E Rig".into(),
         },
         session::PresetEntry {
             slot: 401,
-            name: "E2E Target 1".into(),
+            name: "E2E Pedalboard".into(),
         },
         session::PresetEntry {
             slot: 402,
-            name: "E2E Target 2".into(),
+            name: "E2E Edge".into(),
         },
         session::PresetEntry {
             slot: 403,
-            name: "E2E Realistic".into(),
+            name: "E2E Parallel".into(),
         },
         session::PresetEntry {
             slot: 404,
@@ -486,7 +486,7 @@ async fn e2e_clear_strays(state: State<'_, AppState>) -> Result<usize, String> {
 /// the empty state. SAFETY: refuses unless the slot currently holds `expect_name` (read in
 /// the same session) — so a wrong index can never clear a real preset — and, ONLINE, also
 /// requires the seed's fixture content marker (a name is not ownership: a user preset
-/// coincidentally named "E2E Target 1" must never be cleared; fail-closed). Offline the
+/// coincidentally named "E2E Pedalboard" must never be cleared; fail-closed). Offline the
 /// marker check is skipped — SimDevice state is disposable and serves no field-8 bodies.
 #[cfg(feature = "e2e")]
 #[tauri::command]

@@ -4,13 +4,20 @@ import {
   clearScenario,
   ensureScenario,
   expectReampBalanced,
+  pickBaseTarget,
   reampCounters,
   reampOff,
+  selectBaseOnly,
 } from "../fixtures/scenario";
 
 // Level scenarios — run identically offline (fake re-amp) and online (real re-amp).
-// SCENARIO[0] "E2E Reference" has BOTH footswitch scenes AND block-acting footswitches
-// (and an amp); SCENARIO[1]/[2] "E2E Target 1/2" are PLAIN (no scenes, no footswitches).
+// SCENARIO[0] "E2E Rig" has BOTH footswitch scenes AND block-acting footswitches (and an
+// amp flip). None of the six rebuilt fixtures is Base-only any more (see
+// e2e/fixtures/COVERAGE.md) — SCENARIO[1]/[2] ("E2E Pedalboard"/"E2E Edge") now carry
+// footswitches/scenes of their own, so the first test below selects each preset's Base
+// row EXPLICITLY (never the whole-preset tick) to keep one selected row per preset — the
+// `data-pick="target:NAME"]` trigger is shared by every selected row of a preset, and a
+// whole-preset tick on a footswitch/scene-bearing fixture would collide.
 // Loudness accuracy is the device's job; these prove the multi-preset, per-preset-target
 // flow AND the base+scene+footswitch flow end to end through the real backend.
 test.describe("Level — plain presets + a scenes-and-footswitches preset", () => {
@@ -29,7 +36,7 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await page.close();
   });
 
-  test("levels two PLAIN presets to different targets, end to end", async ({
+  test("levels two presets' Base to different targets, end to end", async ({
     page,
   }) => {
     await ensureScenario(page);
@@ -41,16 +48,15 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
       timeout: 20_000,
     });
 
-    // Target 1 + Target 2 are PLAIN (no scenes, no footswitches), so the whole-preset
-    // CHECKBOX selects exactly their Base — the simplest, most common preset shape. The
-    // filter narrows the list to each in turn; the selection persists across filters.
-    const filter = page.getByPlaceholder(/Filter by name or slot/i);
-    const plain = [SCENARIO[1], SCENARIO[2]];
-    for (const p of plain) {
-      await filter.fill(p.name);
-      await page.getByTitle("Select preset to level").first().click();
+    // Select each preset's Base row explicitly (expand → tick "Base Preset") so exactly
+    // ONE row per preset is selected — both now carry footswitches/scenes of their own,
+    // so a whole-preset tick would sweep those in too and collide on the shared
+    // `data-pick="target:NAME"]` trigger below. The filter narrows the list to each in
+    // turn; the selection persists across filters.
+    const presets = [SCENARIO[1], SCENARIO[2]];
+    for (const p of presets) {
+      await selectBaseOnly(page, p.name);
     }
-    await filter.fill("");
 
     await page.getByRole("button", { name: /Level 2 preset/ }).click();
 
@@ -58,15 +64,14 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     // commit (there is no separate Back-up step).
     await page.getByText(/I.ve backed up with Pro Control/i).click();
 
-    // Two DIFFERENT per-preset targets (each plain preset = one Base row → its
-    // `target:NAME` trigger is unique, no collision).
+    // Two DIFFERENT per-preset targets (each preset has exactly one selected row — its
+    // Base — so its `target:NAME` trigger is unique, no collision).
     const targets = [
       { name: SCENARIO[1].name, label: "Crunch" },
       { name: SCENARIO[2].name, label: "Lead" },
     ];
     for (const { name, label } of targets) {
-      await page.locator(`[data-pick="target:${name}"]`).click();
-      await page.getByText(new RegExp(label)).click();
+      await pickBaseTarget(page, name, label);
     }
     // The picks must actually BIND — assert each row's trigger now reads its target
     // (guards a silent display-vs-value no-op the always-solving fake re-amp would hide).
@@ -86,8 +91,10 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await expectReampBalanced(page, reampBase);
   });
 
-  // The mandatory "both scenes and footswitches" case: E2E Reference carries a Base, 2
-  // footswitch SCENES (Rhythm/Lead, amp outputLevel) AND block-acting FOOTSWITCHES. Ticking
+  // COVERAGE row 1 — base presetLevel solve (indirect: 400's base solving is a
+  // precondition of this run, not asserted in isolation).
+  // The mandatory "both scenes and footswitches" case: E2E Rig carries a Base, 4
+  // footswitch SCENES (amp outputLevel, incl. an amp flip) AND block-acting FOOTSWITCHES. Ticking
   // the whole preset sweeps in ALL of them, so the run exercises base (level_preset) +
   // scene (level_scenes_apply_batched) + footswitch (level_footswitches_apply, VERIFY
   // mode by default — measures ON/OFF delta, writes nothing) leveling in one preset.
@@ -108,7 +115,7 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     });
 
     const filter = page.getByPlaceholder(/Filter by name or slot/i);
-    await filter.fill(SCENARIO[0].name); // E2E Reference
+    await filter.fill(SCENARIO[0].name); // E2E Rig
 
     // Reveal its children (Base + scene rows + footswitch rows), then tick the WHOLE
     // preset → every child selected.
@@ -148,6 +155,7 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await expectReampBalanced(page, reampBase);
   });
 
+  // COVERAGE row 37 — scene wipe / bake / conformance oracle.
   // BUG→GATE (2026-07-27 report — the corruption-class preset's SHAPE). SCENARIO[4]
   // "E2E Hiwatt 3S" is a real unit's preset: 3 tone scenes + a 4th literally named
   // "Base Scene" (a real overlay, NOT the base sentinel) and 4 block-acting footswitches,

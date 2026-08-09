@@ -34,6 +34,7 @@ import { useSceneHandles } from "../level/useSceneHandles";
 import {
   defaultParamIndex,
   instCalState,
+  setupRowHookKey,
   targetFromCandidate,
   verifyFootswitchTarget,
 } from "../level/leveling";
@@ -575,6 +576,7 @@ export function SetupBody({
               return (
                 <PresetOptionRow
                   key={o.key}
+                  setupRowKey={setupRowHookKey(o)}
                   name={nameLabel}
                   tag={tag ?? undefined}
                   isBase={o.isBase}

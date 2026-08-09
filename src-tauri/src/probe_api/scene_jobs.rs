@@ -15,25 +15,33 @@ pub(crate) fn is_amp_category(category: &str) -> bool {
     )
 }
 
+/// Collect catalog block ids from `tmp-model-guide.json` whose `category` satisfies
+/// `is_match`. Shared by `amp_model_ids` (amp categories, cached behind its own
+/// `OnceLock`) and `fixture_gates::cab_model_ids` (`"Cabinets" | "IR"`), so amp-ness
+/// and cab-ness can never disagree about what the catalog says.
+pub(crate) fn model_ids_by_category(
+    is_match: impl Fn(&str) -> bool,
+) -> std::collections::HashSet<String> {
+    let Ok(catalog) = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../src/models/tmp-model-guide.json"
+    )) else {
+        return std::collections::HashSet::new();
+    };
+    let Some(rows) = catalog.get("blocks").and_then(|v| v.as_array()) else {
+        return std::collections::HashSet::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let block_id = row.get("block_id").and_then(|v| v.as_str())?;
+            let category = row.get("category").and_then(|v| v.as_str())?;
+            is_match(category).then(|| block_id.to_string())
+        })
+        .collect()
+}
+
 pub(crate) fn amp_model_ids() -> &'static std::collections::HashSet<String> {
     static IDS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
-    IDS.get_or_init(|| {
-        let Ok(catalog) = serde_json::from_str::<serde_json::Value>(include_str!(
-            "../../../src/models/tmp-model-guide.json"
-        )) else {
-            return std::collections::HashSet::new();
-        };
-        let Some(rows) = catalog.get("blocks").and_then(|v| v.as_array()) else {
-            return std::collections::HashSet::new();
-        };
-        rows.iter()
-            .filter_map(|row| {
-                let block_id = row.get("block_id").and_then(|v| v.as_str())?;
-                let category = row.get("category").and_then(|v| v.as_str())?;
-                is_amp_category(category).then(|| block_id.to_string())
-            })
-            .collect()
-    })
+    IDS.get_or_init(|| model_ids_by_category(is_amp_category))
 }
 
 /// Collapse a device FenderId's cab/IR/convolution suffixes, testing `contains`
@@ -50,14 +58,19 @@ pub(crate) fn amp_model_ids() -> &'static std::collections::HashSet<String> {
 /// Shared by `is_amp_model_id` (catalog amp classification) and
 /// `param_class::classify` (block-scoped parameter overrides) so the one
 /// suffix-collapse rule can't drift between the two call sites.
+/// Device FenderId cab/IR/convolution suffixes, in strip-priority order — shared by
+/// `resolve_base_id` (repeated strip-and-check) and `bakes_in_a_cab` (a single suffix
+/// scan). "CabIRConvRvb" is deliberately absent: it already ends in "ConvRvb", so it is
+/// unreachable in an `any(ends_with)` scan.
+const CAB_SUFFIXES: [&str; 5] = ["ConvRvb", "CabIR", "NoCab", "Cab", "IR"];
+
 pub(crate) fn resolve_base_id(model_id: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
-    const SUFFIXES: [&str; 5] = ["ConvRvb", "CabIR", "NoCab", "Cab", "IR"];
     let mut m = model_id;
     loop {
         if contains(m) {
             return Some(m.to_string());
         }
-        match SUFFIXES.iter().find_map(|s| m.strip_suffix(s)) {
+        match CAB_SUFFIXES.iter().find_map(|s| m.strip_suffix(s)) {
             Some(next) => m = next,
             None => {
                 if m.ends_with("NoFx") {
@@ -68,6 +81,21 @@ pub(crate) fn resolve_base_id(model_id: &str, contains: impl Fn(&str) -> bool) -
             }
         }
     }
+}
+
+/// Does this device FenderId carry its cabinet BAKED IN (a combo / amp+cab-merged
+/// model)? The device spells those with a cab/IR suffix on the bare amp id
+/// (`ACD_DeluxeReverb65BlondeVibratoNoFx` → `…NoFxCabIR`). `NoCab` is the explicit
+/// OPPOSITE and must never match, even though it ends in "Cab" — checked FIRST, before
+/// the shared suffix scan below. Used by `fixture_gates`' cab rule
+/// (`e2e::every_guitar_amp_in_every_fixture_reaches_a_cab`'s `is_cab_merged_amp`) — its
+/// only caller today, hence `#[cfg(test)]` (avoids a dead-code lint on a plain lib build).
+#[cfg(test)]
+pub(crate) fn bakes_in_a_cab(model_id: &str) -> bool {
+    if model_id.ends_with("NoCab") {
+        return false;
+    }
+    CAB_SUFFIXES.iter().any(|s| model_id.ends_with(s))
 }
 
 pub(crate) fn is_amp_model_id(model_id: &str) -> bool {

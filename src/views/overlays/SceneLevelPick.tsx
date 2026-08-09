@@ -102,6 +102,7 @@ export function SceneLevelPick({
     return (
       <BlockParamRow
         key={`${c.nodeId}:${c.parameterId}`}
+        pickKey={`${c.nodeId}:${c.parameterId}`}
         art={blockArtTile(c.fenderId)}
         paramLabel={paramLabel(c.parameterId)}
         selected={on}

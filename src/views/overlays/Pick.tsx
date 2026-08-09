@@ -36,7 +36,12 @@ export interface PickProps {
    *  the apply-to-all value (not yet overridden). */
   muted?: boolean;
   /** e2e hook: stable `data-pick` selector on the trigger (e.g. `target:E2E P400`) so a
-   *  test can open a specific row's picker without relying on portal layout. */
+   *  test can open a specific row's picker without relying on portal layout. Each option
+   *  row also carries `data-pick-option="<tid>:<option.id>"` once the menu is open — a
+   *  text-based option match (`getByText(label,{exact:true})`) breaks once TWO rows are
+   *  bound to option text that's ALSO the trigger's own closed-state label (e.g. two
+   *  presets both already showing "Lead"); the attribute selector has no such collision
+   *  and doesn't depend on DOM append order. */
   tid?: string;
 }
 
@@ -78,6 +83,7 @@ export function Pick({
     return (
       <div
         key={o.id}
+        data-pick-option={tid ? `${tid}:${o.id}` : undefined}
         onClick={(e) => {
           e.stopPropagation();
           pick(o.id);

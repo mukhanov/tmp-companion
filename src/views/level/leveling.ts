@@ -288,6 +288,28 @@ export interface SetupOption {
   sceneHandle?: SceneHandlePick | null;
 }
 
+/** The e2e-hook identity for a setup row (`PresetOptionRow`'s `data-setup-row`) —
+ *  DELIBERATELY DISTINCT from `SetupOption.key` (the SELECTION key: `sel`/`rows` Map
+ *  lookups and the React list key, unchanged by this function). A footswitch's `key`
+ *  is `fswKey`'s POSITION within the levelable-filtered footswitch list, so a fixture
+ *  edit that adds/removes an earlier switch's level candidate silently shifts every
+ *  LATER switch's position — and hence a spec's `f<slot>:<i>` selector, with no
+ *  signal that it now points at a different row. The hook instead names the row by
+ *  the DEVICE SWITCH NUMBER (`FootswitchTarget.switchIndex`, sourced from
+ *  `FootswitchInfo.switch` — see `footswitchTarget`), which is stable under any
+ *  filtered-list reshuffle. A scene row's hook stays `s<slot>:<sceneSlot>`:
+ *  `sceneSlot` is already the wire `scenes[]` index (`chosenFrom`'s "the row index IS
+ *  the 0-based wire sceneSlot"), i.e. already an IDENTITY, not a filtered-list
+ *  position, so it needs no translation. Base rows keep `p<slot>` (nothing to
+ *  disambiguate). */
+export function setupRowHookKey(o: SetupOption): string {
+  if (o.footswitch != null) {
+    return `f${String(o.slot)}:sw${String(o.footswitch.switchIndex)}`;
+  }
+  if (o.sceneSlot != null) return sceneKeyOf(o.slot, o.sceneSlot);
+  return baseKey(o.slot);
+}
+
 /** A chosen setup row + its resolved instrument id and target name (the setup
  *  dialog emits one per option on "Level"; the flow turns each into a RunItem). */
 export interface SetupChoice {
