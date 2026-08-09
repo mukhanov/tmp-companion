@@ -39,6 +39,11 @@ test.describe("Doctor — select, check, results", () => {
   test("checks three presets end to end and lands on Results", async ({
     page,
   }) => {
+    // ~29 real sounds across the three intact fixtures (E2E Rig + Pedalboard + Edge, base +
+    // scenes + footswitches) at ~12-18 s/capture online, plus the pristine-check reseed and
+    // backup scan before the run even starts — worst case ≈ 900 s, matching the terminal
+    // wait below; the budget here adds headroom on top.
+    test.setTimeout(1_200_000);
     await ensureScenario(page);
     const reampBase = await reampCounters(page);
 
@@ -67,11 +72,17 @@ test.describe("Doctor — select, check, results", () => {
     // Set up: keep the defaults, run.
     await page.getByRole("button", { name: /Run check on \d+ sounds/ }).click();
 
-    // The run auto-advances to Results on a natural finish. Progress events don't
-    // stream over the bridge, so the only signal is the terminal Results page.
+    // The run auto-advances to Results on a natural finish. Progress events don't stream
+    // over the bridge, so the only signal is the terminal Results page — but a rejected run
+    // (backend/IPC failure) renders LoadErrorPane's "The check couldn't finish: …" within
+    // seconds instead (DoctorView.tsx). The error pane is a fast-fail: match it in the wait
+    // so a dropped device reports in seconds, then assert it wasn't the branch we took.
     await expect(
-      page.getByText(/presets? need a look|All clear/).first(),
-    ).toBeVisible({ timeout: 240_000 });
+      page
+        .getByText(/presets? need a look|All clear|check couldn.t finish/)
+        .first(),
+    ).toBeVisible({ timeout: 900_000 });
+    await expect(page.getByText(/check couldn.t finish/)).toHaveCount(0);
 
     // The default "Needs a look" filter HIDES fully-clean presets (DoctorResults
     // `shown`), so flip to "Everything" first when the filter strip is present (it
@@ -124,7 +135,10 @@ test.describe("Doctor — select, check, results", () => {
     //    (2.5–2.7 kHz all map log-nearest to the 2 kHz band; the chain owns a
     //    parametric EQ, so the Rx is the point-at-your-EQ advisory).
     if (await isOnline(page)) {
-      const ringChip = /^Rings at 2\.\d kHz$/;
+      // Hedged accepted too: severity < 1.0 renders "Possible Rings at N kHz" via
+      // possibleLabel() (severity.ts), and TubeScreamer-engaged Edge rows can erode the
+      // margin into hedge territory — a hedged detection is still a detection.
+      const ringChip = /^(?:Possible )?Rings at 2\.\d kHz$/;
       const edgeCard = page.locator(`[data-preset-card="${picked[2].name}"]`);
       for (const p of [picked[0], picked[1]]) {
         const card = page.locator(`[data-preset-card="${p.name}"]`);

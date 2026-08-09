@@ -105,6 +105,11 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
   test("levels a preset with base + scenes + footswitches end to end", async ({
     page,
   }) => {
+    // ~18-23 re-amp captures (E2E Rig base + all scenes + all footswitches) plus up to two
+    // `ensure_fresh_load` commit-window stalls (COMMIT_WINDOW_SECS = 150 s each, danger.md)
+    // if a same-slot load races a prior save — worst case ≈ 1200 s, matching the terminal
+    // wait below; the budget here adds headroom on top.
+    test.setTimeout(1_500_000);
     await ensureScenario(page);
     const reampBase = await reampCounters(page);
 
@@ -150,7 +155,7 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await page.getByRole("button", { name: /Level \d+ sound/ }).click();
     await expect(
       page.getByRole("button", { name: /^(Done|Accept)$/ }),
-    ).toBeVisible({ timeout: 240_000 });
+    ).toBeVisible({ timeout: 1_200_000 });
 
     await expectReampBalanced(page, reampBase);
   });

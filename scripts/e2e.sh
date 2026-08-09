@@ -510,7 +510,10 @@ for s in "${SPECS[@]}"; do
   fi
   first=0
   log "running specs/$s.spec.ts (online)"
-  # No outer timeout: Playwright's own 300 s/test governs; a short wrapper would kill it mid-run.
+  # No outer timeout: Playwright's own 300 s/test governs, except the two full-fixture
+  # end-to-end tests (doctor.spec.ts, level.spec.ts) which override to 20/25 min via their
+  # own test.setTimeout — so a hung spec fails forward in up to ~25 min, not 5. A short
+  # wrapper here would kill any of them mid-run.
   if bunx playwright test --config "$ONLINE_CFG" "specs/$s.spec.ts"; then
     log "specs/$s.spec.ts PASSED"
   else
