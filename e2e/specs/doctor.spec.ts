@@ -9,9 +9,10 @@ import {
   reampOff,
 } from "../fixtures/scenario";
 
-// Doctor journey — runs identically offline (fake re-amp: the "capture" is the raw
-// stimulus, so every sound measures finite and identical) and online (real re-amp
-// captures, ~15 s/sound). The oracle is the FLOW: select → set up → run →
+// Doctor journey — runs identically offline (fake re-amp: the sim's physics model
+// scales the stimulus by each sound's sidecar C, so every sound measures finite —
+// levels differ per scene, spectra don't) and online (real re-amp captures,
+// ~15 s/sound). The oracle is the FLOW: select → set up → run →
 // auto-advance → a Results page that renders every checked preset with either
 // diagnosis cards or "All clear". Diagnosis CONTENT is sound-dependent, so the spec
 // never asserts a specific tag; the prescription-content regressions (existing-comp
@@ -157,13 +158,23 @@ test.describe("Doctor — select, check, results", () => {
       expect(edgeRowCount).toBeGreaterThanOrEqual(9);
       await expect(edgeCard.getByText(ringChip)).toHaveCount(edgeRowCount);
 
-      await page.getByText(picked[2].name).last().click();
+      // Click the ROW HEADER's label, scoped inside a [data-sound-row] — a bare
+      // page-wide getByText(name).last() resolves into the "Level jumps" advisory
+      // panel below the rows (its body text repeats "E2E Edge · SCREAMER"), which
+      // expands nothing (HW run 2026-08-09). The panel renders wherever authored
+      // scene deltas exceed the 3 dB jump threshold — in BOTH tiers (the offline
+      // sim models per-scene C from scenario-loudness.json), so it is a permanent
+      // feature of intact-Edge results. Keep the click on the label INSIDE the
+      // header: the toggle handler lives on the inner header div, and once the row
+      // is open the outer [data-sound-row]'s center lands in the expanded body.
+      const edgeRingRow = edgeCard.locator("[data-sound-row]").first();
+      await edgeRingRow.getByText(picked[2].name).first().click();
       await expect(
         page.getByText(/Rings at 2\.\d kHz — cut the 2 kHz band/).first(),
       ).toBeVisible();
       // Collapse the defect row again so the cut-through assertion below can only
       // resolve against picked[1]'s freshly expanded row, never this one.
-      await page.getByText(picked[2].name).last().click();
+      await edgeRingRow.getByText(picked[2].name).first().click();
       await expect(
         page.getByText(/Rings at 2\.\d kHz — cut the 2 kHz band/),
       ).toHaveCount(0);
@@ -171,10 +182,16 @@ test.describe("Doctor — select, check, results", () => {
 
     // Expanding any measured sound row surfaces the cut-through estimate —
     // `cutThrough` is non-null for every successful guitar capture, so this is
-    // deterministic (unlike diagnosis content, which stays unasserted). A plain
-    // preset's base row is labeled with the preset name, so the LAST match is
-    // the clickable sound row (the first is the card header).
-    await page.getByText(picked[1].name).last().click();
+    // deterministic (unlike diagnosis content, which stays unasserted). Scope the
+    // click inside the card's first [data-sound-row] header — a page-wide
+    // getByText(name) can resolve into advisory-panel body text (see the Edge
+    // ring-row click above for the incident).
+    await page
+      .locator(`[data-preset-card="${picked[1].name}"] [data-sound-row]`)
+      .first()
+      .getByText(picked[1].name)
+      .first()
+      .click();
     await expect(
       page.getByText("Cut-through (estimated)").first(),
     ).toBeVisible();
@@ -192,13 +209,13 @@ test.describe("Doctor — select, check, results", () => {
   //
   // MATRIX MISMATCH (row 35, the SNR "some checks skipped" badge): COVERAGE.md lists it
   // Offline, on the premise that 402's "Quiet" scene (sidecar C=-48) reads quiet enough
-  // offline to trip the coverage gate the same way the Level tab's sidecar-authored physics
-  // model does. Empirically it doesn't — HW-verified via this file's own header comment
-  // ("offline... every sound measures finite and identical") and confirmed by an actual
-  // offline run here: 402's Quiet scene renders a normal diagnosis ("Gets lost in the mix"),
-  // no coverage-gated badge. Doctor's offline capture path does not read
-  // scenario-loudness.json's C table the way `leveller`'s does — this row is backend/online
-  // only until (if ever) Doctor's offline fake is wired to that model too.
+  // offline to trip the coverage gate. Empirically it doesn't — an actual offline run
+  // here renders a normal diagnosis on the Quiet scene ("Gets lost in the mix"), no
+  // coverage-gated badge. The cause is NOT a missing C model (the offline capture DOES
+  // ride scenario-loudness.json via the same audio::reamp_capture seam): coverage
+  // compares the body PSD against the SAME capture's pre-onset floor, and the offline
+  // scale_stimulus scales body and preamble uniformly, so coverage is level-invariant
+  // offline however quiet the scene. This row is backend/online only.
   test("400 surfaces its two leveling-damage advisories (backup-scan-only, zero captures)", async ({
     page,
   }) => {
