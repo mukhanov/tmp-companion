@@ -260,7 +260,7 @@ esac
 gap
 
 # ── 2. import ─────────────────────────────────────────────────────────────────────
-log "[2] importing $PRESET_FILE → list index $SLOT…"
+log "[2] importing $PRESET_FILE → list index ${SLOT}…"
 run_probe --import-file "$PRESET_FILE" "$SLOT" >"$OUT_DIR/import.log" 2>&1 \
   || { err "import failed (see $OUT_DIR/import.log) — the slot may be occupied; pick a free scratch index or clear it first"; exit 1; }
 ok "imported (see $OUT_DIR/import.log)"
@@ -271,15 +271,16 @@ gap
 log "[3] confirm read (probe --slot-json $((SLOT + 1)))…"
 run_probe --slot-json "$((SLOT + 1))" >"$OUT_DIR/slot.json" 2>"$OUT_DIR/slot-json.log" \
   || { err "confirm read failed (see $OUT_DIR/slot-json.log)"; exit 1; }
-# Prefer `jq -r .info.name` (precise — the preset JSON can carry other "name" fields at
-# other nesting levels, e.g. per-block names). Fall back to a first-match sed scan if jq
+# Prefer `jq -r .info.displayName` (the preset's user-visible name — `info` carries no
+# bare "name" field; fw 1.8.45's info keys are author/created_at/displayName/preset_id/
+# product_id/source_id/timestamp/version). Fall back to a first-match sed scan if jq
 # isn't present; a WRONG name here only makes the final `--clear` guard refuse (safe), it
 # can never make it clear the wrong thing — `--clear`'s own expect-name check is the
 # actual safety backstop, this is just aiming it correctly.
 if command -v jq >/dev/null 2>&1; then
-  CONFIRMED_NAME="$(jq -r '.info.name // empty' "$OUT_DIR/slot.json" 2>/dev/null)"
+  CONFIRMED_NAME="$(jq -r '.info.displayName // empty' "$OUT_DIR/slot.json" 2>/dev/null)"
 else
-  CONFIRMED_NAME="$(sed -n 's/.*"name" *: *"\([^"]*\)".*/\1/p' "$OUT_DIR/slot.json" | head -1)"
+  CONFIRMED_NAME="$(sed -n 's/.*"displayName" *: *"\([^"]*\)".*/\1/p' "$OUT_DIR/slot.json" | head -1)"
 fi
 [ -n "$CONFIRMED_NAME" ] || { err "could not read the imported preset's name from $OUT_DIR/slot.json — refusing to proceed (no safe name to guard the later clear with)"; exit 1; }
 ok "confirmed slot $SLOT holds \"$CONFIRMED_NAME\""
@@ -299,7 +300,11 @@ cat "$OUT_DIR/level-base.log"
 gap
 
 # ── 4b. level scenes (opt-in via --scene-target) ─────────────────────────────────
-if [ -n "$SCENE_TARGET" ]; then
+# Gated on 4a's $FAILED like steps 5/6: after a failed base level the preset is in an
+# unknown state, and every scene/footswitch pass below is a real re-amp engage + save.
+if [ "$FAILED" -ne 0 ]; then
+  log "[4b] skipping scene leveling — the base leveling step already failed above"
+elif [ -n "$SCENE_TARGET" ]; then
   log "[4b] leveling FS scenes → default $SCENE_TARGET LUFS (${#SCENE_OVERRIDES[@]} override(s))…"
   set -- --level-preset-scenes "$SLOT" "$SCENE_TARGET" "$TOPOLOGY" 1
   for ov in "${SCENE_OVERRIDES[@]:-}"; do
@@ -310,12 +315,38 @@ if [ -n "$SCENE_TARGET" ]; then
     || { err "scene leveling failed (see $OUT_DIR/level-scenes.log)"; FAILED=1; }
   cat "$OUT_DIR/level-scenes.log"
   gap
+  # Honest-count gate: the enumeration must see every scene the SOURCE preset
+  # carries. A field-8 partial read that cuts the scene tail levels fewer scenes
+  # than exist — and a missed scene can still PASS its re-measure by coincidence
+  # of base leveling — so the count mismatch is itself a failure, independent of
+  # the per-row tolerance verdicts. (.preset = XOR-JLD compact JSON; the key is
+  # the committed PRESET_XOR_KEY constant in src-tauri/src/backup.rs.)
+  if [ "$FAILED" -eq 0 ]; then
+    SRC_SCENES="$(python3 - "$PRESET_FILE" <<'PY'
+import json, sys
+raw = open(sys.argv[1], 'rb').read()
+key = b'JLD'
+doc = json.loads(bytes(b ^ key[i % 3] for i, b in enumerate(raw)))
+print(len(doc.get('scenes', [])))
+PY
+)" || SRC_SCENES=""
+    ENUM_SCENES="$(sed -n 's/^scenes (\([0-9][0-9]*\)).*/\1/p' "$OUT_DIR/level-scenes.log" | head -1)"
+    if [ -z "$SRC_SCENES" ] || [ -z "$ENUM_SCENES" ]; then
+      err "could not compare scene counts (source='$SRC_SCENES' enumerated='$ENUM_SCENES')"; FAILED=1
+    elif [ "$ENUM_SCENES" -ne "$SRC_SCENES" ]; then
+      err "scene enumeration saw $ENUM_SCENES scene(s) but the source preset has $SRC_SCENES - an incomplete read leveled fewer scenes than exist"; FAILED=1
+    else
+      log "[4b] scene count check: enumerated $ENUM_SCENES == source $SRC_SCENES"
+    fi
+  fi
 else
   log "[4b] no --scene-target given — skipping scene leveling"
 fi
 
 # ── 4c. level footswitches (opt-in, repeatable --footswitch SW:G:N:P:T) ─────────────
-if [ "${#FOOTSWITCHES[@]}" -gt 0 ]; then
+if [ "$FAILED" -ne 0 ]; then
+  log "[4c] skipping footswitch leveling — a leveling step already failed above"
+elif [ "${#FOOTSWITCHES[@]}" -gt 0 ]; then
   for fs in "${FOOTSWITCHES[@]}"; do
     sw="${fs%%:*}"; rest="${fs#*:}"
     grp="${rest%%:*}"; rest="${rest#*:}"

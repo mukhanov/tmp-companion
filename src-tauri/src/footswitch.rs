@@ -823,6 +823,32 @@ pub fn scene_fs_map(ftsw: &Value) -> std::collections::HashMap<u32, u32> {
     map
 }
 
+/// The highest `scenes[]` index the document REFERENCES elsewhere: `lastLoadedScene` plus
+/// every footswitch scene assignment (base — `session::BASE_SCENE_SLOT` — is not an index and
+/// is excluded). A `scenes` array shorter than this is a TRUNCATED read, not a preset with
+/// fewer scenes: the tolerant parse drops the cut entries and the array length alone can't
+/// tell the two apart. Both references sit BEFORE `scenes` in the document (HW field-8 order:
+/// `ftsw`, `lastLoadedScene`, `scenes`), so a tail cut that shortens `scenes` always leaves
+/// this evidence intact.
+///
+/// ponytail: a scene bound to NO footswitch and not the last-loaded one is unreferenced, so a
+/// cut that takes only such scenes is undetectable. Upgrade path if that matters: thread
+/// `session::scene_names_from_slot_json`'s count (it recovers names from a cut document) out
+/// of `read_slot_preset_parsed`, which already computes and discards it.
+pub(crate) fn max_referenced_scene(preset: &Value) -> Option<u32> {
+    let switch_scenes = preset.get("ftsw").map(scene_fs_map).unwrap_or_default();
+    switch_scenes
+        .into_keys()
+        .chain(
+            preset
+                .get("lastLoadedScene")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+        )
+        .filter(|s| *s < crate::session::BASE_SCENE_SLOT)
+        .max()
+}
+
 /// Overwrite the preset's footswitch layout (`ftsw`). Preset metadata untouched.
 pub fn apply_ftsw(preset: &mut Value, ftsw: Value) -> Result<(), String> {
     let obj = preset.as_object_mut().ok_or("preset is not an object")?;

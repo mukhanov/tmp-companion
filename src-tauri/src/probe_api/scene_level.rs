@@ -7,7 +7,14 @@ use super::stimulus::probe_stimulus_path;
 use super::stimulus::read_stimulus_calibrated;
 use crate::audio;
 use crate::leveller;
-use crate::read_preset_scenes_fresh;
+// Every scene-leveling entry point below ENUMERATES scenes via the complete-JSON
+// fallback (`read_preset_scenes_complete`), not the raw field-8 partial: the scene-tail
+// cut is per-slot-deterministic (notes/gotchas.md's field-8 entry) and a probe run that
+// levels off a truncated scene list silently mislevels or drops a scene. Enumeration
+// only — overlay classification (`scene_jobs::read_saved_preset`) still reads the raw
+// partial, so a tail scene past the cut gets an honest `SceneOverlay::Unknown` refusal
+// rather than a silent skip.
+use crate::read_preset_scenes_complete;
 use crate::scenes;
 use crate::session;
 use crate::session::Session;
@@ -63,7 +70,7 @@ pub fn probe_measure_scene_levels(list_index: u32, topology_id: String) -> Resul
         .ok()
         .and_then(|v| v.parse::<f32>().ok());
     let stim = read_stimulus_calibrated(&stim_path, cal)?;
-    let scenes = read_preset_scenes_fresh(list_index)?;
+    let scenes = read_preset_scenes_complete(list_index)?;
     let mut slots: Vec<(u32, String)> = scenes
         .scenes
         .iter()
@@ -143,7 +150,7 @@ pub fn probe_level_preset_scenes(
     );
 
     // 1) scene names (field-8 read; 1.8.45-safe).
-    let scenes = read_preset_scenes_fresh(list_index)?;
+    let scenes = read_preset_scenes_complete(list_index)?;
     out += &format!("scenes ({}): {:?}\n", scenes.scenes.len(), scenes.scenes);
 
     // 2) Base → presetLevel FIRST (a "base"/"BASE" override targets it).
@@ -270,7 +277,7 @@ pub fn probe_level_preset_scenes(
 /// the scene's loudness is governed by that amp or by something else (the other amp,
 /// a post-amp boost, a delay/IR `level`). No writes, no re-amp.
 pub fn probe_scene_amp_diag(list_index: u32) -> Result<String, String> {
-    let scenes = read_preset_scenes_fresh(list_index)?;
+    let scenes = read_preset_scenes_complete(list_index)?;
     let amp_cands = load_and_filter_amp_candidates(list_index)?;
     let mut all_slots: Vec<u32> = (0..scenes.scenes.len() as u32).collect();
     all_slots.push(session::BASE_SCENE_SLOT);
@@ -558,7 +565,7 @@ pub fn probe_jointk_scenes(
             .unwrap_or(default_target)
     };
 
-    let scenes = read_preset_scenes_fresh(list_index)?;
+    let scenes = read_preset_scenes_complete(list_index)?;
     let candidates = load_and_filter_amp_candidates(list_index)?;
     let mut out = format!(
         "=== jointk-scenes repro · preset idx {list_index} · default {default_target} · save={save} ===\n\
@@ -653,7 +660,7 @@ pub fn probe_redistribute(
         return Err("target + worst-deficit must be finite".to_string());
     }
     let stim = read_stimulus_calibrated(&probe_stimulus_path(&topology_id)?, None)?;
-    let scenes = read_preset_scenes_fresh(list_index)?;
+    let scenes = read_preset_scenes_complete(list_index)?;
     let candidates = load_and_filter_amp_candidates(list_index)?;
     // Base (wire slot 8) + every FS scene (0..N).
     let mut slots: Vec<u32> = vec![session::BASE_SCENE_SLOT];
