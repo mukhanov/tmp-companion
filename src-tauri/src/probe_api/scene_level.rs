@@ -190,8 +190,15 @@ pub fn probe_level_preset_scenes(
     out += &format!("amp candidates: {}\n", candidates.len());
 
     // 3b) ONE un-engaged pre-pass over every FS scene → pick each scene's active amp.
+    // The field-3 harvest can flake batch-wide (a lean/stale session yields docs with
+    // no routing template, HW-observed: every scene then skips as "can't classify").
+    // Routing is scene-invariant, so mirror production and the batched sibling below:
+    // read the SAVED field-8 doc and pass it as `build_scene_jobs`' fallback template
+    // source (`read_saved_preset`'s gap contract: the caller sleeps RECONNECT_GAP_MS).
     let all_slots: Vec<u32> = (0..scenes.scenes.len() as u32).collect();
     let (docs, _) = prepass_scene_docs(list_index, &all_slots)?;
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    let saved = super::scene_jobs::read_saved_preset(list_index);
 
     // 3c) ONE-SHOT open-loop per scene on the active amp `outputLevel`. HW-verified:
     //     captured_LUFS = 20*log10(outputLevel) + C is LINEAR with ~25 LU authority, so
@@ -203,25 +210,35 @@ pub fn probe_level_preset_scenes(
     for slot in all_slots {
         let name = scenes.scenes[slot as usize].clone();
         let target = resolve(&name);
-        // active amp for this scene (first un-bypassed amp outputLevel)
-        let knob = match build_scene_jobs(&[slot], &candidates, &docs, target, None)
-            .ok()
-            .and_then(|j| j.into_iter().next())
-            .and_then(|j| j.knobs.into_iter().next())
-            .map(|kt| kt.knob)
-        {
-            Some(leveller::LevelKnob::Block {
-                group_id,
-                node_id,
-                parameter_id,
-                ..
-            }) => (group_id, node_id, parameter_id),
-            _ => {
-                out += &format!("FS[{slot}] {name:<18} [SKIP: no active amp outputLevel]\n");
+        // The scene's active-amp outputLevel (flow-ordered — the classifier picks the
+        // LAST active amp). The build's Err and the job's own `skip` both carry the
+        // REASON (e.g. "no complete routing read", "no active guitar amp in scene") —
+        // print them rather than folding every failure into one generic skip, or a
+        // prepass harvest problem is indistinguishable from a genuinely knobless scene.
+        let jobs = match build_scene_jobs(&[slot], &candidates, &docs, target, saved.as_ref()) {
+            Err(reason) => {
+                out += &format!("FS[{slot}] {name:<18} [SKIP: {reason}]\n");
                 continue;
             }
+            Ok(jobs) => jobs,
         };
-        let (g, n, p) = knob;
+        let job = jobs.into_iter().next();
+        if let Some(reason) = job.as_ref().and_then(|j| j.skip.as_ref()) {
+            out += &format!("FS[{slot}] {name:<18} [SKIP: {reason}]\n");
+            continue;
+        }
+        let Some(leveller::LevelKnob::Block {
+            group_id: g,
+            node_id: n,
+            parameter_id: p,
+            ..
+        }) = job
+            .and_then(|j| j.knobs.into_iter().next())
+            .map(|kt| kt.knob)
+        else {
+            out += &format!("FS[{slot}] {name:<18} [SKIP: no active amp outputLevel]\n");
+            continue;
+        };
         // measure once at the reference outputLevel (scene-edit on for isolation)
         let measured =
             match measure_scene_knob_isolated(list_index, slot, &g, &n, &p, SCENE_REF, true, &stim)
