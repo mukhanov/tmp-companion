@@ -76,15 +76,27 @@ fn saved_bypass_map(nodes: &[doctor::DoctorNode]) -> std::collections::HashMap<S
     map
 }
 
-/// Resolve the force-bypass isolation for a diagnosed sound — one policy for
+/// What a diagnosed sound's capture must WRITE before engaging — one policy for
 /// doctor_check AND doctor_apply so the audition can never observe a different
-/// bypass state than the diagnosis. A SCENE sound always gets NO force-bypass
+/// state than the diagnosis. `bypass` is the force-bypass isolation; `params` is
+/// the measured footswitch's `param`-function engaged `valueA` writes (a footswitch
+/// SOUND is its on-off flips PLUS its param jumps — without the latter a param-only
+/// switch would capture the base sound).
+pub(crate) struct SoundIsolation {
+    pub(crate) bypass: Vec<(String, String, bool)>,
+    pub(crate) params: Vec<(String, String, String, f32)>,
+}
+
+/// Resolve the pre-engage writes for a diagnosed sound — one policy for
+/// doctor_check AND doctor_apply so the audition can never observe a different
+/// bypass/param state than the diagnosis. A SCENE sound always gets NO
 /// write, graph present or not: it rides its own saved overlay/bypass state
 /// (as-played — the scene recall itself asserts whatever the player hears),
 /// so forcing every footswitch block off here would diagnose a baseline the
 /// player never actually hears. Base/footswitch sounds keep the baseline
-/// isolation: graph present → offline derivation; graph absent → ONE cached
-/// live field-8 read per preset.
+/// isolation: graph present → offline derivation (`derived_force_bypass` +
+/// `derived_param_writes`); graph absent → ONE cached live field-8 read per
+/// preset (`doctor_force_bypass` + `param_fn_values`).
 fn resolve_sound_isolation(
     nodes: &[doctor::DoctorNode],
     footswitches: &[footswitch::FootswitchInfo],
@@ -92,12 +104,22 @@ fn resolve_sound_isolation(
     footswitch: Option<u32>,
     list_index: u32,
     preset_cache: &mut std::collections::HashMap<u32, serde_json::Value>,
-) -> Vec<(String, String, bool)> {
+) -> SoundIsolation {
     if scene.is_some() {
-        return Vec::new();
+        return SoundIsolation {
+            bypass: Vec::new(),
+            params: Vec::new(),
+        };
     }
     if !nodes.is_empty() {
-        footswitch::derived_force_bypass(footswitches, &saved_bypass_map(nodes), footswitch)
+        SoundIsolation {
+            bypass: footswitch::derived_force_bypass(
+                footswitches,
+                &saved_bypass_map(nodes),
+                footswitch,
+            ),
+            params: footswitch::derived_param_writes(footswitches, footswitch),
+        }
     } else {
         // Base/footswitch sounds fall back to the legacy live field-8 read
         // (cached per list index across that preset's base + footswitch
@@ -122,11 +144,18 @@ fn resolve_sound_isolation(
             crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
         }
         let preset = &preset_cache[&list_index];
-        doctor_force_bypass(
-            preset.get("ftsw").unwrap_or(&serde_json::Value::Null),
-            preset,
-            footswitch,
-        )
+        let ftsw = preset.get("ftsw").unwrap_or(&serde_json::Value::Null);
+        SoundIsolation {
+            bypass: doctor_force_bypass(ftsw, preset, footswitch),
+            params: footswitch
+                .map(|sw| {
+                    footswitch::param_fn_values(ftsw, sw)
+                        .into_iter()
+                        .map(|(g, n, p, a, _b)| (g, n, p, a))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 }
 
@@ -135,9 +164,10 @@ fn resolve_sound_isolation(
 /// preset, so the loop resets this to `None` (same effect as the run's start).
 struct PrevSound {
     list_index: u32,
-    /// It sent force-bypass writes (its `fb` was non-empty) — the working copy is
-    /// polluted and only a reload clears it (a scene recall re-asserts ONLY the
-    /// scene's own overrides, not the forced bypasses).
+    /// It sent working-copy writes — force-bypass isolation OR a footswitch's
+    /// param-function `valueA` jumps (`SoundIsolation`, either list non-empty).
+    /// Only a reload clears the pollution (a scene recall re-asserts ONLY the
+    /// scene's own overrides, not foreign bypasses or param values).
     wrote: bool,
 }
 
@@ -379,9 +409,10 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                     })
                 }
             };
-            // Force-bypass isolation for this sound — the shared
-            // `resolve_sound_isolation` policy (see its doc).
-            let fb = resolve_sound_isolation(
+            // Pre-engage writes for this sound (isolation bypasses + the footswitch's
+            // param-function valueA jumps) — the shared `resolve_sound_isolation`
+            // policy (see its doc).
+            let iso = resolve_sound_isolation(
                 &item.nodes,
                 &item.footswitches,
                 item.scene,
@@ -405,7 +436,8 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 let (samples, rate, stereo_loudness) = leveller::doctor_capture_with_loudness(
                     item.list_index,
                     item.scene,
-                    &fb,
+                    &iso.bypass,
+                    &iso.params,
                     stim,
                     Some(0.5),
                     tail_ms,
@@ -492,7 +524,7 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                     coverage_by_item.insert(i, cov);
                     prev = Some(PrevSound {
                         list_index: item.list_index,
-                        wrote: !fb.is_empty(),
+                        wrote: !iso.bypass.is_empty() || !iso.params.is_empty(),
                     });
                     let _ = on_result.send(DoctorProgressItem {
                         key: item.key.clone(),
@@ -999,12 +1031,13 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
         // be measured (and heard) over the space the verdicts were made in.
         let stim = leveller::doctor_stim_slice(read_stimulus_calibrated(&stim_path, calibration)?);
         let run = || -> Result<DoctorApplyResult, String> {
-            // Isolation for the diagnosed sound — the SAME `resolve_sound_isolation`
-            // policy `doctor_check` uses (one policy so the A/B can never observe
-            // a different bypass state than the diagnosis; empty `nodes` falls
-            // back to the live field-8 read). Inside `run` (unlike the stimulus read): its
-            // empty-graph fallback is a live device read the backstop must cover.
-            let fb = resolve_sound_isolation(
+            // Pre-engage writes for the diagnosed sound — the SAME
+            // `resolve_sound_isolation` policy `doctor_check` uses (one policy so the
+            // A/B can never observe a different bypass OR param state than the
+            // diagnosis; empty `nodes` falls back to the live field-8 read). Inside
+            // `run` (unlike the stimulus read): its empty-graph fallback is a live
+            // device read the backstop must cover.
+            let iso = resolve_sound_isolation(
                 &job.nodes,
                 &job.footswitches,
                 job.scene,
@@ -1045,7 +1078,8 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                     let (before, rate) = leveller::doctor_capture(
                         job.list_index,
                         job.scene,
-                        &fb,
+                        &iso.bypass,
+                        &iso.params,
                         &stim,
                         None,
                         tail_ms,
@@ -1086,8 +1120,14 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
             //     auto-restores"), and a stranded mutated buffer would let a
             //     sibling card Apply on top of it.
             let after_clip = match (|| -> Result<String, String> {
-                let (after, rate) =
-                    leveller::doctor_capture_on_session(&mut s, &fb, &stim, None, tail_ms)?;
+                let (after, rate) = leveller::doctor_capture_on_session(
+                    &mut s,
+                    &iso.bypass,
+                    &iso.params,
+                    &stim,
+                    None,
+                    tail_ms,
+                )?;
                 Ok(format!(
                     "data:audio/wav;base64,{}",
                     base64_encode(&wav_bytes(&after, rate)?)

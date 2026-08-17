@@ -186,7 +186,7 @@ pub fn probe_tail_decay(
     }
     let stim = read_stimulus_48k(stimulus_wav)?;
     let (samples, rate) =
-        leveller::doctor_capture(slot, scene, &[], &stim, Some(0.5), tail_ms, false)?;
+        leveller::doctor_capture(slot, scene, &[], &[], &stim, Some(0.5), tail_ms, false)?;
     write_wav_mono(out, &samples, rate)?;
     // The stimulus is 48 kHz by construction (`read_stimulus_48k`); `rate` is the
     // CAPTURE rate `doctor_capture` returns and need not match it — using `rate`
@@ -535,6 +535,7 @@ pub fn probe_doctor(slots: &[(u32, Option<u32>)], topology_id: &str) -> Result<S
             slot,
             scene,
             &fb,
+            &[],
             &stim,
             Some(0.5),
             u64::from(leveller::DOCTOR_TAIL_MS),

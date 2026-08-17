@@ -139,6 +139,47 @@ pub fn probe_knob_sweep(
     Ok(out)
 }
 
+/// `probe --measure-pair <listIdx> <topology> <presetLevel> <g:n:p=v>…` — P0 repro
+/// instrumentation for the headroom-trade physics: measure the captured loudness at an
+/// explicit (`presetLevel` × block-param) point on one isolated fresh re-amp capture
+/// (bundled stimulus, base recall inside `measure_pair_at`). Working-copy writes are
+/// discarded by a final reload; ends with a guaranteed re-amp OFF.
+pub fn probe_measure_pair(
+    list_index: u32,
+    topology_id: &str,
+    preset_level: f32,
+    scene: Option<u32>,
+    writes: &[(String, String, String, f32)],
+) -> Result<String, String> {
+    let stim = read_stimulus_calibrated(&super::stimulus::probe_stimulus_path(topology_id)?, None)?;
+    {
+        let mut s = Session::connect_lean()?;
+        s.load_preset(list_index)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::settle_after_load_ms(),
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    let result = leveller::measure_pair_at(scene, preset_level, writes, &stim);
+    // Discard the pair pollution, then the guaranteed OFF (bound before the `?`).
+    if let Ok(mut s) = Session::connect_lean() {
+        let _ = s.load_preset(list_index);
+    }
+    leveller::reamp_off_guaranteed("measure-pair");
+    let l = result?;
+    let wtxt: Vec<String> = writes
+        .iter()
+        .map(|(g, n, p, v)| format!("{g}/{n}.{p}={v:.4}"))
+        .collect();
+    Ok(format!(
+        "[probe --measure-pair] list_index={list_index} scene={scene:?} presetLevel={preset_level:.4} {} \
+         → integrated {:.3} LUFS  short-term-max {:.3}\n",
+        wtxt.join(" "),
+        l.integrated_lufs,
+        l.short_term_max_lufs
+    ))
+}
+
 /// `probe --scene-doc <listIdx> <scene…>` — repro instrumentation: load the preset,
 /// then recall the given scenes IN ORDER on ONE held session, harvesting the device's
 /// RENDERED field-3 doc after each recall and printing the amp/vibe param values.

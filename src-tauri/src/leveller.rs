@@ -870,6 +870,35 @@ fn capture_full_at(
     tail_ms: u64,
     skip_load: bool,
 ) -> Result<audio::Capture, String> {
+    capture_full_at_params(
+        slot,
+        scene,
+        force_bypass,
+        &[],
+        stimulus,
+        ref_level,
+        tail_ms,
+        skip_load,
+    )
+}
+
+/// [`capture_full_at`] plus `fs_params`: live param writes (a footswitch's `param`
+/// functions at their engaged `valueA`) issued AFTER the scene recall and BEFORE the
+/// isolation bypasses — `measure_fs_state`'s order, for the same reason (the recall
+/// reverts earlier unsaved writes on the session). Without these writes a footswitch
+/// sound's capture reflects only its on-off flips, so a param-function jump (level
+/// change, defect shaping) would be silently absent from the measured audio.
+#[allow(clippy::too_many_arguments)]
+fn capture_full_at_params(
+    slot: u32,
+    scene: Option<u32>,
+    force_bypass: &[(String, String, bool)],
+    fs_params: &[(String, String, String, f32)],
+    stimulus: &[f32],
+    ref_level: Option<f32>,
+    tail_ms: u64,
+    skip_load: bool,
+) -> Result<audio::Capture, String> {
     // The settles here are `sleep_abortable`: a Stop pressed anywhere in the ~1.9 s of
     // settling that brackets a capture bails immediately instead of being noticed only at
     // the next step seam. Safe to leave from any of these points — nothing is engaged or
@@ -893,6 +922,9 @@ fn capture_full_at(
     if let Some(scene) = recall {
         s.load_scene(scene)?;
         settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    }
+    for (g, n, p, v) in fs_params {
+        s.change_parameter(g, n, p, *v)?;
     }
     capture_on_session(&mut s, force_bypass, stimulus, ref_level, tail_ms)
 }
@@ -925,8 +957,12 @@ pub(crate) fn capture_on_session(
     // leaving the edit buffer's presetLevel untouched.
     if let Some(ref_level) = ref_level {
         set_knob(s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0), None)?;
-        settle_or_cancel(SETTLE_AFTER_SET_MS)?;
     }
+    // Settle UNCONDITIONALLY before the engage: the caller (or the loop above) may
+    // have just issued bypass/param writes even when `ref_level` is `None` — the
+    // Doctor apply A/B path — and `measure_fs_state` always settles after its
+    // writes for the same reason (the engage latches whatever the DSP holds).
+    settle_or_cancel(SETTLE_AFTER_SET_MS)?;
     let _ = s.set_reamp_mode(true)?;
     // Past the engage there is NO early return: re-amp is on, and leaving it on strands the
     // unit input-muted. So this settle only wakes early — `reamp_capture` then bails on its
@@ -1053,19 +1089,24 @@ pub fn capture_samples_bypassed(
 /// spectral verdicts with it. This is UNRELATED to the leveling LUFS metric,
 /// which is a 2-ch BS.1770 SUM over the un-mixed pair (`processed_lufs`) — see
 /// [`doctor_capture_with_loudness`] for the seam that gets both.
+/// `fs_params`: the measured footswitch's `param`-function `(group, node, param,
+/// valueA)` writes — empty for base/scene sounds. See `capture_full_at_params`.
+#[allow(clippy::too_many_arguments)]
 pub fn doctor_capture(
     slot: u32,
     scene: Option<u32>,
     force_bypass: &[(String, String, bool)],
+    fs_params: &[(String, String, String, f32)],
     stimulus: &[f32],
     ref_level: Option<f32>,
     tail_ms: u64,
     skip_load: bool,
 ) -> Result<(Vec<f32>, u32), String> {
-    Ok(to_stereo(capture_full_at(
+    Ok(to_stereo(capture_full_at_params(
         slot,
         scene,
         force_bypass,
+        fs_params,
         stimulus,
         ref_level,
         tail_ms,
@@ -1084,19 +1125,24 @@ pub fn doctor_capture(
 /// dev probe harness keeps the plain `doctor_capture` seam (and its legacy
 /// mono-on-mixdown `SoundProfile::integrated_lufs`) unchanged — see
 /// `SoundProfile::from_capture_with_psd_loudness`'s doc.
+/// `fs_params`: the measured footswitch's `param`-function `(group, node, param, valueA)`
+/// writes — empty for base/scene sounds. See `capture_full_at_params`.
+#[allow(clippy::too_many_arguments)]
 pub fn doctor_capture_with_loudness(
     slot: u32,
     scene: Option<u32>,
     force_bypass: &[(String, String, bool)],
+    fs_params: &[(String, String, String, f32)],
     stimulus: &[f32],
     ref_level: Option<f32>,
     tail_ms: u64,
     skip_load: bool,
 ) -> Result<(Vec<f32>, u32, lufs::Loudness), String> {
-    let cap = capture_full_at(
+    let cap = capture_full_at_params(
         slot,
         scene,
         force_bypass,
+        fs_params,
         stimulus,
         ref_level,
         tail_ms,
@@ -1162,14 +1208,23 @@ pub fn doctor_capture_current(
 /// SAME session `ops_session` just applied the prescription ops to: a fresh
 /// reconnect (what `doctor_capture_current` does) would recall the scene again,
 /// reverting those unsaved ops before this capture ever ran and silently
-/// rendering an identical AFTER clip. Stereo mixdown: see `to_stereo`.
+/// rendering an identical AFTER clip. `fs_params` re-plays the measured
+/// footswitch's `param`-function `valueA` writes on THIS session (the BEFORE
+/// capture wrote them on its own throwaway connection, so without the re-play
+/// the A/B would audition a different param state than the diagnosis) — written
+/// before the isolation bypasses, `measure_fs_state`'s order. Stereo mixdown:
+/// see `to_stereo`.
 pub fn doctor_capture_on_session(
     s: &mut Session,
     force_bypass: &[(String, String, bool)],
+    fs_params: &[(String, String, String, f32)],
     stimulus: &[f32],
     ref_level: Option<f32>,
     tail_ms: u64,
 ) -> Result<(Vec<f32>, u32), String> {
+    for (g, n, p, v) in fs_params {
+        s.change_parameter(g, n, p, *v)?;
+    }
     Ok(to_stereo(capture_on_session(
         s,
         force_bypass,
@@ -2485,6 +2540,37 @@ fn arm_measurement(
     // here bails cleanly (the same settle #128 made interruptible pre-refactor).
     settle_or_cancel(SETTLE_AFTER_SET_MS)?;
     Ok(())
+}
+
+/// One fresh-connection measurement at an explicit (`presetLevel` × block-param) POINT:
+/// base recall + presetLevel via `arm_measurement`, then each block write live on the same
+/// armed connection, one engage, measure. P0 instrumentation seam for the headroom-trade
+/// physics (presetLevel↑ / outputLevel↓ product invariance) — writes stay on the throwaway
+/// working copy; the caller reloads to discard.
+pub(crate) fn measure_pair_at(
+    scene: Option<u32>,
+    preset_level: f32,
+    writes: &[(String, String, String, f32)],
+    stimulus: &[f32],
+) -> Result<lufs::Loudness, String> {
+    let mut s = Session::connect_lean()?;
+    match scene {
+        // Base case: the shared arming seam verbatim (base recall → presetLevel →
+        // settle, the ONE tested write order — see `arm_measurement`'s doc).
+        None => arm_measurement(&mut s, &LevelKnob::PresetLevel, preset_level, &[], None)?,
+        // Scene case: the recall targets the scene instead of base; everything after
+        // mirrors the seam (recall FIRST — it reverts earlier unsaved writes).
+        Some(sc) => {
+            s.load_scene(sc)?;
+            settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+            set_knob(&mut s, &LevelKnob::PresetLevel, preset_level, None)?;
+        }
+    }
+    for (g, n, p, v) in writes {
+        s.change_parameter(g, n, p, *v)?;
+    }
+    settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    engage_measure_disengage(&mut s, stimulus)
 }
 
 /// Fresh-connect, arm the measurement (`arm_measurement`: scene context → knob → isolation),

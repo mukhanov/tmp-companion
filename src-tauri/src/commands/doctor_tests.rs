@@ -365,9 +365,60 @@ fn resolve_sound_isolation_never_writes_for_a_scene_sound() {
     let (preset, infos) = iso_ab_fixture();
     let nodes = nodes_from(&preset);
     let mut cache = std::collections::HashMap::new();
-    assert!(resolve_sound_isolation(&nodes, &infos, Some(0), None, 5, &mut cache).is_empty());
+    let iso = resolve_sound_isolation(&nodes, &infos, Some(0), None, 5, &mut cache);
+    assert!(iso.bypass.is_empty() && iso.params.is_empty());
     // Graph absent too — the pre-existing empty-nodes behavior for scenes.
-    assert!(resolve_sound_isolation(&[], &infos, Some(0), None, 5, &mut cache).is_empty());
+    let iso = resolve_sound_isolation(&[], &infos, Some(0), None, 5, &mut cache);
+    assert!(iso.bypass.is_empty() && iso.params.is_empty());
+}
+
+// --- derived_param_writes: the FS-sound param twin of the isolation parity test ---
+
+#[test]
+fn derived_param_writes_matches_the_live_engine_on_every_sound() {
+    // The param derivation exists twice (offline `FootswitchInfo` walk vs live
+    // `ftsw` JSON `param_fn_values`) exactly like the isolation split above —
+    // the two must agree on base + every switch, including the param-only
+    // switch 2 (valueA 0.9) and the on-off-only switches (no param writes).
+    let (preset, infos) = iso_ab_fixture();
+    let ftsw = &preset["ftsw"];
+    let cases: Vec<Option<u32>> = std::iter::once(None)
+        .chain(infos.iter().map(|fi| Some(fi.switch)))
+        .collect();
+    for case in cases {
+        let derived = footswitch::derived_param_writes(&infos, case);
+        let live: Vec<(String, String, String, f32)> = case
+            .map(|sw| {
+                footswitch::param_fn_values(ftsw, sw)
+                    .into_iter()
+                    .map(|(g, n, p, a, _b)| (g, n, p, a))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(derived, live, "mismatch for footswitch={case:?}");
+    }
+    // And the param-only switch actually yields its engaged write — the case the
+    // Doctor used to capture as the base sound.
+    assert_eq!(
+        footswitch::derived_param_writes(&infos, Some(2)),
+        vec![("G1".into(), "MOD".into(), "gain".into(), 0.9_f32)]
+    );
+}
+
+#[test]
+fn resolve_sound_isolation_carries_param_writes_for_a_param_only_switch() {
+    // A param-only footswitch SOUND: no on-off isolation of its own beyond the
+    // siblings, and its `params` must carry the engaged valueA — with `wrote`
+    // semantics downstream keyed on either list being non-empty.
+    let (preset, infos) = iso_ab_fixture();
+    let nodes = nodes_from(&preset);
+    let mut cache = std::collections::HashMap::new();
+    let iso = resolve_sound_isolation(&nodes, &infos, None, Some(2), 5, &mut cache);
+    assert_eq!(
+        iso.params,
+        vec![("G1".into(), "MOD".into(), "gain".into(), 0.9_f32)]
+    );
+    let _ = preset; // fixture kept alive alongside its enumerated infos
 }
 
 // --- bypass_only_conflict: fix P3-2, refuse a scene-context write that would leak to base ---

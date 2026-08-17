@@ -393,8 +393,23 @@ pub fn switch_states(ftsw: &Value, preset: &Value, switch: u32) -> SwitchStates 
     engaged_bypass.extend(own.iter().cloned());
     let mut disengaged_bypass = siblings;
     disengaged_bypass.extend(own.iter().map(|(g, n, b)| (g.clone(), n.clone(), !b)));
-    let params = ftsw
-        .as_array()
+    SwitchStates {
+        engaged_bypass,
+        disengaged_bypass,
+        params: param_fn_values(ftsw, switch),
+    }
+}
+
+/// One switch's `param` functions as `(group, node, param, valueA, valueB)`. A function
+/// missing either value is skipped (nothing to write) — the same rule
+/// [`SwitchStates::params`] has always applied. Shared by [`switch_states`] and the
+/// Doctor's FS-sound capture (which writes each `valueA` before engaging, so the
+/// as-played footswitch sound includes its param-function jumps, not just on-off flips).
+pub(crate) fn param_fn_values(
+    ftsw: &Value,
+    switch: u32,
+) -> Vec<(String, String, String, f32, f32)> {
+    ftsw.as_array()
         .and_then(|a| a.get(switch as usize))
         .and_then(Value::as_array)
         .into_iter()
@@ -418,12 +433,7 @@ pub fn switch_states(ftsw: &Value, preset: &Value, switch: u32) -> SwitchStates 
                 a.get("valueB").and_then(Value::as_f64)? as f32,
             ))
         })
-        .collect();
-    SwitchStates {
-        engaged_bypass,
-        disengaged_bypass,
-        params,
-    }
+        .collect()
 }
 
 /// One switch's `func:"on-off"` `(groupId, nodeId)` pairs (empty nodeIds skipped).
@@ -497,6 +507,37 @@ pub fn siblings_off_excluding(ftsw: &Value, switch: u32) -> Vec<(String, String,
 /// from the live path are not a defect (the caller only ever needs the set). A
 /// `node_id` missing from `saved_bypass` keeps today's `unwrap_or(false)` +
 /// one-shot warn.
+/// The OFFLINE twin of [`param_fn_values`], off the backup scan's already-enumerated
+/// [`FootswitchInfo`] (no live `ftsw` JSON in hand): one switch's `param`-function
+/// engaged writes as `(group, node, param, valueA)`. `None` (a base sound) writes
+/// nothing. Same both-values rule as [`SwitchStates::params`] — a function missing
+/// either value is skipped. Lives next to [`derived_force_bypass`] because the two
+/// together define a footswitch SOUND: on-off flips plus param jumps.
+pub fn derived_param_writes(
+    footswitches: &[FootswitchInfo],
+    footswitch: Option<u32>,
+) -> Vec<(String, String, String, f32)> {
+    let Some(sw) = footswitch else {
+        return Vec::new();
+    };
+    footswitches
+        .iter()
+        .filter(|fi| fi.switch == sw)
+        .flat_map(|fi| &fi.functions)
+        .filter(|f| f.func == "param")
+        .filter_map(|f| {
+            let a = f.value_a? as f32;
+            f.value_b?;
+            Some((
+                f.group_id.clone(),
+                f.node_id.clone(),
+                f.parameter_id.clone()?,
+                a,
+            ))
+        })
+        .collect()
+}
+
 pub fn derived_force_bypass(
     footswitches: &[FootswitchInfo],
     saved_bypass: &std::collections::HashMap<String, bool>,

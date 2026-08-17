@@ -76,6 +76,11 @@
 //!                                  each after-capture's fired verdicts against the recipe's
 //!                                  must_fire/must_not_fire, prints a HIT/MISS/VIOLATION
 //!                                  table. Never saves; loads the slot; ends re-amp OFF.
+//!   probe --doctor-fs <listIdx> <switch>
+//!                                  ONE footswitch SOUND through the production Doctor seam
+//!                                  (on-off isolation + the switch's param-func valueA writes),
+//!                                  printing the diagnosis verdicts — the FS twin of the defect
+//!                                  sweep. Read-only; ends re-amp OFF.
 //!   probe --doctor-window-ab <slots_csv> --stim <wav> [--family <guitar|bass|bass-vi>] [--out <report.json>]
 //!                                  CAPTURE-WINDOW A/B evidence arm: per slot, captures the
 //!                                  oracle (full 6s stim + the pinned 2.5s oracle tail —
@@ -106,6 +111,10 @@
 //!                                  (stimulus via TMP_LEVELLER_STIMULUS)
 //!   probe --measure-current <topology> [sceneSlot] [calibrationLUFS]
 //!                                  measure current live state without changing levels
+//!   probe --measure-pair <listIdx> <topology> <presetLevel> [--scene N] <g:n:p=v>…
+//!                                  one isolated capture at an explicit presetLevel ×
+//!                                  block-param point, optionally in a scene context —
+//!                                  headroom-trade physics instrumentation. Read-only.
 //!   probe --measure-scene <slot> <sceneSlot> <topology> [calibrationLUFS]
 //!                                  [--target <lufs>] [--dump-wav <dir>]
 //!                                  load preset+scene, then measure without changing levels
@@ -376,6 +385,75 @@ fn main() {
         }
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--measure-pair") {
+        // --measure-pair <listIdx> <topology> <presetLevel> [--scene N] <g:n:p=v>…  — P0
+        // repro instrumentation: one isolated capture at an explicit presetLevel ×
+        // block-param point (headroom-trade physics), optionally in a SCENE context
+        // (loadScene before the writes, scene latches at engage). Bundled stimulus;
+        // read-only (working copy).
+        let idx: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        let topology = args.get(i + 2).cloned().unwrap_or_default();
+        let preset_level: f32 = args
+            .get(i + 3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(f32::NAN);
+        // ONE discriminator decides both the scene and where the writes start —
+        // `--scene N` is recognized only immediately after the fixed args (matches
+        // the printed usage; a stray later token is a parse error, not a silent pick).
+        let has_scene = args.get(i + 4).map(String::as_str) == Some("--scene");
+        let scene: Option<u32> = if has_scene {
+            args.get(i + 5).and_then(|s| s.parse().ok())
+        } else {
+            None
+        };
+        let wstart = if has_scene { i + 6 } else { i + 4 };
+        // Strict parse: any malformed g:n:p=v token collapses the whole set to None →
+        // usage error, never a silently shortened write set.
+        let writes: Option<Vec<(String, String, String, f32)>> = args[wstart..]
+            .iter()
+            .take_while(|a| !a.starts_with("--"))
+            .map(|tok| {
+                let (path, val) = tok.split_once('=')?;
+                let mut it = path.split(':');
+                let (g, n, p) = (it.next()?, it.next()?, it.next()?);
+                if it.next().is_some() {
+                    return None;
+                }
+                Some((
+                    g.to_string(),
+                    n.to_string(),
+                    p.to_string(),
+                    val.parse().ok()?,
+                ))
+            })
+            .collect();
+        let (Some(writes), false) = (writes, has_scene && scene.is_none()) else {
+            eprintln!(
+                "usage: probe --measure-pair <listIdx> <topology> <presetLevel> [--scene N] <g:n:p=v>…"
+            );
+            std::process::exit(2);
+        };
+        if idx == u32::MAX || topology.is_empty() || !preset_level.is_finite() {
+            eprintln!(
+                "usage: probe --measure-pair <listIdx> <topology> <presetLevel> [--scene N] <g:n:p=v>…"
+            );
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_measure_pair(idx, &topology, preset_level, scene, &writes) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--dump-currentpresetdata") {
         // --dump-currentpresetdata [slot]  — Tier-4: capture the live field-3
         // currentPresetDataChanged on a dense-heartbeat session, dump the full
@@ -462,6 +540,33 @@ fn main() {
         };
         let block = flag_arg(&args, "--block");
         match tmp_companion_lib::probe_doctor_inject(slot, &gains, block.as_deref()) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--doctor-fs") {
+        // --doctor-fs <listIdx> <switch>  — one FS sound through the production Doctor
+        // seam (isolation + param-func valueA writes), print the diagnosis verdicts.
+        let slot: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        let switch: u32 = args
+            .get(i + 2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        if slot == u32::MAX || switch == u32::MAX {
+            eprintln!("usage: probe --doctor-fs <listIdx> <switch>");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_doctor_fs(slot, switch) {
             Ok(report) => {
                 print!("{report}");
                 return;
