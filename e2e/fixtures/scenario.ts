@@ -16,7 +16,7 @@ export interface Preset {
 }
 
 // Role-based names (not slot numbers): the device stores these at userSlot = listIndex + 1
-// (401/402/403/404/405/406), so a slot-numbered name would read off-by-one in the backup view.
+// (401/402/.../410), so a slot-numbered name would read off-by-one in the backup view.
 // WHICH USE CASE EACH FIXTURE CARRIES: e2e/fixtures/COVERAGE.md (the matrix), pinned by
 // `fixture_gates` in src-tauri/src/lib.rs. In brief — Rig: scene overlays, footswitch classes
 // and the two Doctor damage signatures; Pedalboard: scene-free, the Copy source, EXP + link
@@ -24,6 +24,11 @@ export interface Preset {
 // oracle and the off-USB lane; Parallel: both lane amps live (joint-k / rebalance);
 // Hiwatt 3S: a VERBATIM device export (the scene-conformance oracle — do not edit);
 // Preset24: the stale-load / saturated-pedal footswitch fixture (level-fs-preset24.spec.ts).
+// P3 additions (ADDITIONS, not replacements — 404/405 stay untouched): Combined Level: the
+// new-flow leveling fixture (FS-alone, scene-alone "BASE SCENE", scene-that-enables-an-FS,
+// parallel Deluxe Reverb + Marshall Plexi, a post-cab compressor). Doctor Oracle: 14
+// mixed-shape footswitches, one per Doctor spectral check, all bypassed in base. Preset24
+// Min / Hiwatt Min: the smallest presets still reproducing each incident's own bug class.
 export const SCENARIO: Preset[] = [
   { slot: 400, name: "E2E Rig" },
   { slot: 401, name: "E2E Pedalboard" },
@@ -31,6 +36,10 @@ export const SCENARIO: Preset[] = [
   { slot: 403, name: "E2E Parallel" },
   { slot: 404, name: "E2E Hiwatt 3S" },
   { slot: 405, name: "E2E Preset24" },
+  { slot: 406, name: "E2E Combined Level" },
+  { slot: 407, name: "E2E Doctor Oracle" },
+  { slot: 408, name: "E2E Preset24 Min" },
+  { slot: 409, name: "E2E Hiwatt Min" },
 ];
 
 export async function invoke(

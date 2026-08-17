@@ -13,7 +13,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 /// How many presets `e2e/fixtures/scenario-presets.json` ships (= the offline snapshot list
 /// + the backup-fixture row count). One constant so adding a scenario preset is one edit.
-const SCENARIO_PRESETS: usize = 6;
+const SCENARIO_PRESETS: usize = 10;
 
 /// Invoke a command through the SAME IPC path the HTTP bridge uses: a JSON body in,
 /// the command's JSON response out (or its error value).
@@ -103,6 +103,22 @@ fn offline_copy_journey_through_real_backend() {
         crate::session::PresetEntry {
             slot: 405,
             name: "E2E Preset24".into(),
+        },
+        crate::session::PresetEntry {
+            slot: 406,
+            name: "E2E Combined Level".into(),
+        },
+        crate::session::PresetEntry {
+            slot: 407,
+            name: "E2E Doctor Oracle".into(),
+        },
+        crate::session::PresetEntry {
+            slot: 408,
+            name: "E2E Preset24 Min".into(),
+        },
+        crate::session::PresetEntry {
+            slot: 409,
+            name: "E2E Hiwatt Min".into(),
         },
     ];
     MONITOR_ENABLED.store(true, SeqCst);

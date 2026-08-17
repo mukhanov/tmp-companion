@@ -237,7 +237,12 @@ mod fixture_gates {
                 )
             })
             .collect();
-        assert_eq!(out.len(), 6, "the scenario set is six presets at 400-405");
+        assert_eq!(
+            out.len(),
+            10,
+            "the scenario set is ten presets at 400-409 (400-405 the original set, \
+             406-409 the P3 leveling-doctor-fixtures additions)"
+        );
         out
     }
 
@@ -763,6 +768,397 @@ mod fixture_gates {
         assert_eq!(fs.len(), 4, "the four drive-pedal switches (ftsw 5-8)");
     }
 
+    /// A node's `dspUnitParameters.bypass`, by nodeId, walked from `p`'s base graph via
+    /// the shared node-walk seam (`crate::audiograph::for_each_node` +
+    /// `crate::audiograph::node_id`, which falls back to `FenderId`) rather than a
+    /// hand-rolled `guitarNodes`-only walk — this also covers `micNodes`. `None` if
+    /// the node is absent.
+    fn base_node_bypass(p: &serde_json::Value, node_id: &str) -> Option<bool> {
+        let mut found = None;
+        crate::audiograph::for_each_node(p, |n| {
+            let obj = serde_json::Value::Object(n.clone());
+            if crate::audiograph::node_id(&obj) == Some(node_id) {
+                found = n
+                    .get("dspUnitParameters")
+                    .and_then(|d| d.get("bypass"))
+                    .and_then(serde_json::Value::as_bool);
+            }
+        });
+        found
+    }
+
+    /// `E2E Combined Level` @ 406: the combined leveling fixture. Pins the structural
+    /// facts the new-flow leveling specs build on: parallel BOTH-amps-active topology
+    /// with one cab node per amp lane, a post-cab compressor always live in one
+    /// lane (the trade/correction physics case), an FS acting on a block no scene ever
+    /// overlays ("FS alone"), a scene literally named "BASE SCENE" that enables no
+    /// footswitch ("scene alone"), and a distinct scene that DOES enable one ("Lead")
+    /// — both judged rows sitting at wire index ≥ 1 (index 0 stays an unjudged filler:
+    /// scene 0 of a 2-amp preset is never judged, since USB `loadScene(0)` can
+    /// materialize a different amp state than the physical footswitch tap — see
+    /// `danger.md`'s OPEN scene-0 item).
+    #[test]
+    fn fx_combined_level_carries_the_leveling_use_cases() {
+        let cabs = cab_model_ids();
+        let (name, _, p) = fixture(406);
+        assert_eq!(name, "E2E Combined Level");
+        assert_eq!(p["audioGraph"]["template"], "gtrParallel1");
+
+        // One cab node per amp lane, no more. (Counted by catalog category, NOT via
+        // blockcaps: the firmware's `ComboHalfStackCabinetsLimit` set does not count
+        // `ACD_Mar412Cent100`, so cap weight and cab-node count differ here on purpose.)
+        let mut cab_count = 0usize;
+        let groups = p["audioGraph"]["guitarNodes"]
+            .as_object()
+            .expect("guitarNodes");
+        for nodes in groups.values() {
+            for n in nodes.as_array().into_iter().flatten() {
+                if let Some(fid) = n["FenderId"].as_str() {
+                    if cabs.contains(fid) {
+                        cab_count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            cab_count, 2,
+            "exactly one cab node per amp lane (2 total), no more"
+        );
+
+        // Both lane amps active (base state) — the "parallel both active" shape.
+        assert_eq!(
+            base_node_bypass(&p, "ampA"),
+            Some(false),
+            "ampA (Deluxe Reverb) live"
+        );
+        assert_eq!(
+            base_node_bypass(&p, "ampB"),
+            Some(false),
+            "ampB (Marshall Plexi) live"
+        );
+        assert_eq!(
+            p["audioGraph"]["guitarNodes"]["G2"][0]["FenderId"],
+            "ACD_DeluxeReverb65NoFx"
+        );
+        assert_eq!(
+            p["audioGraph"]["guitarNodes"]["G3"][0]["FenderId"],
+            "ACD_MarshallPlexi"
+        );
+
+        // The post-cab compressor is ALWAYS ON (the trade/correction physics case).
+        assert_eq!(
+            p["audioGraph"]["guitarNodes"]["G3"][2]["FenderId"],
+            "ACD_CompressorSimpleSoftKnee"
+        );
+        assert_eq!(
+            base_node_bypass(&p, "compB"),
+            Some(false),
+            "post-cab comp is always live"
+        );
+
+        // FS alone: switch 1 (DRIVE) acts on ACD_TubeScreamer, and NO scene overlays it.
+        let fs = crate::footswitch::enumerate_block_footswitches(&p["ftsw"], &p);
+        let drive = fs
+            .iter()
+            .find(|f| {
+                f.functions
+                    .iter()
+                    .any(|fun| fun.node_id == "ACD_TubeScreamer")
+            })
+            .expect("a DRIVE footswitch acting on ACD_TubeScreamer");
+        assert_eq!(drive.switch, 1);
+        let scenes = p["scenes"].as_array().expect("scenes");
+        for scene in scenes {
+            assert!(
+                scene["guitarNodes"]["G1"].get("ACD_TubeScreamer").is_none(),
+                "FS-alone target must never be overlaid by any scene"
+            );
+        }
+
+        // Judged scenes sit at wire index >= 1: scene 0 is the unjudged filler.
+        assert_eq!(scenes.len(), 3);
+
+        // Scene-alone: "BASE SCENE" (literal name, judged, index >= 1) enables no FS.
+        let base_scene_idx = scenes
+            .iter()
+            .position(|s| s["sceneName"] == "BASE SCENE")
+            .expect("a scene literally named \"BASE SCENE\"");
+        assert!(
+            base_scene_idx >= 1,
+            "BASE SCENE must be a judged row (wire index >= 1)"
+        );
+        let base_scene_states = scenes[base_scene_idx]["ftswStates"]
+            .as_array()
+            .expect("ftswStates");
+        assert!(
+            base_scene_states
+                .iter()
+                .all(|v| v == &serde_json::json!(false)),
+            "BASE SCENE (scene alone) must enable no footswitch"
+        );
+
+        // Scene-that-also-enables-an-FS: "LEAD" un-bypasses ACD_KingOfTone (switch 2,
+        // BOOST) via a Full overlay AND flags it in ftswStates.
+        let lead_idx = scenes
+            .iter()
+            .position(|s| s["sceneName"] == "LEAD")
+            .expect("a scene named \"LEAD\" that enables an FS");
+        assert!(
+            lead_idx >= 1,
+            "the scene-that-enables-an-FS must be a judged row too"
+        );
+        assert_eq!(
+            scenes[lead_idx]["guitarNodes"]["G4"]["ACD_KingOfTone"]["dspUnitParameters"]["bypass"],
+            false,
+            "LEAD un-bypasses the BOOST switch's block"
+        );
+        assert_eq!(
+            scenes[lead_idx]["ftswStates"][2], true,
+            "LEAD's ftswStates must reflect switch 2 (BOOST) engaged"
+        );
+    }
+
+    /// `E2E Doctor Oracle` @ 407: the Doctor spectral-check
+    /// oracle fixture. Pins the per-defect param constants TABLE BELOW, which MIRRORS
+    /// the fixture JSON — the fixture JSON itself is the actual HW-tuning surface for
+    /// the eventual real-Doctor-path verification, and the two must be edited in
+    /// lockstep — and the "base fires nothing" precondition (every one of the 5
+    /// defect blocks bypassed at rest). `buried` is DELIBERATELY absent: it only fires
+    /// for `Family::Bass|BassVi` with a drive detected, both impossible on this
+    /// guitar-topology fixture.
+    #[test]
+    fn fx_doctor_oracle_fires_nothing_in_base_and_carries_its_defect_table() {
+        let (name, _, p) = fixture(407);
+        assert_eq!(name, "E2E Doctor Oracle");
+
+        // Base precondition: amp+cab live, every defect block bypassed.
+        assert_eq!(base_node_bypass(&p, "ACD_TwinReverb65NoFx"), Some(false));
+        assert_eq!(base_node_bypass(&p, "cab1"), Some(false));
+        for node in ["eq10", "peq5", "hlp1", "plate1", "comp1"] {
+            assert_eq!(
+                base_node_bypass(&p, node),
+                Some(true),
+                "{node}: every defect block must be bypassed in base (\"base must fire nothing\")"
+            );
+        }
+
+        // The per-defect param constants table (label -> node -> [(param, valueA,
+        // valueB)]), P0-informed, tune-later per the module's own report. Each row
+        // is a MIXED-shape switch: one on-off entry (un-bypass) + its param entries,
+        // except SPIKY (on-off only — no verified CompressorSimpleSoftKnee controlId
+        // exists anywhere in this repo; inventing one risks the exact "wrong id
+        // silently no-ops" trap doctor.rs's own EQ10_BANDS comment warns about).
+        type DefectRow = (
+            u32,
+            &'static str,
+            &'static str,
+            &'static [(&'static str, f64, f64)],
+        );
+        let table: &[DefectRow] = &[
+            (1, "CONTROL", "eq10", &[("gain1khz", 0.0, 0.0)]),
+            (2, "MUDDY", "eq10", &[("gain250hz", 12.0, 0.0)]),
+            (
+                3,
+                "BOOMY",
+                "eq10",
+                &[("gain62hz", 12.0, 0.0), ("gain125hz", 9.0, 0.0)],
+            ),
+            (
+                4,
+                "HARSH",
+                "eq10",
+                &[("gain1khz", 10.0, 0.0), ("gain2khz", 10.0, 0.0)],
+            ),
+            (5, "FIZZY", "eq10", &[("gain8khz", 12.0, 0.0)]),
+            (
+                6,
+                "LOST",
+                "eq10",
+                &[("gain500hz", -12.0, 0.0), ("gain1khz", -12.0, 0.0)],
+            ),
+            (
+                7,
+                "BRIGHT",
+                "eq10",
+                &[
+                    ("gain2khz", 8.0, 0.0),
+                    ("gain4khz", 8.0, 0.0),
+                    ("gain8khz", 8.0, 0.0),
+                ],
+            ),
+            (
+                8,
+                "CUTTHRU",
+                "eq10",
+                &[
+                    ("gain62hz", 10.0, 0.0),
+                    ("gain125hz", 10.0, 0.0),
+                    ("gain250hz", 6.0, 0.0),
+                ],
+            ),
+            (
+                9,
+                "RESONANT",
+                "peq5",
+                &[
+                    ("filter3frequency", 2600.0, 2600.0),
+                    ("filter3gaindb", 12.0, 0.0),
+                    ("filter3q", 14.0, 14.0),
+                    ("filter4frequency", 2600.0, 2600.0),
+                    ("filter4gaindb", 12.0, 0.0),
+                    ("filter4q", 14.0, 14.0),
+                ],
+            ),
+            (
+                10,
+                "BOXY",
+                "peq5",
+                &[
+                    ("filter2frequency", 420.0, 420.0),
+                    ("filter2gaindb", 12.0, 0.0),
+                    ("filter2q", 8.0, 8.0),
+                    ("filter3frequency", 420.0, 420.0),
+                    ("filter3gaindb", 12.0, 0.0),
+                    ("filter3q", 8.0, 8.0),
+                ],
+            ),
+            (11, "THIN", "hlp1", &[("hpffc", 800.0, 20.0)]),
+            (12, "DARK", "hlp1", &[("lpffc", 1100.0, 20000.0)]),
+            (
+                13,
+                "WASHED",
+                "plate1",
+                &[("wetdrymix", 0.65, 0.0), ("decay", 0.7, 0.3)],
+            ),
+            (14, "SPIKY", "comp1", &[]),
+        ];
+
+        let ftsw = p["ftsw"].as_array().expect("ftsw");
+        for (idx, label, node, params) in table {
+            let entries = ftsw[*idx as usize].as_array().unwrap_or_else(|| {
+                panic!("ftsw[{idx}] ({label}): expected a mixed-shape entry array")
+            });
+            assert_eq!(
+                entries.first().and_then(|e| e["func"].as_str()),
+                Some("on-off"),
+                "ftsw[{idx}] ({label}): first entry must be the on-off un-bypass"
+            );
+            assert_eq!(
+                entries[0]["nodes"][0]["nodeId"].as_str(),
+                Some(*node),
+                "ftsw[{idx}] ({label}): on-off must target {node}"
+            );
+            let param_entries = &entries[1..];
+            assert_eq!(
+                param_entries.len(),
+                params.len(),
+                "ftsw[{idx}] ({label}): param entry count must match the table"
+            );
+            for (i, (pid, va, vb)) in params.iter().enumerate() {
+                let e = &param_entries[i];
+                assert_eq!(e["func"], "param");
+                assert_eq!(e["nodeId"], *node);
+                assert_eq!(e["parameterId"], *pid);
+                assert_eq!(
+                    e["valueA"].as_f64(),
+                    Some(*va),
+                    "ftsw[{idx}] ({label}).{pid} valueA"
+                );
+                assert_eq!(
+                    e["valueB"].as_f64(),
+                    Some(*vb),
+                    "ftsw[{idx}] ({label}).{pid} valueB"
+                );
+            }
+            // A defect switch must actually CHANGE something. Anchor entries (a peaking
+            // filter's frequency/Q pinned equal on both sides) are legitimate, so the
+            // invariant is per ROW, not per entry: at least one param entry moves. CONTROL
+            // is the deliberate no-op discriminator; SPIKY is on-off-only (no entries).
+            if *label != "CONTROL" && !params.is_empty() {
+                assert!(
+                    params.iter().any(|(_, va, vb)| va != vb),
+                    "ftsw[{idx}] ({label}): no param entry changes value — the defect \
+                     switch is a no-op"
+                );
+            }
+        }
+    }
+
+    /// The minimal incident repros:
+    /// the SMALLEST preset still reproducing each bug class, landing ALONGSIDE the
+    /// originals (404/405 stay untouched — spec migration is a later pass, not this
+    /// one). Pins each repro's own structural shape; size is bounded elsewhere (the
+    /// 16 KiB per-fixture field-8 budget gate, `e2e_fixtures_stay_inside_the_field8_
+    /// read_budget`) rather than compared against its original here.
+    #[test]
+    fn fx_minimal_incident_repros_pin_their_incident_shape() {
+        // 408 "E2E Preset24 Min" — the lazy-save (stale-load) TIMING bug class needs
+        // only ONE BAKE-eligible drive pedal, not 405's four (the incident is about
+        // base-save -> FS-batch-load ordering, not pedal count).
+        let (name, _, _p405) = fixture(405);
+        assert_eq!(name, "E2E Preset24");
+        let (name, _, p408) = fixture(408);
+        assert_eq!(name, "E2E Preset24 Min");
+        assert!(p408["scenes"].as_array().expect("scenes").is_empty());
+        let fs408 = crate::footswitch::enumerate_block_footswitches(&p408["ftsw"], &p408);
+        assert_eq!(
+            fs408.len(),
+            1,
+            "the minimal repro needs exactly one drive pedal"
+        );
+        assert_eq!(
+            p408["audioGraph"]["guitarNodes"]["G1"][1]["dspUnitParameters"]["outputLevel"], 1.0,
+            "the saturated amp's own knob stays untouched, same as 405"
+        );
+
+        // 409 "E2E Hiwatt Min" — the scene/overlay-conformance class needs only a
+        // single amp + 2 scenes (one literally "Base Scene", matching 404's own real
+        // device-exported case, level.spec.ts's header) rather than 404's full
+        // 4-scene parallel-amp device export. It also carries deliberate non-empty
+        // overlay content for the overlay-conformance class: a DRIVE on-off switch
+        // and a scene that un-bypasses the block it targets.
+        let (name, _, _p404) = fixture(404);
+        assert_eq!(name, "E2E Hiwatt 3S");
+        let (name, _, p409) = fixture(409);
+        assert_eq!(name, "E2E Hiwatt Min");
+        let scenes409 = p409["scenes"].as_array().expect("scenes");
+        assert_eq!(scenes409.len(), 2);
+        assert!(
+            scenes409.iter().any(|s| s["sceneName"] == "Base Scene"),
+            "must keep the literal \"Base Scene\" name — NOT the base sentinel — that \
+             the real device export exercises (level.spec.ts's own header)"
+        );
+
+        let fs409 = crate::footswitch::enumerate_block_footswitches(&p409["ftsw"], &p409);
+        let drive409: Vec<_> = fs409.iter().filter(|f| f.label == "DRIVE").collect();
+        assert_eq!(
+            drive409.len(),
+            1,
+            "409 must carry exactly one DRIVE footswitch"
+        );
+        assert_eq!(
+            drive409[0].functions.len(),
+            1,
+            "DRIVE must carry exactly one function"
+        );
+        assert_eq!(drive409[0].functions[0].func, "on-off");
+        assert_eq!(
+            drive409[0].functions[0].node_id, "ACD_TubeScreamer",
+            "DRIVE must target ACD_TubeScreamer"
+        );
+
+        let base_scene = scenes409
+            .iter()
+            .find(|s| s["sceneName"] == "Base Scene")
+            .expect("a scene literally named \"Base Scene\"");
+        assert_eq!(
+            base_scene["guitarNodes"]["G1"]["ACD_TubeScreamer"]["dspUnitParameters"]["bypass"],
+            false,
+            "\"Base Scene\" un-bypasses ACD_TubeScreamer — the overlay's real content \
+             the non-empty overlay-conformance class needs"
+        );
+    }
+
     /// NON-REGRESSION GATE for two defects found on a real 1.8.45 unit (2026-07-26).
     ///
     /// The e2e scenario fixtures were written with `info.product_id = "pro"`. Every
@@ -1057,12 +1453,26 @@ mod fixture_gates {
         ];
         // Per-fixture expected scene count (listIndex → count), replacing a single
         // cross-fixture sum: a failure now names the culprit fixture instead of just
-        // reporting the total drifted. A slot absent here (401, 405) is expected to
-        // carry NO scenes.
-        let expected_scenes: std::collections::HashMap<u32, usize> =
-            [(400u32, 4usize), (402, 8), (403, 4), (404, 4)]
-                .into_iter()
-                .collect();
+        // reporting the total drifted. A slot absent here (401, 405, 408) is expected
+        // to carry NO scenes. 406/407/409 are the P3 leveling-doctor-fixtures
+        // additions: 406 "E2E Combined Level" carries 3 (SCRATCH filler at wire index
+        // 0 + BASE SCENE + LEAD, both judged rows at index ≥1 — scene 0 of a 2-amp
+        // preset is never judged, since USB `loadScene(0)` can materialize a
+        // different amp state than the physical footswitch tap; see `danger.md`'s
+        // OPEN scene-0 item); 407 "E2E Doctor Oracle" carries 2 (SCRATCH filler + the
+        // scene-consistency oracle's own big-outputLevel-jump scene); 409
+        // "E2E Hiwatt Min" carries 2 (the minimal scene/overlay-conformance repro).
+        let expected_scenes: std::collections::HashMap<u32, usize> = [
+            (400u32, 4usize),
+            (402, 8),
+            (403, 4),
+            (404, 4),
+            (406, 3),
+            (407, 2),
+            (409, 2),
+        ]
+        .into_iter()
+        .collect();
         let entries = fixtures();
         for (idx, name, _, p) in &entries {
             let scenes = p["scenes"].as_array().map_or(0, Vec::len);
