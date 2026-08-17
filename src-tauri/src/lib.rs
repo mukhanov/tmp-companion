@@ -34,6 +34,9 @@ mod doctor;
 #[cfg(feature = "e2e")]
 mod e2e_server;
 mod footswitch;
+// Benefit-aware headroom trade + the clamp-error taxonomy (pure; the device half is in
+// `leveller.rs`).
+mod headroom_trade;
 #[allow(dead_code)]
 mod hid;
 mod ir;

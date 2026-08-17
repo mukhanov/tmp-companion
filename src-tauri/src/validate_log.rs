@@ -42,6 +42,23 @@ pub(crate) fn log_path() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// Path of the DOCTOR log — a SEPARATE file, and separate arming, from the leveling one.
+///
+/// WHY NOT THE SAME FILE. The leveling consumer (`scripts/level-validate.sh`) grades every
+/// row against `target_lufs` and treats a row it cannot parse a target from as a hard FAIL.
+/// A Doctor sound has no loudness target at all — it is captured so an independent tool can
+/// re-judge the SPECTRAL premise a diagnosis rests on — so mixing the two into one file
+/// would either wreck the leveling gate or force a fake target into the Doctor rows. Two
+/// files, one row shape, no cross-contamination.
+///
+/// Inert by default, exactly like [`log_path`]: unset means [`emit_doctor`] returns before
+/// any work.
+pub(crate) fn doctor_log_path() -> Option<String> {
+    std::env::var("TMP_E2E_DOCTOR_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
 /// Directory the dumped WAVs land in: `TMP_E2E_VALIDATE_WAV_DIR`, else a
 /// `level-validate-wavs` sibling of the log itself, so a caller that sets only the log
 /// path still gets self-describing artifacts next to it.
@@ -152,6 +169,32 @@ impl ValidationRow {
         }
     }
 
+    /// ONE Doctor sound of `slot`, by the same identity triple every other row uses:
+    /// `scene` for a scene sound, `switch` for a footswitch sound, neither for base.
+    ///
+    /// `target_lufs` is left at `0.0` here and OVERWRITTEN by [`emit_doctor`] with what THIS
+    /// repo measured for the capture — a Doctor sound has no loudness target, so the field
+    /// carries the cross-check number instead of an assertion, and it cannot be known until
+    /// the capture exists. A Doctor log's consumer must never grade it as a target miss,
+    /// which is precisely why Doctor rows live in their own file ([`doctor_log_path`]).
+    pub fn doctor(slot: u32, scene_slot: Option<u32>, switch: Option<u32>) -> Self {
+        let what = match (scene_slot, switch) {
+            (_, Some(sw)) => format!("switch{sw}"),
+            (Some(sc), None) => format!("scene{sc}"),
+            (None, None) => "base".to_string(),
+        };
+        Self {
+            label: format!("doctor:slot{slot}:{what}"),
+            slot,
+            scene_slot,
+            switch,
+            target_lufs: 0.0,
+            clamped: false,
+            persist_mismatch: None,
+            wav_dir: None,
+        }
+    }
+
     pub fn with_flags(mut self, clamped: bool, persist_mismatch: Option<bool>) -> Self {
         self.clamped = clamped;
         self.persist_mismatch = persist_mismatch;
@@ -251,6 +294,26 @@ pub(crate) fn emit(row: &ValidationRow, cap: &audio::Capture, loud: &lufs::Loudn
     };
     let dir = row.wav_dir.clone().unwrap_or_else(|| wav_dir(&log));
     emit_to(&log, &dir, row, cap, loud);
+}
+
+/// The DOCTOR twin of [`emit`]: dump this Doctor sound's processed pair and append one row to
+/// the Doctor log. NO-OP (and no work at all) unless `TMP_E2E_DOCTOR_LOG` is set, so a
+/// production Doctor run never allocates, never writes a WAV, never touches the filesystem.
+///
+/// SAME row shape and SAME dumper as the leveling seam — an external judge that can read one
+/// log can read the other. What differs is only WHICH file it lands in and what the numbers
+/// mean (see [`ValidationRow::doctor`]).
+pub(crate) fn emit_doctor(row: &ValidationRow, cap: &audio::Capture, loud: &lufs::Loudness) {
+    let Some(log) = doctor_log_path() else {
+        return;
+    };
+    let dir = row.wav_dir.clone().unwrap_or_else(|| wav_dir(&log));
+    // The measured loudness IS the row's number for a Doctor sound (see `ValidationRow::doctor`).
+    let row = ValidationRow {
+        target_lufs: loud.integrated_lufs,
+        ..row.clone()
+    };
+    emit_to(&log, &dir, &row, cap, loud);
 }
 
 /// [`emit`] with the destinations resolved — the env-free seam the unit tests drive
@@ -488,6 +551,81 @@ mod tests {
             "the second row points at its own capture: {body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ITEM 7 — THE DOCTOR PREMISE-CHECK SEAM. A Doctor sound is captured so an independent
+    // tool can re-judge the audio a diagnosis rests on. Three things must hold:
+    //
+    // 1. the row carries IDENTITY (slot + scene/switch), never a position;
+    // 2. `target_lufs` is OVERWRITTEN with what this repo measured — a Doctor sound has no
+    //    loudness target, and the number is a cross-check, not an assertion;
+    // 3. the row shape is the SAME one the leveling consumer parses, so one judge reads both.
+    #[test]
+    fn a_doctor_row_carries_identity_and_the_measured_loudness() {
+        let dir = scratch("doctorrow");
+        let log = dir.join("doctor.jsonl");
+        let wavs = dir.join("wavs");
+        emit_to(
+            log.to_str().expect("utf8"),
+            wavs.to_str().expect("utf8"),
+            &ValidationRow::doctor(404, None, Some(11)),
+            &cap(2),
+            &loud(-17.05, -11.0),
+        );
+        let body = std::fs::read_to_string(&log).expect("log written");
+        assert!(
+            body.contains("\"label\":\"doctor:slot404:switch11\""),
+            "{body}"
+        );
+        assert!(body.contains("\"slot\":404"), "{body}");
+        assert!(body.contains("\"switch\":11"), "{body}");
+        assert!(body.contains("\"scene_slot\":null"), "{body}");
+        assert!(
+            body.contains("\"clamped\":false"),
+            "a Doctor row is never a clamp: {body}"
+        );
+        assert!(
+            wavs.join("doctor_slot404_switch11.wav").is_file(),
+            "the capture the diagnosis was made from is on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The three Doctor sound kinds label distinctly — a base sound, a scene sound and a
+    // footswitch sound of the same preset must never collide on one WAV.
+    #[test]
+    fn the_three_doctor_sound_kinds_get_distinct_identities() {
+        assert_eq!(
+            ValidationRow::doctor(400, None, None).label,
+            "doctor:slot400:base"
+        );
+        assert_eq!(
+            ValidationRow::doctor(400, Some(2), None).label,
+            "doctor:slot400:scene2"
+        );
+        assert_eq!(
+            ValidationRow::doctor(400, Some(2), Some(5)).label,
+            "doctor:slot400:switch5",
+            "a footswitch sound is named by its switch even when it sits in a scene"
+        );
+        let r = ValidationRow::doctor(400, Some(2), Some(5));
+        assert_eq!(
+            (r.scene_slot, r.switch),
+            (Some(2), Some(5)),
+            "the MACHINE identity keeps both — only the label picks one"
+        );
+    }
+
+    // INERT BY DEFAULT, and on its OWN file. `emit_doctor` must do nothing at all unless
+    // `TMP_E2E_DOCTOR_LOG` is set: a production Doctor run never writes a WAV. (Arming it
+    // here would arm it for every other test in the process, so the check is on the path
+    // resolver — the single gate `emit_doctor` returns on.)
+    #[test]
+    fn the_doctor_log_is_armed_separately_from_the_leveling_one() {
+        assert!(
+            doctor_log_path().is_none(),
+            "unset by default — a production run writes nothing"
+        );
     }
 
     #[test]

@@ -91,6 +91,7 @@ pub fn run() {
             cancel_preset_leveling,
             restore_preset_level,
             level_footswitches_apply,
+            list_footswitch_scene_contexts,
             cancel_footswitch_leveling,
             read_active_preset,
             current_graph,

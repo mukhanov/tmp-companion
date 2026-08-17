@@ -58,6 +58,11 @@ pub struct FootswitchInfo {
     pub link_group: Option<u32>,
     pub functions: Vec<FootswitchFn>,
     pub level_params: Vec<LevelParamCandidate>,
+    /// EVERY numeric param of the acted-on blocks, class-annotated and level-class first —
+    /// the combined picker's source ([`all_numeric_candidates_for_node`]). A SUPERSET of
+    /// `level_params`, which stays the safe-default/pre-selection source and keeps its
+    /// "never `Other`" contract. Additive on the wire.
+    pub all_params: Vec<LevelParamCandidate>,
 }
 
 /// Is `key` on block `fender_id` a leveling candidate? The gate is
@@ -113,6 +118,61 @@ pub fn level_candidates_for_node(
             })
         })
         .collect()
+}
+
+/// ONE node's params for the COMBINED PICKER: **every numeric `dspUnitParameter`**, each
+/// annotated with the classifier's verdict, level-class controls first and alphabetical
+/// within a rank.
+///
+/// WHY A PARALLEL FUNCTION RATHER THAN A RELAXED [`level_candidates_for_node`]. That one is
+/// the SAFE-DEFAULT source: everything that pre-selects a handle, refuses a request, or picks
+/// an amp knob reads it, and it admits only controls the classifier recognises. Widening it
+/// would silently let an `Other` param become a *default* pick — sweeping a control that
+/// changes the effect, not the volume. This function feeds the PICKER ONLY: the user sees
+/// every control the block has, annotated, and their explicit pick is authoritative — while
+/// an unrecognised pick still meets [`crate::leveller::FsParamTarget::refuse_if_not_a_level_control`]
+/// at solve time, which is the one gate that must not move.
+///
+/// `class` on a returned candidate CAN be [`crate::param_class::ParamClass::Other`] (unlike
+/// [`level_candidates_for_node`]'s, which never is) — that is the annotation the picker sorts
+/// and warns on. `ParamInfo.range` is meaningless for `Other`, so a consumer must read the
+/// class before trusting a range.
+pub fn all_numeric_candidates_for_node(
+    group_id: &str,
+    node_id: &str,
+    fender_id: &str,
+    params: &serde_json::Map<String, Value>,
+) -> Vec<LevelParamCandidate> {
+    let mut out: Vec<LevelParamCandidate> = params
+        .iter()
+        .filter_map(|(k, v)| {
+            let current = v.as_f64()?;
+            Some(LevelParamCandidate {
+                group_id: group_id.to_string(),
+                node_id: node_id.to_string(),
+                fender_id: fender_id.to_string(),
+                parameter_id: k.clone(),
+                current,
+                class: crate::param_class::classify(fender_id, k).class,
+            })
+        })
+        .collect();
+    // Stable, deterministic order: rank, then key. `sort_by` (not `sort_unstable_by`) so an
+    // equal-rank pair keeps the map's own iteration order as the tiebreak fallback.
+    let rank = |class: crate::param_class::ParamClass| -> u8 {
+        use crate::param_class::ParamClass::*;
+        match class {
+            LevelLinear | LevelDb => 0,
+            WetMix => 1,
+            Other => 2,
+        }
+    };
+    out.sort_by(|a, b| {
+        rank(a.class)
+            .cmp(&rank(b.class))
+            .then_with(|| a.parameter_id.cmp(&b.parameter_id))
+    });
+    out
 }
 
 /// Enumerate the preset's BLOCK-ACTING footswitches (`func:"on-off"` / `func:"param"`),
@@ -231,12 +291,22 @@ pub fn enumerate_block_footswitches(ftsw: &Value, preset: &Value) -> Vec<Footswi
         let mut level_params: Vec<LevelParamCandidate> = Vec::new();
         let mut seen: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
+        // The combined picker's superset, deduped on its own key set (a param can be a
+        // candidate in both lists and must appear exactly once in each).
+        let mut all_params: Vec<LevelParamCandidate> = Vec::new();
+        let mut seen_all: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for (g, nid) in &acted {
             if let Some((fid, params)) = nodes.get(nid) {
                 level_params.extend(
                     level_candidates_for_node(g, nid, fid, params)
                         .into_iter()
                         .filter(|c| seen.insert((nid.clone(), c.parameter_id.clone()))),
+                );
+                all_params.extend(
+                    all_numeric_candidates_for_node(g, nid, fid, params)
+                        .into_iter()
+                        .filter(|c| seen_all.insert((nid.clone(), c.parameter_id.clone()))),
                 );
             }
         }
@@ -246,6 +316,7 @@ pub fn enumerate_block_footswitches(ftsw: &Value, preset: &Value) -> Vec<Footswi
             link_group,
             functions,
             level_params,
+            all_params,
         });
     }
     out
@@ -369,18 +440,6 @@ pub struct SwitchStates {
     /// One `param` function each: `(group, node, param, valueA, valueB)` — the engaged and
     /// disengaged values. A function missing either value is skipped (nothing to write).
     pub params: Vec<(String, String, String, f32, f32)>,
-}
-
-impl SwitchStates {
-    /// Does engaging this switch change NOTHING measurable — no on-off node flips and no
-    /// param function to jump? Then the two captures would be byte-identical by
-    /// construction and the delta a guaranteed 0.0, so the caller refuses BEFORE paying two
-    /// ~10 s re-amp captures for a known answer. (Only reachable for a switch whose
-    /// block-acting functions are all `param` ones with no `valueA`/`valueB` — the
-    /// enumerator already drops switches with no block-acting function at all.)
-    pub fn changes_nothing(&self) -> bool {
-        self.params.is_empty() && self.engaged_bypass == self.disengaged_bypass
-    }
 }
 
 /// Derive [`SwitchStates`] for `switch` from the SAVED (field-8) preset. PURE — no device
@@ -924,9 +983,195 @@ impl crate::bulkrun::Operation for FootswitchLayoutOp {
     }
 }
 
+// ───────────────────── Scene context for a footswitch sound (D3) ─────────────────────
+
+/// One switch's SCENE-CONTEXT answer for the leveling picker: which FS scenes turn this switch
+/// on, and which one (if any) the UI should preselect.
+///
+/// PICKER-PRESELECT ONLY — the caveat travels with the shape that crosses the wire, because
+/// this is what a consumer reads: both fields are derived from a DERIVED CACHE the real device
+/// ignores on recall, so neither may ever decide what to WRITE (full rationale:
+/// [`scene_contexts_for_switches`]'s doc).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsSceneContext {
+    pub switch: u32,
+    /// The 0-based `scenes[]` wire slots whose overlay ENABLES this switch, in scene order.
+    pub enabling_scenes: Vec<u32>,
+    /// What to preselect: `Some(i)` iff EXACTLY ONE scene enables the switch — then that scene
+    /// is unambiguously the sound the player reaches by tapping it. `None` = level it in the
+    /// BASE context, which is both the historical behaviour and the only defensible answer when
+    /// zero scenes (nothing to infer) or several (no single right one) enable it. The user may
+    /// still override to any scene, including a non-enabling one; the picker flags that.
+    pub suggested: Option<u32>,
+}
+
+/// Which scenes enable each footswitch, read off `scenes[].ftswStates` — one bool per switch,
+/// positionally aligned with `ftsw` (an invariant the fixture gates already assert).
+///
+/// PURE, and PICKER-PRESELECT ONLY. `ftswStates` is a DERIVED CACHE: the real device ignores it
+/// on recall and re-derives the switch state from the scene's own block overlays
+/// (`sim_device.rs` documents the same), so it must never be used to decide what to WRITE or
+/// what a capture will sound like. As the source for "which scene did the player mean when they
+/// wrote this switch", it is exactly right — it is what the authoring app recorded.
+///
+/// A scene with no readable `ftswStates` (a truncated field-8 tail takes `scenes` first)
+/// contributes nothing, so a preset that cannot be read simply falls back to base — the
+/// conservative side.
+pub fn scene_contexts_for_switches(preset: &Value) -> Vec<FsSceneContext> {
+    let switch_count = preset
+        .get("ftsw")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let scenes = preset
+        .get("scenes")
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a.as_slice());
+    (0..switch_count)
+        .map(|switch| {
+            let enabling_scenes: Vec<u32> = scenes
+                .iter()
+                .enumerate()
+                .filter(|(_, sc)| {
+                    sc.get("ftswStates")
+                        .and_then(Value::as_array)
+                        .and_then(|st| st.get(switch))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .map(|(i, _)| i as u32)
+                .collect();
+            FsSceneContext {
+                switch: switch as u32,
+                suggested: match enabling_scenes.as_slice() {
+                    [one] => Some(*one),
+                    _ => None,
+                },
+                enabling_scenes,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 3-scene / 3-switch preset: switch 0 enabled by scene 1 ALONE (the auto-detect case),
+    /// switch 1 by scenes 0 and 2 (ambiguous), switch 2 by nobody.
+    fn scene_context_preset() -> Value {
+        serde_json::json!({
+            "ftsw": [[], [], []],
+            "scenes": [
+                { "ftswStates": [false, true, false] },
+                { "ftswStates": [true, false, false] },
+                { "ftswStates": [false, true, false] }
+            ]
+        })
+    }
+
+    // (D3) EXACTLY ONE enabling scene auto-detects; zero or several fall back to base — the
+    // only two answers that don't guess on the player's behalf.
+    #[test]
+    fn a_switch_enabled_by_exactly_one_scene_preselects_that_scene() {
+        let rows = scene_contexts_for_switches(&scene_context_preset());
+        assert_eq!(rows.len(), 3, "one row per switch");
+        assert_eq!(rows[0].enabling_scenes, vec![1]);
+        assert_eq!(rows[0].suggested, Some(1));
+        assert_eq!(rows[1].enabling_scenes, vec![0, 2]);
+        assert_eq!(
+            rows[1].suggested, None,
+            "two enabling scenes: no single right one"
+        );
+        assert!(rows[2].enabling_scenes.is_empty());
+        assert_eq!(rows[2].suggested, None, "nothing enables it: base");
+    }
+
+    // A truncated / absent `scenes` tail must fall back to base, never invent a context.
+    #[test]
+    fn an_unreadable_scene_list_falls_back_to_base() {
+        let rows = scene_contexts_for_switches(&serde_json::json!({ "ftsw": [[], []] }));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.suggested.is_none()));
+        // A scene whose `ftswStates` is missing or short contributes nothing rather than
+        // shifting every later switch's answer by one.
+        let short = serde_json::json!({
+            "ftsw": [[], []],
+            "scenes": [{ "ftswStates": [true] }, { "name": "no states" }]
+        });
+        let rows = scene_contexts_for_switches(&short);
+        assert_eq!(rows[0].suggested, Some(0));
+        assert!(rows[1].enabling_scenes.is_empty());
+    }
+
+    // The wire shape the picker reads.
+    #[test]
+    fn a_scene_context_row_serializes_camel_case() {
+        let rows = scene_contexts_for_switches(&scene_context_preset());
+        let json = serde_json::to_value(&rows[0]).expect("serialize");
+        assert_eq!(json["switch"], 0);
+        assert_eq!(json["enablingScenes"], serde_json::json!([1]));
+        assert_eq!(json["suggested"], 1);
+    }
+
+    // ITEM 4 — THE COMBINED PICKER'S SOURCE. `all_numeric_candidates_for_node` lists EVERY
+    // numeric param of the block, annotated with the classifier's verdict and with the
+    // level-class controls first, while `level_candidates_for_node` — the SAFE-DEFAULT source
+    // every pre-selection reads — is untouched and still admits only recognised controls.
+    //
+    // The split is the whole point: widening the default source would let an `Other` param
+    // become a DEFAULT pick and silently sweep a control that changes the effect, not the
+    // volume.
+    #[test]
+    fn the_combined_picker_lists_every_numeric_param_and_ranks_level_controls_first() {
+        use crate::param_class::ParamClass;
+        let params: serde_json::Map<String, Value> = serde_json::from_value(serde_json::json!({
+            // Deliberately NOT in the answer's order, so a pass proves the sort ran.
+            "tone": 0.4,
+            "blend": 0.5,
+            "level": 0.7,
+            "bypass": false,
+            "clipState": "hard",
+        }))
+        .expect("params");
+
+        let all = all_numeric_candidates_for_node("G1", "n1", "ACD_TubeScreamer", &params);
+        let names: Vec<&str> = all.iter().map(|c| c.parameter_id.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["level", "blend", "tone"],
+            "every NUMERIC param, level-class first then wet/mix then the rest: {all:?}"
+        );
+        assert!(
+            all.iter().all(|c| c.node_id == "n1" && c.group_id == "G1"),
+            "the node coordinates ride on every candidate: {all:?}"
+        );
+        // Non-numeric keys are not params a solve could ever sweep.
+        assert!(
+            !names.contains(&"bypass") && !names.contains(&"clipState"),
+            "bool/string state keys are not candidates: {all:?}"
+        );
+        // The annotation is what the picker sorts and warns on — `Other` DOES appear here.
+        let tone = all.iter().find(|c| c.parameter_id == "tone").expect("tone");
+        assert_eq!(tone.class, ParamClass::Other);
+        assert_eq!(tone.current, 0.4, "the authored value rides along");
+
+        // THE SAFE DEFAULT IS UNCHANGED: still only classifier-recognised controls, and never
+        // `Other`.
+        let safe = level_candidates_for_node("G1", "n1", "ACD_TubeScreamer", &params);
+        assert!(
+            safe.iter().all(|c| c.class != ParamClass::Other),
+            "the pre-selection source must never offer an unrecognised control: {safe:?}"
+        );
+        assert!(
+            !safe.iter().any(|c| c.parameter_id == "tone"),
+            "an `Other` param is not a default candidate: {safe:?}"
+        );
+        assert!(
+            safe.len() < all.len(),
+            "the combined list is a strict superset: {safe:?} vs {all:?}"
+        );
+    }
     use std::path::PathBuf;
 
     fn scene_switch(label: &str, slot: u64) -> Value {
@@ -979,7 +1224,6 @@ mod tests {
             .disengaged_bypass
             .contains(&("G1".into(), "drive".into(), true)));
         assert!(st.params.is_empty());
-        assert!(!st.changes_nothing());
     }
 
     // A PURE-param switch has no bypass difference at all — its engaged state is the param
@@ -1015,10 +1259,13 @@ mod tests {
             st.engaged_bypass, st.disengaged_bypass,
             "no on-off function → no bypass difference"
         );
-        assert!(!st.changes_nothing(), "the param jump IS the engaged state");
+        assert!(!st.params.is_empty(), "the param jump IS the engaged state");
         // Switch 1's only function is the valueB-less one → nothing measurable at all.
         let none = switch_states(&ftsw, &preset, 1);
-        assert!(none.changes_nothing());
+        assert!(
+            none.params.is_empty() && none.engaged_bypass == none.disengaged_bypass,
+            "a switch whose param functions carry no values changes nothing measurable"
+        );
     }
 
     // The re-run idempotency anchor: the stored valueA of an existing param function.

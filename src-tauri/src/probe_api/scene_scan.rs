@@ -58,6 +58,8 @@ pub fn probe_level_scenes_oneshot(
             commit,
             restore_scene.filter(|_| commit),
             saved.as_ref(),
+            // No headroom trade on this dev arm — it runs the jobs verbatim.
+            None,
             |_, _| {},
             || false,
         )
@@ -69,6 +71,8 @@ pub fn probe_level_scenes_oneshot(
             commit,
             restore_scene.filter(|_| commit),
             saved.as_ref(),
+            // No headroom trade on this dev arm — it runs the jobs verbatim.
+            None,
             |_, _| {},
             || false,
         )
@@ -124,7 +128,7 @@ pub fn probe_knob_sweep(
     std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
     let mut out = format!("[probe --knob-sweep] list_index={list_index} {group}/{node}.{param}\n");
     for v in values {
-        let l = leveller::measure_fs_at((group, node, param), &[], &stim, *v)?;
+        let l = leveller::measure_fs_at(None, (group, node, param), &[], &stim, *v)?;
         out += &format!(
             "  {param}={v:.3} → integrated {:.3} LUFS  short-term-max {:.3}\n",
             l.integrated_lufs, l.short_term_max_lufs

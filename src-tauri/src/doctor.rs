@@ -4881,6 +4881,7 @@ mod tests {
                 is_active: false,
             }],
             level_params: Vec::new(),
+            all_params: Vec::new(),
         }
     }
 

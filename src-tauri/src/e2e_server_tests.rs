@@ -406,14 +406,21 @@ fn level_defaults_base_clamps_and_the_split_lane_footswitch_is_offbranch() {
     );
 }
 
-/// VERIFY-ONLY footswitch row (the row a user gave NO leveling handle): it must MEASURE the
-/// engaged-vs-disengaged delta and WRITE NOTHING. Slot 405's Plumes switch is the fixture
-/// with a real delta — engaged the pedal's own knob drives the saturated-amp curve
-/// (`saturated_pedal_lufs` at its authored 0.5), disengaged the preset falls through to the
-/// flat base C — so a verify row that silently degraded into a solve, or one whose engaged
-/// capture read as off-branch silence, both fail here.
+/// THE FS PREPASS CEILING (the reordered run's footswitch half): one engage with the leveling
+/// handle PINNED AT THE TOP of its range reads how loud this footswitch sound can possibly be
+/// — a MEASUREMENT, never an extrapolation, because an arbitrary block param has no
+/// algebraically predictable response.
+///
+/// Slot 405's Plumes switch (5) is the fixture: its block is OFF in base, so engaging it puts
+/// the saturated-amp curve in charge, and the ceiling must equal that curve AT THE HANDLE'S
+/// TOP BOUND (`saturated_pedal_lufs(1.0)`), not at its authored 0.5. A prepass that forgot to
+/// pin the handle, or that measured the disengaged sound, both fail here.
+///
+/// It must also WRITE NOTHING PERSISTENT: every write lands on the throwaway capture
+/// connection's working copy, which is what makes a ceiling read safe to take before the run
+/// has decided anything.
 #[test]
-fn verify_only_footswitch_row_measures_a_delta_and_writes_nothing() {
+fn the_fs_prepass_reads_the_ceiling_at_the_handles_top_bound() {
     let _serial = serial();
     set_e2e_env(&[
         (
@@ -444,36 +451,24 @@ fn verify_only_footswitch_row_measures_a_delta_and_writes_nothing() {
         let mut s = crate::session::Session::connect_lean().expect("connect");
         s.load_preset(405).expect("load 405");
     }
-    // Switch 5 = the Plumes on-off; its block is OFF in base, so engaging it turns the pedal
-    // on and the saturated-amp curve takes over from the flat C.
     let states = crate::footswitch::switch_states(&ftsw, &preset, 5);
-    let r = crate::leveller::verify_footswitch(5, &states, &stim, -23.0, 0.5)
-        .expect("verify the Plumes switch");
-
-    let delta = r
-        .on_off_delta_lu
-        .expect("a verify row always carries a delta");
-    // Engaged: the pedal curve at its authored 0.5. Disengaged: the flat base C (-21).
-    let expected = crate::sim_device::saturated_pedal_lufs(0.5).unwrap() - (-21.0);
+    let handle = crate::leveller::FsParamTarget::new("ACD_Plumes", "level", 0.5);
+    let probe = crate::leveller::FsCeilingProbe {
+        scene: None,
+        states: &states,
+        handle: ("G1".to_string(), "ACD_Plumes".to_string(), handle.clone()),
+    };
+    // THROUGH THE SIM — the only half this seam test owns. (The probe's PURE composition is
+    // pinned without a device by `leveller::reordered_run_tests::
+    // the_ceiling_probe_pins_the_handle_at_its_top_bound_and_writes_it_last`.)
+    let (_, hi) = handle.bounds();
+    let ceiling = crate::leveller::measure_fs_ceiling(&probe, &stim).expect("ceiling read");
+    let expected = crate::sim_device::saturated_pedal_lufs(hi).unwrap();
     assert!(
-        (delta - expected).abs() < 0.3,
-        "engaged-vs-disengaged delta should be ~{expected:.2} LU, got {delta:.2} ({r:?})"
-    );
-    assert!(!r.saved, "a verify row never saves");
-    assert_eq!(r.method, "verify");
-    // WROTE NOTHING: not one float `changeParameter` on the pedal's own knob. (The bypass
-    // force-list is not a knob write — it is the isolation both captures need, and it lives
-    // only in the throwaway capture connections' working copy.)
-    let wrote_knob = sim.events().iter().any(|e| {
-        matches!(
-            e,
-            crate::sim_device::SimEvent::ChangeParameter { param, .. } if param == "level"
-        )
-    });
-    assert!(
-        !wrote_knob,
-        "a verify row must not write the block's knob: {:?}",
-        sim.events()
+        (ceiling.integrated_lufs - expected).abs() < 0.3,
+        "the ceiling is the engaged curve at the handle's TOP ({expected:.2}), not at its \
+         authored value — got {:.2}",
+        ceiling.integrated_lufs
     );
 }
 
@@ -562,8 +557,8 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
         lev_node_id: NODE.into(),
         lev_parameter_id: PARAM.into(),
         target_lufs: TARGET,
-        mode: Default::default(),
         display_label: None,
+        scene_context: None,
     };
     let (value_b, write_spec) =
         crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
@@ -851,8 +846,8 @@ fn solve_400_spring(
         lev_node_id: NODE.into(),
         lev_parameter_id: PARAM.into(),
         target_lufs,
-        mode: Default::default(),
         display_label: None,
+        scene_context: None,
     };
     let (value_b, write_spec) =
         crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
@@ -1993,6 +1988,8 @@ fn scene_offset_mode_preserves_each_scenes_distance_and_reports_the_effective_ta
         false,
         None,
         saved.as_ref(),
+        // No headroom trade in this fixture run.
+        None,
         |_, _| {},
         || false,
     )
@@ -2091,6 +2088,8 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         rebalanceable: false,
         target_mode: crate::leveller::SceneTargetMode::Match,
         handle: Some(handle),
+        // Legacy order: the solve takes its own as-is capture (no reordered prepass here).
+        prepass: None,
     };
     let outcomes = crate::leveller::level_scenes_oneshot(
         404,
@@ -2099,6 +2098,8 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         false,
         None,
         saved.as_ref(),
+        // No headroom trade in this fixture run.
+        None,
         |_, _| {},
         || false,
     )
@@ -2297,4 +2298,569 @@ fn a_mid_batch_failure_keeps_every_surviving_scenes_identity_and_emits_its_row()
         "the clamped row is EMITTED with clamped:true (SKIP downstream), not dropped: {body}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────── The benefit-aware headroom trade, through the real batched command ─────────
+//
+// Every clause of the arming rule (`plan_trade_for_batch`) needs its own piece of fixture: a
+// SAVE run, a base row leveled by the amp FADER (no user handle), and a scene that CLAMPS and
+// BENEFITS. Slot 404's scene 3 ("Base Scene") is that scene — a FULL overlay pins its
+// `outputLevel` independently of base, so the compensating fader drop misses it, and the
+// authored C table puts it 14 LU below base, far under any shipped target.
+//
+// WHY 404 SCENE 3 AND NOT 400 SCENE 2 (the obvious "Ceiling" candidate). The fake serves ONE
+// graph for every scene recall, so the live prepass reads every scene's knob as BASE's value —
+// which is what `classify_scene_knobs` takes as the row's `current`, hence what
+// `scene_ceiling_lufs` extrapolates from. On 400 that reads scene 2's knob as 0.35 when the
+// preset authors it at 1.0, inventing 9 dB of headroom the sound does not have, and nothing
+// ever clamps. 404's scene 3 authors the SAME `outputLevel` as base (0.69), so the plan and the
+// capture model agree about that row and its clamp is real.
+
+/// Reset the SCENE LANE'S CANCEL FLAG when the test ends, INCLUDING on a panicking assert.
+/// It is process-global and cleared only at a scene command's own entry, so a leaked `true`
+/// stops the next serial test that levels a scene before its first solve.
+struct SceneCancelReset;
+impl Drop for SceneCancelReset {
+    fn drop(&mut self) {
+        crate::commands::level_scenes::SCENE_LEVEL_CANCEL
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The physics env (fixtures + the authored C table + the backup blob + the stimulus) plus a
+/// live sim wired as the transport factory. Returns the fake so the caller can read its event
+/// log and its `presetLevel`. Also returns the event index the RUN starts at — the seed below
+/// saves, and a `Saved` count has to be able to exclude it.
+fn trade_sim() -> (crate::sim_device::SimDevice, usize) {
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+        (
+            "TMP_E2E_BACKUP_FIXTURE",
+            "/../e2e/fixtures/backup-fixture.bin",
+        ),
+        (
+            "TMP_E2E_STIMULUS",
+            "/resources/samples/guitar-humbucker.wav",
+        ),
+    ]);
+    crate::leveller::clear_slot_save_registry();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    // MAKE THE FAKE'S TWO PRESET-LEVEL TRUTHS AGREE, which the trade needs and no other gate
+    // does. A fresh sim's LIVE `presetLevel` is 1.0 until the slot has been saved this run
+    // (`SimState::ever_saved` gates the load-time restore), while the FIELD-8 document the
+    // planner reads its headroom from is the fixture's authored 0.6. Left alone the planner
+    // sees 4.4 dB of room the capture model does not have and trades against a level the
+    // physics is not at. One save round trip settles both on 0.6 — the state a real unit is
+    // always in, since a load there restores the saved level.
+    {
+        let mut s = crate::session::Session::connect_lean().expect("connect");
+        s.load_preset(TRADE_SLOT).expect("load the trade fixture");
+        s.set_preset_level(TRADE_PRESET_LEVEL)
+            .expect("seed presetLevel");
+        s.save_current_preset(TRADE_SLOT).expect("seed save");
+    }
+    let from = sim.events().len();
+    (sim, from)
+}
+
+/// The trade fixture: slot 404 (E2E Hiwatt 3S), its authored `audioGraph.presetLevel`, its one
+/// guitar amp at that amp's authored base `outputLevel` (the fader the trade pays with), and
+/// the scene whose FULL overlay authors the SAME `outputLevel` as base — the row whose clamp
+/// the offline capture model and the planner agree about (see the section header).
+const TRADE_SLOT: u32 = 404;
+const TRADE_PRESET_LEVEL: f32 = 0.6;
+const TRADE_AMP: &str = "ACD_HiwattDR103CanMod";
+const TRADE_BASE_FADER: f32 = 0.69;
+const TRADE_SCENE: u64 = 3;
+
+fn trade_amp_candidates() -> serde_json::Value {
+    serde_json::json!([{
+        "groupId": "G1", "nodeId": TRADE_AMP,
+        "parameterId": "outputLevel", "value": TRADE_BASE_FADER
+    }])
+}
+
+/// One `level_scenes_apply_batched` app + webview, built the way the offline UI drives it. The
+/// `App` is returned only to be held: dropping it takes the webview with it.
+fn batched_scene_app() -> (tauri::App<MockRuntime>, WebviewWindow<MockRuntime>) {
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![level_scenes_apply_batched])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    (app, webview)
+}
+
+/// The row a batched scene result names. Base rides the wire as a NULL `scene_slot` — the
+/// `BASE_SCENE_SLOT` sentinel is not a `scenes[]` index (`outcome_to_level_result`).
+fn scene_row(rows: &[serde_json::Value], scene: Option<u64>) -> Option<&serde_json::Value> {
+    rows.iter().find(|r| match scene {
+        Some(s) => r["scene_slot"].as_u64() == Some(s),
+        None => r["scene_slot"].is_null(),
+    })
+}
+
+/// ⟦F1⟧ THE TRADE, LANDED AND PERSISTED, through the real batched command. At the shipped −21
+/// default 404's scene 3 is 11 LU short with its own knob already at the top, and it BENEFITS
+/// (a Full overlay pins that knob independently of base) — the one shape that justifies
+/// churning the base pair, so the run raises base `presetLevel` and solves the base amp fader
+/// back down to leave base exactly where it was asked for. `presetLevel` is the smaller of the
+/// two rooms here, so the raise is TRIMMED to the 4.44 dB left above 0.6 and says so; the row
+/// it was bought for is 4.44 LU louder for it and still, honestly, clamped.
+///
+/// THE PAIR IS ONE EDIT AND HAS TO PERSIST AS ONE (`apply_headroom_trade`'s atomicity note):
+/// half of it saved leaves the preset uniformly loud or uniformly quiet, and `danger.md` says
+/// a save cannot be undone from the app. So both halves are read back out of the SAVED
+/// document after the batch's ONE save, against the summary the run itself reported — that
+/// summary is the UI's disclosure AND its restore anchor, so one that disagrees with the
+/// device is worse than none.
+///
+/// TWO ASSERTIONS TOGETHER SEE THE REGRESSION THIS CLOSES, and neither does alone. The hold's
+/// fader writes SEED the runner's `written` list; base's own row is left AT target by the hold
+/// (`scene_at_target`), so the base slot gets a post-save verdict at all only because the
+/// trade's writes are in that list — drop them and `persist_mismatch` reads `None`, the re-read
+/// confirming the scenes while saying nothing about the pair that moved every one of them. That
+/// the verdict is about the TRADE's value rather than some later base solve is what the saved
+/// fader equalling `trade.base_amps[0].value` pins down.
+#[test]
+fn a_batched_scene_run_persists_both_halves_of_a_landed_headroom_trade() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _cancel_reset = SceneCancelReset;
+    let (sim, from) = trade_sim();
+    let (_app, webview) = batched_scene_app();
+
+    // Base (wire slot 8) + the deep-quiet benefiting scene, both at the shipped −21 default.
+    let jobs = serde_json::json!([
+        {"sceneSlot": 8, "targetLufs": -21.0},
+        {"sceneSlot": TRADE_SCENE, "targetLufs": -21.0}
+    ]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": TRADE_SLOT, "jobs": jobs, "candidates": trade_amp_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    let rows = res.as_array().expect("results array").clone();
+    assert_eq!(
+        rows.len(),
+        2,
+        "base + the clamped scene both level: {rows:?}"
+    );
+
+    // The trade rides EVERY row: it moved the whole preset's gain structure, not one row's.
+    for r in &rows {
+        assert_eq!(
+            r["trade"]["applied"],
+            serde_json::json!(true),
+            "an applied (not advisory) trade is disclosed on every row: {r}"
+        );
+    }
+    let trade = rows[0]["trade"].clone();
+    let raise_db = trade["raise_db"].as_f64().expect("raise_db");
+    let previous_pl = trade["previous_preset_level"].as_f64().expect("previous") as f32;
+    let raised_pl = trade["preset_level"].as_f64().expect("preset_level") as f32;
+    assert!(
+        (raise_db - 4.437).abs() < 0.1,
+        "the raise is all the dB `presetLevel` had left above 0.6, not the 11 the clamp \
+         wanted: {trade}"
+    );
+    assert_eq!(
+        trade["cap"], "preset_level_max",
+        "…and the BINDING cap is named — the fader had 36 dB, presetLevel had 4.4: {trade}"
+    );
+    assert_eq!(
+        trade["benefiting"],
+        serde_json::json!([{ "kind": "scene", "sceneSlot": TRADE_SCENE }]),
+        "the raise was bought for the Full-overlay scene, by identity: {trade}"
+    );
+
+    // HALF ONE — presetLevel really rose, on the device, by exactly the reported raise.
+    assert!(
+        (previous_pl - TRADE_PRESET_LEVEL).abs() < 1e-3,
+        "fixture premise: the trade slot is authored at presetLevel {TRADE_PRESET_LEVEL}, got \
+         {previous_pl}"
+    );
+    assert!(
+        (crate::headroom_trade::raised_preset_level(previous_pl, raise_db) - raised_pl).abs()
+            < 1e-4,
+        "the summary's raised level is the exact linear solution: {trade}"
+    );
+    assert!(
+        (sim.preset_level() - raised_pl).abs() < 1e-3,
+        "the unit holds the raised presetLevel, got {}: {trade}",
+        sim.preset_level()
+    );
+
+    // HALF TWO — the base fader PAID for it, and base is still exactly where it was asked for.
+    let amp = trade["base_amps"][0].clone();
+    let fader = amp["value"]
+        .as_f64()
+        .expect("a landed trade SOLVED the fader") as f32;
+    let previous_fader = amp["previous_value"].as_f64().expect("previous_value") as f32;
+    assert!(
+        fader < previous_fader,
+        "the compensating fader went DOWN from {previous_fader}, got {fader}"
+    );
+    let base = scene_row(&rows, None)
+        .unwrap_or_else(|| panic!("a base row: {rows:?}"))
+        .clone();
+    let base_lufs = base["measured_lufs"].as_f64().expect("base lufs");
+    assert!(
+        (base_lufs + 21.0).abs() < 0.5,
+        "base is HELD at its target — the whole point of paying with the fader: {base}"
+    );
+    // The sound the raise was bought for is `raise_db` louder than its own pre-trade ceiling —
+    // and STILL clamped, reported honestly with its own cause. A capped trade buys real
+    // loudness without pretending it closed the gap.
+    const PRE_TRADE_CEILING: f64 = -32.21; // C −31 at presetLevel 0.6, knob 0.69 → 1.0
+    let scene = scene_row(&rows, Some(TRADE_SCENE))
+        .unwrap_or_else(|| panic!("a scene {TRADE_SCENE} row: {rows:?}"))
+        .clone();
+    let scene_lufs = scene["measured_lufs"].as_f64().expect("scene lufs");
+    assert!(
+        (scene_lufs - (PRE_TRADE_CEILING + raise_db)).abs() < 0.5,
+        "the benefiting row gains EXACTLY the raise (presetLevel is exactly linear in dB): \
+         {scene}"
+    );
+    assert_eq!(
+        scene["clamped"],
+        serde_json::json!(true),
+        "…and it is still short of −21, which the row must keep saying: {scene}"
+    );
+    assert_eq!(
+        scene["clamp_kind"], "scene_ceiling",
+        "the trade LANDED, so the clamp is the ordinary headroom one — not `trade_floor` or \
+         `partial_trade`, which describe the base pair's own fate: {scene}"
+    );
+
+    // BOTH HALVES AT THE ONE SAVE. One `saveCurrentPreset`, and the re-read finds the pair.
+    assert_eq!(
+        sim.events()[from..]
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(s) if *s == TRADE_SLOT))
+            .count(),
+        1,
+        "exactly one deferred save persists the batch: {:?}",
+        &sim.events()[from..]
+    );
+    let saved = crate::read_saved_preset(TRADE_SLOT).expect("the saved preset re-reads");
+    let saved_pl = crate::audiograph::preset_level(&saved).expect("saved presetLevel") as f32;
+    assert!(
+        (saved_pl - raised_pl).abs() < 1e-3,
+        "the SAVED document carries the raised presetLevel, got {saved_pl}"
+    );
+    let saved_fader =
+        crate::commands::level_footswitch::node_param_f64(&saved, TRADE_AMP, "outputLevel")
+            .expect("saved base outputLevel") as f32;
+    assert!(
+        (saved_fader - fader).abs() < 1e-3,
+        "…and the solved base fader alongside it, got {saved_fader} vs the reported {fader}"
+    );
+    assert_eq!(
+        base["persist_mismatch"],
+        serde_json::json!(false),
+        "the trade's own writes are in the run's verified set — base is left at target by the \
+         hold, so this reads `None` the moment they are dropped from it: {base}"
+    );
+}
+
+/// Fire the scene lane's STOP the moment the sim records a `changeParameter` on `scene`'s own
+/// `outputLevel` overlay — a wire event that happens exactly ONCE in the run (the prepass
+/// writes nothing, and both the base row and the trade's hold write under the base sentinel),
+/// so the cancel lands at one reproducible point with no timer and no watcher thread.
+///
+/// It stores the LANE flag directly instead of calling `cancel_scene_leveling`, which would
+/// also raise `device_gate::OP_ABORT` and kill the capture already in flight. The lane flag is
+/// read only at `run_scene_jobs`' loop top, so the scene under way FINISHES and the stop lands
+/// on the NEXT job — precisely the "cancel after the trade landed, mid-batch" shape.
+struct CancelAtSceneWrite {
+    sim: crate::sim_device::SimDevice,
+    scene: i64,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CancelAtSceneWrite {
+    fn check(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.fired.load(SeqCst) {
+            return;
+        }
+        let hit = self.sim.events().iter().any(|e| {
+            matches!(e, crate::sim_device::SimEvent::ChangeParameter { scene, param, .. }
+                if *scene == self.scene && param == "outputLevel")
+        });
+        if hit {
+            self.fired.store(true, SeqCst);
+            crate::commands::level_scenes::SCENE_LEVEL_CANCEL.store(true, SeqCst);
+        }
+    }
+}
+
+impl crate::hid::HidTransport for CancelAtSceneWrite {
+    fn send(&self, body: &[u8]) -> Result<(), String> {
+        let r = crate::hid::HidTransport::send(&self.sim, body);
+        self.check();
+        r
+    }
+    fn transact(&self, body: &[u8], pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        let r = crate::hid::HidTransport::transact(&self.sim, body, pump_ms);
+        self.check();
+        r
+    }
+    fn transact_chunked(&self, body: &[u8], pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        let r = crate::hid::HidTransport::transact_chunked(&self.sim, body, pump_ms);
+        self.check();
+        r
+    }
+    fn pump(&self, pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        crate::hid::HidTransport::pump(&self.sim, pump_ms)
+    }
+    fn transact_eager(&self, body: &[u8], max_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        let r = crate::hid::HidTransport::transact_eager(&self.sim, body, max_ms);
+        self.check();
+        r
+    }
+}
+
+/// ⟦F2⟧ CANCEL AFTER A LANDED TRADE RETURNS ITS OUTCOMES AND DISCLOSES THE TRADE — it does not
+/// come back as the bare `CANCELLED` sentinel, whose results the command maps to an EMPTY vec.
+/// That historical shape is the silent-wrong-numbers outcome this codebase refuses: the save
+/// on the stopped path has already persisted the raised `presetLevel` + the base fader holding
+/// base on target, every scene already solved was solved AT that raised level, and handing
+/// back nothing would leave the preset carrying a gain-structure change the UI never mentioned
+/// and cannot offer to restore (danger.md — see ⟦F1⟧'s doc).
+///
+/// JOB ORDER IS LOAD-BEARING, and so is which row triggers. The benefiting scene is the row
+/// that WRITES its own overlay (base is left exactly at target by the hold), so it
+/// is the cancel's trigger — and a third job follows it purely so the stop has an unstarted
+/// job to land on. It has to land at a LOOP TOP with at least one row already attempted: land
+/// it earlier and the runner takes its pre-solve exit, which reloads the preset and discards
+/// the untraded-for pair, exactly as the back-out does.
+#[test]
+fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _cancel_reset = SceneCancelReset;
+    let (sim, from) = trade_sim();
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (sf, ff) = (sim.clone(), fired.clone());
+        crate::session::e2e_transport::set_factory(Box::new(move || {
+            Box::new(CancelAtSceneWrite {
+                sim: sf.clone(),
+                scene: TRADE_SCENE as i64,
+                fired: ff.clone(),
+            })
+        }));
+    }
+    let (_app, webview) = batched_scene_app();
+
+    let jobs = serde_json::json!([
+        {"sceneSlot": 8, "targetLufs": -21.0},
+        {"sceneSlot": TRADE_SCENE, "targetLufs": -21.0},
+        {"sceneSlot": 1, "targetLufs": -21.0}
+    ]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": TRADE_SLOT, "jobs": jobs, "candidates": trade_amp_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("a cancelled run that traded must return Ok, not an error");
+    let rows = res.as_array().expect("results array").clone();
+
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate is vacuous unless the stop actually fired: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "base + the scene that finished come back; the stop landed on the LAST job's loop \
+         top — the historical shape returned an EMPTY vec here: {rows:?}"
+    );
+    assert!(
+        scene_row(&rows, Some(1)).is_none(),
+        "the unstarted job emits no row: {rows:?}"
+    );
+    assert!(
+        scene_row(&rows, None).is_some() && scene_row(&rows, Some(TRADE_SCENE)).is_some(),
+        "and the two that ran name themselves: {rows:?}"
+    );
+
+    // THE DISCLOSURE — on every returned row, with the pre-trade values a Restore needs.
+    for r in &rows {
+        assert_eq!(
+            r["trade"]["applied"],
+            serde_json::json!(true),
+            "a cancelled run that PERSISTED a trade must say so: {r}"
+        );
+        assert!(
+            r["trade"]["raise_db"].as_f64().expect("raise_db") > 0.0,
+            "…with the raise it actually made: {r}"
+        );
+        assert!(
+            r["trade"]["base_amps"][0]["previous_value"].is_number()
+                && r["trade"]["previous_preset_level"].is_number(),
+            "…and both restore anchors: {r}"
+        );
+    }
+
+    // PERSISTED, not backed out: one save, and the unit holds the raised pair.
+    assert_eq!(
+        sim.events()[from..]
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(s) if *s == TRADE_SLOT))
+            .count(),
+        1,
+        "the stopped path still fires the batch's ONE save: {:?}",
+        &sim.events()[from..]
+    );
+    let raised = rows[0]["trade"]["preset_level"].as_f64().expect("level") as f32;
+    assert!(
+        (sim.preset_level() - raised).abs() < 1e-3,
+        "the raised pair stands — backing it out would leave every solved scene off target by \
+         the raise while the run reported it on: got {}",
+        sim.preset_level()
+    );
+}
+
+/// ⟦F3⟧ A FOOTSWITCH ROW'S SCENE CONTEXT IS A MEASUREMENT ORDER, not a label. `measure_fs_state`
+/// recalls the context FIRST, then writes the switch's engaged state and the pinned handle,
+/// and only then engages: re-amp latches preset state AT ENGAGE (`danger.md`), so a recall or
+/// a write that goes out after it is simply not in the capture. `scene_context: None` recalls
+/// BASE for the same reason — a preset loads into its saved `lastLoadedScene`, so "no scene"
+/// still costs an explicit recall or the sound measured is whatever the connection held.
+///
+/// Slot 400's Boost switch is the fixture and its `gain` is the handle. The two contexts are
+/// discriminated TWICE over: by the event order, and by the reading itself — the authored C
+/// table puts scene 1 ("Lead") 3 LU above base, so a run that ordered the recall correctly but
+/// measured the wrong sound still fails. `gain` is not a `leveledParams` entry on this slot, so
+/// the capture model is flat in the handle and the two readings differ by the context alone.
+#[test]
+fn an_fs_scene_context_recalls_its_scene_before_the_engage_and_base_without_one() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    let spec = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec
+        .iter()
+        .find(|p| p.list_index == 400)
+        .expect("400 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
+    let ftsw = preset["ftsw"].clone();
+
+    const SWITCH: u32 = 2; // the Boost switch
+    const NODE: &str = "ACD_Boost";
+    const PARAM: &str = "gain";
+    const SCENE: u32 = 1; // "Lead" — 3 LU louder than base in the authored C table
+    let states = crate::footswitch::switch_states(&ftsw, &preset, SWITCH);
+    let handle = crate::leveller::FsParamTarget::new(NODE, PARAM, 2.5);
+    let (_, hi) = handle.bounds();
+
+    // Each probe is read on its own load — a load discards the previous one's edit buffer, so
+    // neither reading can inherit the other's writes.
+    let read_in = |scene: Option<u32>| -> (Vec<crate::sim_device::SimEvent>, f64) {
+        {
+            let mut s = crate::session::Session::connect_lean().expect("connect");
+            s.load_preset(400).expect("load 400");
+        }
+        let from = sim.events().len();
+        let probe = crate::leveller::FsCeilingProbe {
+            scene,
+            states: &states,
+            handle: ("G1".to_string(), NODE.to_string(), handle.clone()),
+        };
+        let l = crate::leveller::measure_fs_ceiling(&probe, &stim).expect("ceiling read");
+        (sim.events()[from..].to_vec(), l.integrated_lufs)
+    };
+    let position = |events: &[crate::sim_device::SimEvent],
+                    what: &str,
+                    pred: &dyn Fn(&crate::sim_device::SimEvent) -> bool|
+     -> usize {
+        events
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("no {what} in {events:?}"))
+    };
+    let engage =
+        |e: &crate::sim_device::SimEvent| matches!(e, crate::sim_device::SimEvent::ReAmp(true));
+
+    let (scene_events, scene_lufs) = read_in(Some(SCENE));
+    let recall = position(
+        &scene_events,
+        "scene recall",
+        &|e| matches!(e, crate::sim_device::SimEvent::LoadScene(s) if *s == SCENE),
+    );
+    let write = position(&scene_events, "pinned-handle write", &|e| {
+        matches!(e, crate::sim_device::SimEvent::ChangeParameter { node, param, value, .. }
+            if node == NODE && param == PARAM && (*value - hi).abs() < 1e-6)
+    });
+    let engaged = position(&scene_events, "re-amp engage", &engage);
+    assert!(
+        recall < write && write < engaged,
+        "recall → write → engage, in that order (re-amp latches at engage): {scene_events:?}"
+    );
+
+    let (base_events, base_lufs) = read_in(None);
+    let base_recall = position(&base_events, "base recall", &|e| {
+        matches!(e, crate::sim_device::SimEvent::LoadScene(s)
+            if *s == crate::session::BASE_SCENE_SLOT)
+    });
+    let base_engaged = position(&base_events, "re-amp engage", &engage);
+    assert!(
+        base_recall < base_engaged,
+        "no scene context still RECALLS BASE before engaging — a bare capture would measure \
+         the preset's saved lastLoadedScene: {base_events:?}"
+    );
+    assert!(
+        !base_events
+            .iter()
+            .any(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(s) if *s == SCENE)),
+        "…and never touches the scene: {base_events:?}"
+    );
+
+    // The captures really were taken in the two different contexts, not merely ordered right.
+    assert!(
+        (scene_lufs - base_lufs - 3.0).abs() < 0.3,
+        "scene 1 sits 3 LU above base in the authored C table — got {scene_lufs:.2} vs \
+         {base_lufs:.2}"
+    );
 }

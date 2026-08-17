@@ -209,6 +209,13 @@ pub enum SimEvent {
     },
     /// `clearFootswitchAssignment`(55) — remove function `index` from `ftsw[addr]`.
     ClearFootswitchAssignment { addr: u32, index: u32 },
+    /// `SettingsMessage(3) → reampModeActive(30)` — the re-amp toggle (`true` = engage).
+    /// Recorded because the ENGAGE is the only ordering landmark a capture has: everything a
+    /// measurement sets up (the scene recall, the isolation bypasses, the pinned handle) is
+    /// only in that capture if it went out BEFORE the engage — re-amp latches preset state at
+    /// engage (`danger.md`), so "the write happened" and "the write was heard" are different
+    /// facts and only the order tells them apart.
+    ReAmp(bool),
 }
 
 struct SimState {
@@ -1070,7 +1077,9 @@ impl SimDevice {
             if let Some(sm) = proto::first_bytes(&top, TMS_SETTINGS) {
                 if let Some(re) = proto::first_bytes(&proto::parse(sm), F_REAMP_SETTING) {
                     let on = proto::first_varint(&proto::parse(re), 1).unwrap_or(0) != 0;
-                    self.state.lock().expect("sim lock").reamp_on = on;
+                    let mut st = self.state.lock().expect("sim lock");
+                    st.reamp_on = on;
+                    st.events.push(SimEvent::ReAmp(on));
                 }
             }
             return Vec::new();

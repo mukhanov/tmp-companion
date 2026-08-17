@@ -23,6 +23,11 @@ pub(crate) struct SceneLevelProgressItem {
     status: String,
     result: Option<leveller::LevelResult>,
     message: Option<String>,
+    /// THE HEADROOM TRADE, disclosed as it happens. Set on the `"trade"` status item emitted
+    /// between the ceiling prepass and the writes, and on a cancelled-after-trade item as
+    /// well; `None` on every ordinary row. Additive: a consumer that doesn't know the status
+    /// ignores the item, and the same summary is also stamped on every returned result row.
+    trade: Option<crate::headroom_trade::TradeSummary>,
 }
 
 /// One scene-leveling request from the wizard: a wire scene slot + its OWN loudness
@@ -322,7 +327,11 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
         // routing-structure fallback — which still only fills in for a live doc set that
         // lacks `audioGraph.template`, so an unconditional `Some` changes no classification.
         let saved = crate::read_saved_preset(slot);
-        let run_batched = |save_run: bool| -> Result<Vec<leveller::BatchedSceneOutcome>, String> {
+        type BatchOutcome = (
+            Vec<leveller::BatchedSceneOutcome>,
+            Option<crate::headroom_trade::TradeSummary>,
+        );
+        let run_batched = |save_run: bool| -> Result<BatchOutcome, String> {
             // Un-engaged pre-pass (scene docs → jobs), then the ONE-SHOT runner:
             // amp `outputLevel` is linear in dB, so each scene is measured once at a
             // reference level (ISOLATED fresh re-amp capture) and solved exactly — the
@@ -402,13 +411,45 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     j.scene_slot
                 ));
             }
+            let cancelled = || SCENE_LEVEL_CANCEL.load(SeqCst);
+            // ── THE REORDERED RUN ────────────────────────────────────────────────────
+            // PHASE 1 — measure EVERY sound's ceiling before anything is written. Same
+            // captures the solves used to take themselves, simply paid up front, which is
+            // the only ordering in which the headroom trade can be decided (it needs every
+            // ceiling next to every target, and its verdict changes what every later sound
+            // is solved to).
+            {
+                let mut started = |scene| {
+                    let _ = on_result.send(scene_progress_item(slot, save_run, scene, None));
+                };
+                leveller::prepass_scene_ceilings(&mut scene_jobs, &stim, &mut started, cancelled)?;
+            }
+            // PHASE 2 — plan and (only on a SAVE run, and only if a BENEFITING sound clamps)
+            // execute the trade. A no-save run plans it and reports it as ADVISORY.
+            let trade = trade_for_batch(
+                slot,
+                &mut scene_jobs,
+                saved.as_ref(),
+                &stim,
+                save_run,
+                cancelled,
+            );
+            if let Some(summary) = trade.summary.clone() {
+                let _ = on_result.send(SceneLevelProgressItem {
+                    scene_slot: session::BASE_SCENE_SLOT,
+                    status: "trade".to_string(),
+                    result: None,
+                    message: None,
+                    trade: Some(summary),
+                });
+            }
             let on_scene = |scene, done: Option<&leveller::BatchedSceneOutcome>| {
                 let _ = on_result.send(scene_progress_item(slot, save_run, scene, done));
             };
-            let cancelled = || SCENE_LEVEL_CANCEL.load(SeqCst);
+            // PHASE 3 — the writes, on the existing batch runner, unchanged.
             // `rebalance` (opt-in) equalizes a path-MERGE scene's two lanes before joint-k;
             // non-mergeable scenes fall through to the same joint-k either way.
-            if rebalance {
+            let mut outcomes = if rebalance {
                 leveller::level_scenes_rebalance(
                     slot,
                     &scene_jobs,
@@ -416,6 +457,7 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     save_run,
                     restore_scene,
                     saved.as_ref(),
+                    trade.hold.as_ref(),
                     on_scene,
                     cancelled,
                 )
@@ -427,10 +469,13 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     save_run,
                     restore_scene,
                     saved.as_ref(),
+                    trade.hold.as_ref(),
                     on_scene,
                     cancelled,
                 )
-            }
+            }?;
+            trade.stamp_failure(&mut outcomes);
+            Ok((outcomes, trade.summary))
         };
         // Per-scene leveling drives ONLY the active amp's `outputLevel`. When a scene
         // can't reach target even at the knob's limit it CLAMPS and reports the achieved
@@ -438,19 +483,47 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
         // lifts EVERY other scene off-target (presetLevel is the Base's job, settled once
         // before the scene pass), and HW the old boost-and-rerun drove
         // presetLevel to 1.0 and blew preset 001's loud scenes 5–7 LU over target.
+        //
+        // The headroom trade above is NOT that boost: it raises `presetLevel` only while
+        // scaling the base amp's fader DOWN by the same dB, so base stays ON target and
+        // the raise is pure headroom for the scenes that pin their own knob. It runs ONCE
+        // before the pass (never as a boost-and-rerun), and when the fader hits its floor
+        // the still-short sounds get a CLAMPING ERROR instead of a silent overshoot.
         let outcome = run_batched(save);
         let result = match outcome {
-            Ok(outcomes) => Ok(outcomes
-                .iter()
-                .filter(|o| o.failure.is_none())
-                .map(|o| outcome_to_level_result(slot, save, o))
-                .collect()),
+            Ok((outcomes, summary)) => {
+                // A run CANCELLED after a headroom trade landed comes back Ok, carrying its
+                // partial outcomes on purpose (see `run_scene_jobs`' cancel site): the raised
+                // base pair is persisted, so the run must disclose rather than hand back an
+                // empty vec. Report the cancel here so the wizard still closes its row.
+                if SCENE_LEVEL_CANCEL.load(SeqCst) {
+                    let _ = on_result.send(SceneLevelProgressItem {
+                        scene_slot: session::BASE_SCENE_SLOT,
+                        status: "cancelled".to_string(),
+                        result: None,
+                        message: Some(leveller::CANCELLED.to_string()),
+                        trade: summary.clone(),
+                    });
+                }
+                Ok(outcomes
+                    .iter()
+                    .filter(|o| o.failure.is_none())
+                    .map(|o| {
+                        let mut r = outcome_to_level_result(slot, save, o);
+                        // The trade moved the whole preset's gain structure, so EVERY row it
+                        // touched carries it (disclosure rationale: `TradeSummary`'s doc).
+                        r.trade = summary.clone();
+                        r
+                    })
+                    .collect())
+            }
             Err(e) if e == leveller::CANCELLED => {
                 let _ = on_result.send(SceneLevelProgressItem {
                     scene_slot: session::BASE_SCENE_SLOT,
                     status: "cancelled".to_string(),
                     result: None,
                     message: Some(e),
+                    trade: None,
                 });
                 Ok(Vec::new())
             }
@@ -460,6 +533,449 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
         result
     })
     .await
+}
+
+/// The batch's headroom-trade result: what landed (if anything), what to disclose, and — when
+/// the trade was attempted and FAILED — which rows deserve the trade's own clamp kind rather
+/// than a generic headroom clamp.
+pub(crate) struct BatchTrade {
+    /// The UNSAVED base pair to hand the batch runner: its `presetLevel` must be re-asserted at
+    /// the one save, and its fader writes belong in the run's post-save re-read. `None` on
+    /// every run that did not MOVE the pair (an advisory one included).
+    pub(crate) hold: Option<leveller::TradeHold>,
+    /// What to tell the user — a landed trade OR a no-save run's advisory plan. `None` when
+    /// there was nothing to trade at all.
+    pub(crate) summary: Option<crate::headroom_trade::TradeSummary>,
+    /// The trade's failure cause, when one was attempted and backed out.
+    failure: Option<crate::headroom_trade::ClampKind>,
+    /// The scene slots the trade would have RESCUED — the only rows whose clamp the trade's
+    /// failure explains. A row that was never going to benefit keeps its honest
+    /// `scene_ceiling` clamp, because the trade is not why it can't reach target.
+    benefiting: Vec<u32>,
+}
+
+impl BatchTrade {
+    fn none() -> Self {
+        Self {
+            hold: None,
+            summary: None,
+            failure: None,
+            benefiting: Vec::new(),
+        }
+    }
+
+    /// Re-stamp the clamp taxonomy on the rows a FAILED trade was supposed to rescue, so the
+    /// UI says "the trade ran out of base fader" / "the trade was backed out" instead of the
+    /// generic "this sound cannot reach the target". Only CLAMPED benefiting rows are touched;
+    /// a row that reached its target is untouched whatever the trade did.
+    ///
+    /// An ADVISORY (no-save) run leaves every kind alone: those rows clamp for their own
+    /// honest reason — the trade never ran, so it is not why they missed.
+    fn stamp_failure(&self, outcomes: &mut [leveller::BatchedSceneOutcome]) {
+        let Some(kind) = self.failure else { return };
+        for o in outcomes.iter_mut() {
+            if o.clamped && o.failure.is_none() && self.benefiting.contains(&o.scene_slot) {
+                o.clamp_kind = Some(kind);
+            }
+        }
+    }
+}
+
+/// PHASE 2's decision, taken from the prepass ceilings BEFORE any device work touches the base
+/// pair. Made by [`plan_trade_for_batch`], which is PURE — the whole benefit / room / handle /
+/// save rule set is unit-testable with no device in the loop.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TradeDecision {
+    /// Nothing to trade — see [`plan_trade_for_batch`] for the five ways this happens.
+    None,
+    /// A SAVE run with a benefiting clamp: execute the plan.
+    Apply(TradeIntent),
+    /// A NO-SAVE run with a benefiting clamp: report what WOULD be traded, write nothing.
+    Advisory(TradeIntent),
+}
+
+/// Everything the executor needs from the pure plan.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TradeIntent {
+    pub(crate) plan: crate::headroom_trade::TradePlan,
+    /// Index of the BASE row in the job list.
+    pub(crate) base_idx: usize,
+    pub(crate) preset_level: f32,
+    /// The QUIETEST audible base amp `outputLevel` (see `min_audible_above`'s doc).
+    pub(crate) base_fader: f32,
+    /// The wire scene slots a base raise actually helps.
+    pub(crate) benefiting: Vec<u32>,
+}
+
+/// PHASE 2, PURE HALF: decide the benefit-aware headroom trade from the prepass ceilings.
+///
+/// BENEFIT comes from the OVERLAY DEPENDENCY STRUCTURE, never from a guess — see
+/// `benefits_from_base_raise`'s doc (`headroom_trade.rs`) for the table.
+///
+/// FIVE WAYS THIS ANSWERS `None`:
+/// 1. no saved document (nothing to read overlays or `presetLevel` from);
+/// 2. no BASE row in the batch. The trade's whole shape is "raise `presetLevel`, hold BASE at
+///    its target with the base fader" — without base's own job there is no target to hold it
+///    to and no fader to hold it with;
+/// 3. the base row is HANDLE-DRIVEN. The user picked base's own leveling control, and the hold
+///    would solve THAT control down instead of a fader — a wet `mix` carries a preservation
+///    floor precisely so a run never guts an effect to make a number (D5), and the only knob
+///    the trade may lower is the base amp fader (`outputLevel` is pure digital gain; a
+///    wet/tone param is never a trade lever, D6). So: no trade. The base row still levels on
+///    its handle exactly as asked and every clamp is reported honestly. Checked BEFORE the
+///    fader fold, because a handle row's `current` is the handle param's value — folding it
+///    would fabricate fader room out of a mix control;
+/// 4. no `presetLevel` in the saved document;
+/// 5. the plan itself asks for no raise (nothing clamps, or nothing that clamps benefits).
+pub(crate) fn plan_trade_for_batch(
+    scene_jobs: &[leveller::SceneJob],
+    saved: Option<&serde_json::Value>,
+    save: bool,
+) -> TradeDecision {
+    use crate::headroom_trade::{
+        benefits_from_base_raise, min_audible_above, plan_headroom_trade, SoundId, TradeSound,
+        BASE_FADER_FLOOR,
+    };
+    let Some(saved_doc) = saved else {
+        return TradeDecision::None;
+    };
+    let Some(base_idx) = scene_jobs
+        .iter()
+        .position(|j| j.scene_slot == session::BASE_SCENE_SLOT && j.skip.is_none())
+    else {
+        return TradeDecision::None;
+    };
+    if scene_jobs[base_idx].handle.is_some() {
+        return TradeDecision::None;
+    }
+    let Some(preset_level) = audiograph::preset_level(saved_doc) else {
+        return TradeDecision::None;
+    };
+    let preset_level = preset_level as f32;
+    // The base fader the trade has to pay with: the QUIETEST AUDIBLE base amp's `outputLevel`
+    // (see `min_audible_above`'s doc). A base row with no audible lane at all reports zero
+    // room, which the planner reads as no trade.
+    let base_fader = min_audible_above(
+        scene_jobs[base_idx].knobs.iter().map(|kt| kt.current),
+        BASE_FADER_FLOOR,
+    )
+    .unwrap_or(0.0);
+
+    let mut benefiting: Vec<u32> = Vec::new();
+    let mut sounds: Vec<TradeSound> = Vec::new();
+    for (i, job) in scene_jobs.iter().enumerate() {
+        let Some(ceiling) = leveller::scene_ceiling_lufs(job) else {
+            continue;
+        };
+        if i == base_idx {
+            sounds.push(TradeSound {
+                id: SoundId::Base,
+                ceiling_lufs: ceiling,
+                target_lufs: job.target_lufs,
+                // Base is HELD at its target by the trade; it never benefits from it.
+                benefits: false,
+            });
+            continue;
+        }
+        // Every knob of the scene must be overlay-pinned for the scene to keep the whole
+        // rise: a lane still reading base's fader takes the drop with it.
+        let benefits = !job.knobs.is_empty()
+            && job.knobs.iter().all(|kt| match &kt.knob {
+                leveller::LevelKnob::Block { node_id, .. } => {
+                    benefits_from_base_raise(&scene_overlay(saved_doc, job.scene_slot, node_id))
+                }
+                leveller::LevelKnob::PresetLevel => false,
+            });
+        if benefits {
+            benefiting.push(job.scene_slot);
+        }
+        sounds.push(TradeSound {
+            id: SoundId::Scene {
+                scene_slot: job.scene_slot,
+            },
+            ceiling_lufs: ceiling,
+            target_lufs: job.target_lufs,
+            benefits,
+        });
+    }
+    let plan = plan_headroom_trade(&sounds, preset_level, base_fader);
+    if !plan.is_trade() {
+        return TradeDecision::None;
+    }
+    let intent = TradeIntent {
+        plan,
+        base_idx,
+        preset_level,
+        base_fader,
+        benefiting,
+    };
+    if save {
+        TradeDecision::Apply(intent)
+    } else {
+        TradeDecision::Advisory(intent)
+    }
+}
+
+/// The per-lane `outputLevel` moves of a trade. `solved` aligns with `base_job.knobs` (the
+/// hold's own output); `None` = an advisory, which solved nothing (module header: the fader
+/// response is not algebraically predictable), so a run that never solved it must not state a
+/// value.
+fn base_amp_moves(
+    base_job: &leveller::SceneJob,
+    solved: Option<&[f32]>,
+) -> Vec<crate::headroom_trade::TradeAmpMove> {
+    base_job
+        .knobs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, kt)| match &kt.knob {
+            leveller::LevelKnob::Block {
+                group_id,
+                node_id,
+                parameter_id,
+                ..
+            } => Some(crate::headroom_trade::TradeAmpMove {
+                group_id: group_id.clone(),
+                node_id: node_id.clone(),
+                parameter_id: parameter_id.clone(),
+                previous_value: kt.current,
+                value: solved.and_then(|s| s.get(i)).copied(),
+            }),
+            leveller::LevelKnob::PresetLevel => None,
+        })
+        .collect()
+}
+
+/// The advisory summary for a no-save run: what the trade WOULD do.
+fn advisory_summary(
+    intent: &TradeIntent,
+    base_job: &leveller::SceneJob,
+) -> crate::headroom_trade::TradeSummary {
+    crate::headroom_trade::TradeSummary {
+        applied: false,
+        raise_db: intent.plan.raise_db,
+        previous_preset_level: intent.preset_level,
+        preset_level: crate::headroom_trade::raised_preset_level(
+            intent.preset_level,
+            intent.plan.raise_db,
+        ),
+        base_amps: base_amp_moves(base_job, None),
+        cap: intent.plan.capped,
+        benefiting: intent
+            .benefiting
+            .iter()
+            .map(|&scene_slot| crate::headroom_trade::SoundId::Scene { scene_slot })
+            .collect(),
+    }
+}
+
+/// The trade's own writes, as the batch runner's post-save re-read wants them: the base pair
+/// lives in the BASE graph, so the scene slot is the base sentinel (`persisted_value` reads
+/// those straight off `dspUnitParameters`).
+fn trade_hold_writes(
+    base_job: &leveller::SceneJob,
+    levels: &[f32],
+) -> Vec<leveller::PersistedWrite> {
+    base_job
+        .knobs
+        .iter()
+        .zip(levels)
+        .filter_map(|(kt, &v)| match &kt.knob {
+            leveller::LevelKnob::Block {
+                node_id,
+                parameter_id,
+                ..
+            } => Some(leveller::PersistedWrite {
+                scene_slot: session::BASE_SCENE_SLOT,
+                node_id: node_id.clone(),
+                parameter_id: parameter_id.clone(),
+                value: v,
+            }),
+            leveller::LevelKnob::PresetLevel => None,
+        })
+        .collect()
+}
+
+/// Adopt the trade's solved base faders as the jobs' new knob ANCHORS. `KnobTarget::current` is
+/// what every later solve treats as "what the device holds", so leaving pre-trade values in
+/// place makes base's own already-at-target path report the OLD fader as final and makes an
+/// inheriting scene's first write overshoot by the whole fader drop.
+///
+/// WHO INHERITS: see `benefits_from_base_raise`'s doc for the overlay table (`Absent` /
+/// `BypassOnly` inherit base's value, `Full` pins its own). An `Unknown` overlay is left alone:
+/// its solve re-measures and the verify+correct loop absorbs a stale first write, so the
+/// conservative side costs nothing.
+fn adopt_trade_levels(
+    scene_jobs: &mut [leveller::SceneJob],
+    base_idx: usize,
+    saved: &serde_json::Value,
+    base_levels: &[f32],
+) {
+    let by_node: Vec<(String, f32)> = scene_jobs[base_idx]
+        .knobs
+        .iter()
+        .zip(base_levels)
+        .filter_map(|(kt, &v)| match &kt.knob {
+            leveller::LevelKnob::Block { node_id, .. } => Some((node_id.clone(), v)),
+            leveller::LevelKnob::PresetLevel => None,
+        })
+        .collect();
+    for (i, job) in scene_jobs.iter_mut().enumerate() {
+        for kt in job.knobs.iter_mut() {
+            let leveller::LevelKnob::Block { node_id, .. } = &kt.knob else {
+                continue;
+            };
+            let Some((_, v)) = by_node.iter().find(|(n, _)| n == node_id) else {
+                continue;
+            };
+            let inherits = i == base_idx
+                || matches!(
+                    scene_overlay(saved, job.scene_slot, node_id),
+                    SceneOverlay::Absent | SceneOverlay::BypassOnly(_)
+                );
+            if inherits {
+                kt.current = *v;
+            }
+        }
+    }
+}
+
+/// PHASE 2 of the reordered run: take [`plan_trade_for_batch`]'s decision and, on a SAVE run
+/// with a benefiting clamp, execute it.
+///
+/// WHY A NO-SAVE RUN NEVER EXECUTES. The hold is written with `defer = true`, but phase 3 runs
+/// with `defer = save` — and with `save = false` every scene apply ends in
+/// `restore_saved_preset`, a same-slot load that reloads the SAVED preset and destroys the
+/// unsaved raise + hold. `retarget_prepass_after_trade` would meanwhile have shifted the
+/// benefiting scenes' readings by `+raise_db`, so they would describe a device state that no
+/// longer exists and every one of those rows would report a number the preview cannot produce.
+/// So a preview PLANS the trade and says so, and the rows it would have rescued keep their
+/// honest clamp: without the trade, they really do clamp.
+fn trade_for_batch(
+    slot: u32,
+    scene_jobs: &mut [leveller::SceneJob],
+    saved: Option<&serde_json::Value>,
+    stim: &[f32],
+    save: bool,
+    cancelled: impl Fn() -> bool + Copy,
+) -> BatchTrade {
+    use crate::headroom_trade::{ClampKind, TradeSummary};
+    let intent = match plan_trade_for_batch(scene_jobs, saved, save) {
+        TradeDecision::None => return BatchTrade::none(),
+        TradeDecision::Advisory(intent) => {
+            log::info!(
+                "headroom trade slot={slot}: ADVISORY only (no-save run) — would raise \
+                 presetLevel by {:.2} dB for scenes {:?}",
+                intent.plan.raise_db,
+                intent.benefiting,
+            );
+            let summary = advisory_summary(&intent, &scene_jobs[intent.base_idx]);
+            return BatchTrade {
+                hold: None,
+                summary: Some(summary),
+                // NOT a failure: nothing was attempted, so there is nothing to re-stamp. Those
+                // rows clamp for their own honest reason.
+                failure: None,
+                benefiting: intent.benefiting,
+            };
+        }
+        TradeDecision::Apply(intent) => intent,
+    };
+    // `saved` is `Some` by construction (the planner answers `None` without it).
+    let Some(saved_doc) = saved else {
+        return BatchTrade::none();
+    };
+    log::info!(
+        "headroom trade slot={slot}: raising presetLevel by {:.2} dB (from {:.4}, quietest base \
+         fader {:.4}, capped: {:?}) for scenes {:?}",
+        intent.plan.raise_db,
+        intent.preset_level,
+        intent.base_fader,
+        intent.plan.capped,
+        intent.benefiting,
+    );
+    let base_job = scene_jobs[intent.base_idx].clone();
+    let attempt = |plan: &crate::headroom_trade::TradePlan| {
+        leveller::apply_headroom_trade(
+            slot,
+            plan,
+            intent.preset_level,
+            &base_job,
+            stim,
+            saved,
+            cancelled,
+        )
+    };
+    let mut plan = intent.plan.clone();
+    let mut outcome = attempt(&plan);
+    // THE ONE BOUNDED RE-PLAN (see `replan_after_floor_pin`'s doc for the arithmetic and the
+    // worth-retrying rule). If the smaller raise still pins, the pair is backed out and the
+    // rows it would have rescued are stamped `TradeFloor`.
+    if let Err(f) = &outcome {
+        if f.kind == ClampKind::TradeFloor && !cancelled() {
+            let retry = f
+                .base_overshoot_lu
+                .and_then(|o| crate::headroom_trade::replan_after_floor_pin(plan.raise_db, o));
+            if let Some(retry) = retry {
+                log::info!(
+                    "headroom trade slot={slot}: hold pinned at the fader floor ({:.2} LU over \
+                     target) — ONE re-plan at {:.2} dB",
+                    f.base_overshoot_lu.unwrap_or_default(),
+                    retry.raise_db
+                );
+                plan = retry;
+                outcome = attempt(&plan);
+            }
+        }
+    }
+    match outcome {
+        Ok(applied) => {
+            // See `retarget_prepass_after_trade`'s doc: benefiting sounds shift exactly, the
+            // rest re-measure.
+            let bset = intent.benefiting.clone();
+            leveller::retarget_prepass_after_trade(scene_jobs, applied.raise_db, move |sc| {
+                bset.contains(&sc)
+            });
+            adopt_trade_levels(scene_jobs, intent.base_idx, saved_doc, &applied.base_levels);
+            let summary = TradeSummary {
+                applied: true,
+                raise_db: applied.raise_db,
+                previous_preset_level: applied.previous_preset_level,
+                preset_level: applied.preset_level,
+                base_amps: base_amp_moves(&base_job, Some(&applied.base_levels)),
+                cap: plan.capped,
+                benefiting: intent
+                    .benefiting
+                    .iter()
+                    .map(|&scene_slot| crate::headroom_trade::SoundId::Scene { scene_slot })
+                    .collect(),
+            };
+            BatchTrade {
+                hold: Some(leveller::TradeHold {
+                    preset_level: applied.preset_level,
+                    writes: trade_hold_writes(&base_job, &applied.base_levels),
+                }),
+                summary: Some(summary),
+                failure: None,
+                benefiting: intent.benefiting,
+            }
+        }
+        Err(f) => {
+            // BACKED OUT — the base pair is whole again and NOTHING was persisted. Every
+            // prepass reading still describes the pre-raise device, so they all stand.
+            log::warn!(
+                "headroom trade slot={slot} did not land ({:?}): {}",
+                f.kind,
+                f.why
+            );
+            BatchTrade {
+                hold: None,
+                summary: None,
+                failure: Some(f.kind),
+                benefiting: intent.benefiting,
+            }
+        }
+    }
 }
 
 /// Build the streamed progress row for one scene step — `None` = the step just STARTED
@@ -478,6 +994,7 @@ fn scene_progress_item(
             status: "active".to_string(),
             result: None,
             message: None,
+            trade: None,
         },
         Some(o) => match &o.failure {
             None => SceneLevelProgressItem {
@@ -485,12 +1002,14 @@ fn scene_progress_item(
                 status: "done".to_string(),
                 result: Some(outcome_to_level_result(slot, save, o)),
                 message: None,
+                trade: None,
             },
             Some(e) => SceneLevelProgressItem {
                 scene_slot: scene,
                 status: "error".to_string(),
                 result: None,
                 message: Some(e.clone()),
+                trade: None,
             },
         },
     }
@@ -529,6 +1048,10 @@ fn outcome_to_level_result(
         verify_lufs: o.final_lufs,
         iterations: o.windows.max(o.writes),
         dynamic_spread_lu: o.dynamic_spread_lu,
+        // Forwarded verbatim from the runner's outcome — the taxonomy is decided once, in
+        // the leveller, so a scene row and a footswitch row can never name the same cause
+        // differently.
+        clamp_kind: o.clamp_kind,
         clamp_reason: o.clamp_reason.clone(),
         verify_by_ear: o.verify_by_ear,
         // Scene rows write amp outputLevel, not presetLevel — nothing to revert here.
@@ -540,6 +1063,9 @@ fn outcome_to_level_result(
         // `target_lufs` above is already the EFFECTIVE (offset-shifted) target; this is the
         // shift itself, which the frontend can't derive from what it sent.
         target_offset_lu: o.target_offset_lu,
+        // Stamped by the caller when the batch traded — the trade is a BATCH fact, not a
+        // per-outcome one, so the outcome cannot carry it.
+        trade: None,
     }
 }
 
@@ -561,8 +1087,9 @@ pub(crate) struct SceneHandleCandidate {
     parameter_id: String,
     /// `"level_linear" | "level_db" | "wet_mix"` — the classifier's verdict, serialized
     /// straight off [`param_class::ParamClass`] (no hand-rolled mapping to drift from the
-    /// table). `"other"` never appears: `footswitch::level_candidates_for_node` admits only
-    /// params the classifier recognises, so an unrecognised one is not a candidate at all.
+    /// table). On the `candidates` list `"other"` never appears — `level_candidates_for_node`
+    /// admits only params the classifier recognises. On `allCandidates` it CAN: that list is
+    /// every numeric control of the block, annotated so the picker can sort and warn.
     class: param_class::ParamClass,
     /// The param's usable `[lo, hi]` — NOT `[0,1]` for every control (`ACD_Boost.gain` is
     /// raw dB over `[0, 12]`). For a `wet_mix` the LOW bound is already raised to the wet
@@ -595,6 +1122,11 @@ pub(crate) struct SceneHandleRow {
     /// for base (it has no overlay concept).
     scene_slot: u32,
     candidates: Vec<SceneHandleCandidate>,
+    /// EVERY numeric control of every block in this scene, class-annotated and level-class
+    /// first — the combined picker's source. A SUPERSET of `candidates`, which stays the
+    /// safe-default list every pre-selection reads. Additive on the wire, so an existing
+    /// consumer is unaffected.
+    all_candidates: Vec<SceneHandleCandidate>,
 }
 
 /// Within this fraction of the range's top, a control counts as having no room to go up.
@@ -643,6 +1175,7 @@ fn scene_handle_rows(preset: &serde_json::Value) -> Vec<SceneHandleRow> {
     (0..scene_count)
         .map(|scene| {
             let mut candidates = Vec::new();
+            let mut all_candidates = Vec::new();
             for (group_id, node_id, fender_id) in &roster {
                 let Some(base_params) = params.get(node_id) else {
                     continue;
@@ -661,9 +1194,10 @@ fn scene_handle_rows(preset: &serde_json::Value) -> Vec<SceneHandleRow> {
                     SceneOverlay::BypassOnly(_) => ("shared_with_base", None),
                     SceneOverlay::Unknown => ("unknown", None),
                 };
-                for mut c in
-                    footswitch::level_candidates_for_node(group_id, node_id, fender_id, base_params)
-                {
+                // ONE annotation rule, applied to both lists — the safe-default candidates
+                // and the combined picker's superset must describe the same control the same
+                // way, which they cannot do if each list annotates separately.
+                let annotate = |mut c: footswitch::LevelParamCandidate| {
                     if let Some(v) = overlay_params
                         .and_then(|p| p.get(&c.parameter_id))
                         .and_then(|v| v.as_f64())
@@ -678,7 +1212,7 @@ fn scene_handle_rows(preset: &serde_json::Value) -> Vec<SceneHandleRow> {
                     } else {
                         "full"
                     };
-                    candidates.push(SceneHandleCandidate {
+                    SceneHandleCandidate {
                         group_id: c.group_id,
                         node_id: c.node_id,
                         fender_id: c.fender_id,
@@ -688,12 +1222,33 @@ fn scene_handle_rows(preset: &serde_json::Value) -> Vec<SceneHandleRow> {
                         current,
                         scope: scope.to_string(),
                         headroom: headroom.to_string(),
-                    });
-                }
+                    }
+                };
+                candidates.extend(
+                    footswitch::level_candidates_for_node(
+                        group_id,
+                        node_id,
+                        fender_id,
+                        base_params,
+                    )
+                    .into_iter()
+                    .map(annotate),
+                );
+                all_candidates.extend(
+                    footswitch::all_numeric_candidates_for_node(
+                        group_id,
+                        node_id,
+                        fender_id,
+                        base_params,
+                    )
+                    .into_iter()
+                    .map(annotate),
+                );
             }
             SceneHandleRow {
                 scene_slot: scene,
                 candidates,
+                all_candidates,
             }
         })
         .collect()
@@ -881,6 +1436,7 @@ pub(crate) async fn redistribute_headroom<R: tauri::Runtime>(
                     status: "cancelled".to_string(),
                     result: None,
                     message: Some(e.clone()),
+                    trade: None,
                 });
                 Err(e)
             }
@@ -1043,6 +1599,277 @@ pub(crate) async fn level_scenes(
             .ok_or_else(|| "no finite scene loudness measured".to_string())
     })
     .await
+}
+
+/// PHASE 2's pure decision seam, exercised with NO device in the loop. Items ⟦1⟧ (a
+/// handle-carrying base row disables the trade), ⟦2⟧ (a no-save run plans but never applies)
+/// and ⟦4b⟧ (the QUIETEST lane binds a joint scale-down) all land here.
+#[cfg(test)]
+mod trade_planner_tests {
+    use super::*;
+    use crate::headroom_trade::BASE_FADER_FLOOR;
+
+    /// A preset whose amp carries a scene-0 knob overlay (`Full` — so scene 0 BENEFITS from a
+    /// base raise) and a pedal for the handle rows to point at.
+    fn preset(preset_level: f64) -> serde_json::Value {
+        serde_json::json!({
+            "audioGraph": {
+                "presetLevel": preset_level,
+                "guitarNodes": { "G1": [
+                    { "nodeId": "amp", "FenderId": "ACD_TwinReverb65NoFx",
+                      "dspUnitParameters": { "outputLevel": 0.8, "bypass": false } },
+                    { "nodeId": "amp2", "FenderId": "ACD_TwinReverb65NoFx",
+                      "dspUnitParameters": { "outputLevel": 0.02, "bypass": false } },
+                    { "nodeId": "ped", "FenderId": "ACD_ChorusCE",
+                      "dspUnitParameters": { "mix": 0.6, "bypass": false } }
+                ] }
+            },
+            "scenes": [
+                { "guitarNodes": { "G1": {
+                    "ACD_TwinReverb65NoFx": { "dspUnitParameters": { "outputLevel": 0.5 } } } } },
+                // Scene 1 mentions no amp at all (`Absent`): it READS base's fader, so a base
+                // fader drop moves it too — exactly net-zero, and it never benefits.
+                { "guitarNodes": { "G1": {
+                    "ACD_ChorusCE": { "dspUnitParameters": { "mix": 0.4 } } } } }
+            ]
+        })
+    }
+
+    fn knob(node: &str, current: f32, scene_slot: Option<u32>) -> leveller::KnobTarget {
+        leveller::KnobTarget {
+            knob: leveller::LevelKnob::Block {
+                group_id: "G1".into(),
+                node_id: node.into(),
+                parameter_id: "outputLevel".into(),
+                scene_slot,
+            },
+            lo: 0.0,
+            hi: 1.0,
+            current,
+        }
+    }
+
+    /// One prepass-measured job. `asis` is the ceiling seed: `scene_ceiling_lufs` extrapolates
+    /// it to the top of the amp's range, so a job with a 1.0 knob has `ceiling == asis`.
+    fn job(
+        scene_slot: u32,
+        target: f64,
+        asis: f64,
+        knobs: Vec<leveller::KnobTarget>,
+    ) -> leveller::SceneJob {
+        leveller::SceneJob {
+            scene_slot,
+            target_lufs: target,
+            knobs,
+            skip: None,
+            rebalanceable: false,
+            target_mode: leveller::SceneTargetMode::Match,
+            handle: None,
+            prepass: Some(leveller::ScenePrepass { asis, spread: 1.0 }),
+        }
+    }
+
+    /// Base (on its amp fader, at target) + a benefiting scene 0 that is 4 LU short.
+    fn base_and_clamped_scene(base_knobs: Vec<leveller::KnobTarget>) -> Vec<leveller::SceneJob> {
+        vec![
+            job(session::BASE_SCENE_SLOT, -23.0, -23.0, base_knobs),
+            job(0, -15.0, -19.0, vec![knob("amp", 1.0, Some(0))]),
+        ]
+    }
+
+    fn intent(d: &TradeDecision) -> &TradeIntent {
+        match d {
+            TradeDecision::Apply(i) | TradeDecision::Advisory(i) => i,
+            TradeDecision::None => panic!("expected a planned trade, got None"),
+        }
+    }
+
+    // The control case: a plain fader base row on a SAVE run plans and EXECUTES the trade.
+    #[test]
+    fn a_fader_base_row_on_a_save_run_arms_the_trade() {
+        let p = preset(0.5);
+        let jobs = base_and_clamped_scene(vec![knob("amp", 0.8, None)]);
+        let d = plan_trade_for_batch(&jobs, Some(&p), true);
+        assert!(matches!(d, TradeDecision::Apply(_)), "{d:?}");
+        let i = intent(&d);
+        assert!(
+            (i.plan.raise_db - 4.0).abs() < 1e-9,
+            "{:?}",
+            i.plan.raise_db
+        );
+        assert_eq!(
+            i.benefiting,
+            vec![0],
+            "scene 0's overlay pins its own fader"
+        );
+    }
+
+    // ⟦1⟧ THE BLOCKING ONE. When the user picked base's OWN control, the hold would solve THAT
+    // control down to pay for the raise — a wet mix has a preservation floor precisely so a run
+    // never guts an effect to make a number (D5), and the only knob the trade may lower is the
+    // base amp fader (D6). So a handle-carrying base row disables the trade outright; the row
+    // still levels on its handle and every clamp is reported honestly.
+    #[test]
+    fn a_handle_carrying_base_row_disables_the_trade() {
+        let p = preset(0.5);
+        let mut jobs = base_and_clamped_scene(vec![leveller::KnobTarget {
+            knob: leveller::LevelKnob::Block {
+                group_id: "G1".into(),
+                node_id: "ped".into(),
+                parameter_id: "mix".into(),
+                scene_slot: None,
+            },
+            lo: 0.0,
+            hi: 1.0,
+            // A wet mix authored at 0.6 — folding THIS as "fader room" is exactly the bug.
+            current: 0.6,
+        }]);
+        jobs[0].handle = Some(leveller::FsParamTarget::from_preset(&p, "ped", "mix"));
+        assert_eq!(
+            plan_trade_for_batch(&jobs, Some(&p), true),
+            TradeDecision::None,
+            "a user handle on base is never a trade lever"
+        );
+        // And it is the HANDLE that disabled it, not the batch shape: the same batch with a
+        // fader base row does trade.
+        assert!(matches!(
+            plan_trade_for_batch(
+                &base_and_clamped_scene(vec![knob("amp", 0.8, None)]),
+                Some(&p),
+                true
+            ),
+            TradeDecision::Apply(_)
+        ));
+    }
+
+    // ⟦2⟧ A NO-SAVE run must plan the trade and write NOTHING: phase 3 runs `defer = save`, so
+    // with `save = false` every scene apply reloads the stored preset and destroys an unsaved
+    // raise + hold — while the benefiting rows' prepass readings would already have been
+    // shifted `+raise_db` to describe a device state that no longer exists.
+    #[test]
+    fn a_no_save_run_plans_the_trade_as_advisory_and_never_applies_it() {
+        let p = preset(0.5);
+        let jobs = base_and_clamped_scene(vec![knob("amp", 0.8, None)]);
+        let d = plan_trade_for_batch(&jobs, Some(&p), false);
+        assert!(matches!(d, TradeDecision::Advisory(_)), "{d:?}");
+        let i = intent(&d);
+        assert!((i.plan.raise_db - 4.0).abs() < 1e-9);
+
+        // The advisory the run reports: the raise and the WOULD-BE presetLevel are exact,
+        // the fader values deliberately are not (module header).
+        let s = advisory_summary(i, &jobs[i.base_idx]);
+        assert!(!s.applied);
+        assert!((s.previous_preset_level - 0.5).abs() < 1e-6);
+        assert!((s.preset_level - 0.7924).abs() < 1e-3, "{}", s.preset_level);
+        assert_eq!(
+            s.benefiting,
+            vec![crate::headroom_trade::SoundId::Scene { scene_slot: 0 }]
+        );
+        match &s.base_amps[..] {
+            [a] => {
+                assert!((a.previous_value - 0.8).abs() < 1e-6);
+                assert_eq!(a.value, None, "an advisory solved no fader");
+            }
+            n => panic!("expected one base amp, got {}", n.len()),
+        }
+    }
+
+    // ⟦4b⟧ see `min_audible_above`'s doc for why the QUIETEST lane binds the room.
+    #[test]
+    fn the_quietest_base_lane_binds_the_fader_room() {
+        // presetLevel 0.05 leaves ~26 dB of its own room, so the FADER is what binds.
+        let p = preset(0.05);
+        let jobs = vec![
+            job(
+                session::BASE_SCENE_SLOT,
+                -23.0,
+                -23.0,
+                vec![knob("amp", 0.8, None), knob("amp2", 0.02, None)],
+            ),
+            // 12 LU short — more than the quiet lane can ever pay for.
+            job(0, -15.0, -27.0, vec![knob("amp", 1.0, Some(0))]),
+        ];
+        let d = plan_trade_for_batch(&jobs, Some(&p), true);
+        let i = intent(&d);
+        assert!(
+            (i.base_fader - 0.02).abs() < 1e-6,
+            "the QUIETEST audible lane, got {}",
+            i.base_fader
+        );
+        assert!(
+            (i.plan.raise_db - 6.0206).abs() < 1e-3,
+            "0.02 → 0.01 is ~6 dB of room, not ~38; got {}",
+            i.plan.raise_db
+        );
+        assert_eq!(
+            i.plan.capped,
+            Some(crate::headroom_trade::TradeCap::BaseFaderFloor)
+        );
+    }
+
+    // A lane the author already parked at/below the floor is not a lane the trade can spend —
+    // but it must not veto the trade either. The audible lane binds; the parked one rides.
+    #[test]
+    fn a_base_lane_parked_at_the_floor_does_not_bind_the_room() {
+        let p = preset(0.5);
+        let jobs = vec![
+            job(
+                session::BASE_SCENE_SLOT,
+                -23.0,
+                -23.0,
+                vec![knob("amp", 0.8, None), knob("amp2", BASE_FADER_FLOOR, None)],
+            ),
+            job(0, -15.0, -19.0, vec![knob("amp", 1.0, Some(0))]),
+        ];
+        let d = plan_trade_for_batch(&jobs, Some(&p), true);
+        let i = intent(&d);
+        assert!((i.base_fader - 0.8).abs() < 1e-6, "{}", i.base_fader);
+        assert!((i.plan.raise_db - 4.0).abs() < 1e-9);
+    }
+
+    // A scenes-only batch has no base target to hold and no base fader to hold it with.
+    #[test]
+    fn a_batch_without_a_base_row_never_trades() {
+        let p = preset(0.5);
+        let jobs = vec![job(0, -15.0, -19.0, vec![knob("amp", 1.0, Some(0))])];
+        assert_eq!(
+            plan_trade_for_batch(&jobs, Some(&p), true),
+            TradeDecision::None
+        );
+    }
+
+    // ⟦7⟧ The trade's solved base faders become the jobs' new anchors — but only where the
+    // scene actually READS base's value. Scene 0 pins its own `outputLevel` overlay (that is
+    // why it benefits), so its anchor must be left alone.
+    #[test]
+    fn the_solved_base_faders_become_the_inheriting_rows_anchors() {
+        let p = preset(0.5);
+        let mut jobs = vec![
+            job(
+                session::BASE_SCENE_SLOT,
+                -23.0,
+                -23.0,
+                vec![knob("amp", 0.8, None)],
+            ),
+            // Scene 0: a `Full` overlay on the amp → pinned, untouched.
+            job(0, -15.0, -19.0, vec![knob("amp", 0.5, Some(0))]),
+            // Scene 1: no overlay at all (`Absent`) → it read base's fader, so it moved too.
+            job(1, -15.0, -19.0, vec![knob("amp", 0.8, Some(1))]),
+        ];
+        adopt_trade_levels(&mut jobs, 0, &p, &[0.5044]);
+        assert!(
+            (jobs[0].knobs[0].current - 0.5044).abs() < 1e-6,
+            "base adopts the solve"
+        );
+        assert!(
+            (jobs[1].knobs[0].current - 0.5).abs() < 1e-6,
+            "an overlay-pinned scene keeps its own value"
+        );
+        assert!(
+            (jobs[2].knobs[0].current - 0.5044).abs() < 1e-6,
+            "an inheriting scene follows base's fader down"
+        );
+    }
 }
 
 #[cfg(test)]

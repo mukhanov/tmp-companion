@@ -647,6 +647,8 @@ pub fn probe_jointk_scenes(
             save,
             restore_scene,
             saved.as_ref(),
+            // No headroom trade on this dev arm — it runs the jobs verbatim.
+            None,
             |_, _| {},
             || false,
         ) {

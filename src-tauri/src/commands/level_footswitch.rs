@@ -4,40 +4,23 @@ use crate::*;
 
 // ───────────────────────── Footswitch (engaged-state) leveling ─────────────────────────
 
-/// What a footswitch row asks for. Intent belongs to the USER: a row they have explicitly
-/// given a leveling handle to is solved and written ([`FsJobMode::Level`], the default and
-/// the pre-existing behavior); a row they have NOT is only MEASURED
-/// ([`FsJobMode::Verify`]) — the leveler reports how much the switch changes the loudness
-/// and writes nothing, rather than inferring which knob "should" carry it.
-#[derive(serde::Deserialize, Debug, Clone, Copy, Default, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FsJobMode {
-    /// Solve the row's handle and (with `save`) write it — today's path. Serde default, so
-    /// every existing caller's payload keeps its meaning with no `mode` key at all.
-    #[default]
-    Level,
-    /// Measure engaged vs disengaged, report the delta, write NOTHING.
-    Verify,
-}
-
 /// One footswitch-leveling request: level switch `switch`'s engaged state by solving the
 /// `(lev_group_id, lev_node_id, lev_parameter_id)` param to hit `target_lufs`.
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FootswitchLevelJob {
     pub(crate) switch: u32,
-    /// The leveling handle. Defaulted (empty) so a [`FsJobMode::Verify`] row — which has no
-    /// handle by definition — can omit all three; a `Level` row with any of them empty is a
-    /// clean per-row error rather than a solve against node "".
+    /// The leveling handle. Defaulted (empty) so a malformed payload is a clean per-row
+    /// error rather than a solve against node "".
     #[serde(default)]
     pub(crate) lev_group_id: String,
     #[serde(default)]
     pub(crate) lev_node_id: String,
     #[serde(default)]
     pub(crate) lev_parameter_id: String,
+    /// This row's OWN loudness target. Per-row (not one batch target) so a preset with a
+    /// mix of targets levels in ONE batch — one prepass, one runner, one deferred save.
     pub(crate) target_lufs: f64,
-    #[serde(default)]
-    pub(crate) mode: FsJobMode,
     /// The switch's CURRENT display label as the UI shows it (the Level list's footswitch row
     /// name: the player's `customLabel`, else the toggled block's friendly name). Used ONLY
     /// when the assign path appends a second function to a switch whose `customLabel` is empty
@@ -45,6 +28,20 @@ pub(crate) struct FootswitchLevelJob {
     /// prior display name keeps the pedalboard reading the same. Absent → today's behavior.
     #[serde(default)]
     pub(crate) display_label: Option<String>,
+    /// THE SCENE CONTEXT this switch's sound is measured and solved in (D3): a 0-based
+    /// `scenes[]` wire slot, or `None` = the preset's BASE sound (the historical behaviour and
+    /// the serde default, so an existing payload with no `sceneContext` key is unchanged).
+    ///
+    /// A footswitch does not sound the same in every scene — the scene's overlay decides which
+    /// blocks the switch is layered on top of, and (for the headroom trade) whether the sound
+    /// is pinned by its own `outputLevel` overlay or inherits base's. The UI picks this with
+    /// [`footswitch::scene_contexts_for_switches`]: exactly ONE scene enabling the switch
+    /// preselects that scene,
+    /// anything else falls back to base. A user override to a NON-enabling scene is allowed —
+    /// it is a real sound, just not one the pedalboard reaches by tapping that switch there —
+    /// and the picker flags it.
+    #[serde(default)]
+    pub(crate) scene_context: Option<u32>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -206,6 +203,25 @@ pub(crate) fn resolve_footswitch_job(
     Ok((value_b, spec))
 }
 
+/// Which scenes enable each footswitch of `slot`, for the leveling wizard's SCENE-CONTEXT
+/// picker (D3). PURE apart from ONE field-8 read: every answer comes out of the saved document,
+/// so no scene is recalled on the unit and nothing is measured.
+///
+/// The frontend preselects [`footswitch::FsSceneContext::suggested`] — the single enabling
+/// scene when there is exactly one, else base — and sends the user's final choice back as
+/// [`FootswitchLevelJob::scene_context`].
+#[tauri::command]
+pub(crate) async fn list_footswitch_scene_contexts(
+    state: State<'_, AppState>,
+    slot: u32,
+) -> Result<Vec<footswitch::FsSceneContext>, String> {
+    with_released_seize(state.session.clone(), move || {
+        let (preset, _, _) = read_slot_preset_parsed(slot)?;
+        Ok(footswitch::scene_contexts_for_switches(&preset))
+    })
+    .await
+}
+
 /// Level one or more block-acting footswitches of preset `slot`, streaming a progress item
 /// per switch. Each switch's engaged state is measured/solved independently against the
 /// base preset; jobs run sequentially. Mirrors `level_scenes_apply_batched`.
@@ -249,46 +265,21 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
         // Plan bake-vs-assign for the whole batch (pure) — block-off-in-base + sole-owner + no
         // scene overlay on THAT node's bypass ⇒ bake straight onto the block (no `ftsw` write, so
         // the switch keeps its single function and its label); otherwise the param assignment.
-        // Planning covers LEVEL rows ONLY. A verify row writes nothing and has no handle to
-        // plan a write for, and letting one into the batch would let `BakeShared { rep }`
-        // pick it as a level row's representative — `results[rep]` would then be a verify
-        // result (a delta, no solved value) silently reused as a solved one.
-        //
-        // `plan_footswitch_jobs` therefore answers in PLAN space (one entry per level row)
-        // while `jobs`/`results`/`pending` are all in JOB space. The two spaces meet ONCE,
-        // right here: `level_idx[k]` is plan `k`'s job index, and the loop below realigns
-        // every plan into job space — translating `BakeShared.rep` with it — so nothing
-        // downstream ever holds a plan-space index again. `plans[idx]` is `None` exactly for
-        // a verify row.
-        let level_idx: Vec<usize> = jobs
+        // PLAN SPACE IS JOB SPACE: every row is a level row (the verify-mode filter that used
+        // to thin this list is gone), so `plan_footswitch_jobs` answers one plan per job in
+        // job order and `BakeShared.rep` is already a `results`/`plans` index — nothing to
+        // realign.
+        let keys: Vec<footswitch::FsJobKey> = jobs
             .iter()
-            .enumerate()
-            .filter(|(_, j)| j.mode == FsJobMode::Level)
-            .map(|(i, _)| i)
-            .collect();
-        let keys: Vec<footswitch::FsJobKey> = level_idx
-            .iter()
-            .map(|&i| footswitch::FsJobKey {
-                switch: jobs[i].switch,
-                lev_node: &jobs[i].lev_node_id,
-                lev_param: &jobs[i].lev_parameter_id,
-                target_bits: jobs[i].target_lufs.to_bits(),
+            .map(|j| footswitch::FsJobKey {
+                switch: j.switch,
+                lev_node: &j.lev_node_id,
+                lev_param: &j.lev_parameter_id,
+                target_bits: j.target_lufs.to_bits(),
             })
             .collect();
-        let mut plans: Vec<Option<footswitch::FsLevelPlan>> = vec![None; jobs.len()];
-        for (k, plan) in footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys)
-            .into_iter()
-            .enumerate()
-        {
-            plans[level_idx[k]] = Some(match plan {
-                footswitch::FsLevelPlan::BakeShared { rep } => {
-                    footswitch::FsLevelPlan::BakeShared {
-                        rep: level_idx[rep],
-                    }
-                }
-                other => other,
-            });
-        }
+        let plans: Vec<footswitch::FsLevelPlan> =
+            footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys);
 
         // Freshness barrier: a same-slot batch load starting shortly after this preset's own
         // earlier save (base level, a prior FS batch, …) could otherwise materialize the
@@ -324,6 +315,94 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
         // The solved writes pending the batch's single write+save session, each
         // carrying its job index (one vec — no hand-aligned parallel arrays).
         let mut pending: Vec<(usize, leveller::FsPendingWrite)> = Vec::new();
+        // ── THE REORDERED RUN, FS HALF ────────────────────────────────────────────────
+        // PHASE 1: read every row's CEILING (its engaged sound with the leveling handle
+        // pinned at the top of its range) BEFORE any solve. One engage per row — a
+        // MEASUREMENT, never an extrapolation, because an arbitrary block param has no
+        // algebraically predictable response. A row whose target sits clearly above its own
+        // ceiling is settled here: it clamps honestly and its (up to `FS_CORRECT_MAX`)
+        // secant captures are never paid.
+        //
+        // A `BakeShared` sibling pays NOTHING here. Its plan says its sound is the SAME sound
+        // as `rep`'s — same node, same param, same target (`FsJobKey`), which is the very
+        // premise phase 2 already relies on when it copies `results[rep]` verbatim — so its
+        // ceiling is `rep`'s ceiling, and `rep` is always a LOWER index (the planner picks the
+        // first row of the group as the representative), so the entry is already in hand.
+        // Saves one engage+capture per sibling, on a device where that is ~10 s.
+        let mut ceilings: Vec<Option<leveller::FsCeiling>> = Vec::with_capacity(jobs.len());
+        for (idx, job) in jobs.iter().enumerate() {
+            let ceiling = (|| {
+                if let Some(footswitch::FsLevelPlan::BakeShared { rep }) = plans.get(idx) {
+                    return ceilings.get(*rep).copied().flatten();
+                }
+                if FOOTSWITCH_LEVEL_CANCEL.load(SeqCst)
+                    || job.lev_group_id.is_empty()
+                    || job.lev_node_id.is_empty()
+                    || job.lev_parameter_id.is_empty()
+                {
+                    return None;
+                }
+                let handle = leveller::FsParamTarget::from_preset(
+                    &preset,
+                    &job.lev_node_id,
+                    &job.lev_parameter_id,
+                );
+                // An unrecognised control refuses at the solve; measuring its ceiling first
+                // would burn a capture to reach the same refusal.
+                if handle.refuse_if_not_a_level_control().is_some() {
+                    return None;
+                }
+                let states = footswitch::switch_states(&ftsw, &preset, job.switch);
+                let probe = leveller::FsCeilingProbe {
+                    // THE ROW'S SCENE CONTEXT (D3). `None` = base — the historical default,
+                    // the sound the isolation list describes on its own. A `Some(i)` row
+                    // recalls scene `i` before engaging, so the ceiling read describes the
+                    // switch AS IT SOUNDS IN THAT SCENE — the same context its solve below
+                    // measures in, or the two would describe different sounds.
+                    scene: job.scene_context,
+                    states: &states,
+                    handle: (
+                        job.lev_group_id.clone(),
+                        job.lev_node_id.clone(),
+                        handle.clone(),
+                    ),
+                };
+                match leveller::measure_fs_ceiling(&probe, &stim) {
+                    Ok(l) => {
+                        let ceiling_lufs = l.integrated_lufs;
+                        let target = job.target_lufs + offset;
+                        let unreachable =
+                            leveller::fs_target_beyond_ceiling(ceiling_lufs, target);
+                        log::info!(
+                            "fs prepass switch={} ceiling={ceiling_lufs:.2} LUFS target={target:.2} \
+                             unreachable={unreachable}",
+                            job.switch
+                        );
+                        Some(leveller::FsCeiling {
+                            ceiling_lufs,
+                            spread_lu: l.spread_lu(),
+                            unreachable,
+                        })
+                    }
+                    // A failed ceiling read is NOT a failed row: the solve takes over and
+                    // reports whatever it finds, exactly as it did before this phase existed.
+                    Err(e) => {
+                        log::warn!(
+                            "fs prepass ceiling for switch {} failed ({e}); its solve will decide",
+                            job.switch
+                        );
+                        None
+                    }
+                }
+            })();
+            ceilings.push(ceiling);
+        }
+        // Guaranteed fresh re-amp OFF after the measurement phase — each capture disengages
+        // itself, but an interrupted one can strand the unit input-muted (`danger.md`).
+        leveller::reamp_off_guaranteed("fs_prepass_ceilings");
+
+        // PHASE 2: solve + collect the writes (the writes themselves still ride the single
+        // live-edit session at the end, unchanged).
         for (idx, job) in jobs.iter().enumerate() {
             if FOOTSWITCH_LEVEL_CANCEL.load(SeqCst) {
                 let _ = on_result.send(FootswitchLevelProgressItem {
@@ -360,125 +439,130 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                     job.lev_parameter_id.clone(),
                 )
             };
-            // VERIFY: two isolated captures, no solve, no write (see
-            // `leveller::verify_footswitch`). Deliberately NOT class-gated — nothing is
-            // swept, so an `Other`-classified handle (or none at all) is irrelevant here.
-            let plan = plans[idx].as_ref();
-            let outcome: Result<leveller::FootswitchLevelResult, String> = match (job.mode, plan) {
-                (FsJobMode::Verify, _) => {
-                    let states = footswitch::switch_states(&ftsw, &preset, job.switch);
-                    leveller::verify_footswitch(
+            let plan = plans.get(idx);
+            // PREPASS VERDICT FIRST: the ceiling read already proved this row cannot reach
+            // its target with the handle at the top, so the solve has nothing to find. Report
+            // the honest clamp at the loudest the sound can actually be, write nothing, and
+            // keep the row's authored value exactly as the player wrote it.
+            let unreachable = ceilings[idx].filter(|c| c.unreachable);
+            let outcome: Result<leveller::FootswitchLevelResult, String> = match plan {
+                _ if unreachable.is_some() => {
+                    let c = unreachable.expect("checked by the guard");
+                    Ok(leveller::fs_result_from_ceiling(
                         job.switch,
-                        &states,
-                        &stim,
                         job.target_lufs + offset,
-                        lev_param.authored,
-                    )
+                        &lev_param,
+                        &c,
+                        // The method is what the row WOULD have used; nothing was written.
+                        match plan {
+                            Some(footswitch::FsLevelPlan::Bake { .. })
+                            | Some(footswitch::FsLevelPlan::BakeShared { .. }) => "baked",
+                            _ => "assigned",
+                        },
+                    ))
                 }
-                // A level row's handle is what the whole solve addresses; an empty
-                // coordinate would sweep node "" and report a number for nothing.
-                (FsJobMode::Level, _)
-                    if job.lev_group_id.is_empty()
-                        || job.lev_node_id.is_empty()
-                        || job.lev_parameter_id.is_empty() =>
+                // A row's handle is what the whole solve addresses; an empty coordinate
+                // would sweep node "" and report a number for nothing. (The verify-only row
+                // that used to legitimately carry no handle is gone — every row levels.)
+                _ if job.lev_group_id.is_empty()
+                    || job.lev_node_id.is_empty()
+                    || job.lev_parameter_id.is_empty() =>
                 {
                     Err("no leveling parameter chosen for this footswitch".to_string())
                 }
-                // Unreachable by construction (`plans[idx]` is `Some` for every level row);
-                // an honest per-row error beats a panic inside a device run.
-                (FsJobMode::Level, None) => {
-                    Err("internal: no plan built for this footswitch row".to_string())
-                }
-                (FsJobMode::Level, Some(plan)) => match plan {
-                    footswitch::FsLevelPlan::Clamp(msg) => Err(msg.clone()),
-                    // A sibling switch already baked this (node, param, target) — reuse its
-                    // result. `rep` is a JOB index (translated at alignment), so it indexes
-                    // `results` directly.
-                    footswitch::FsLevelPlan::BakeShared { rep } => results[*rep]
-                        .clone()
-                        .map(|mut r| {
-                            r.switch = job.switch;
-                            r
-                        })
-                        .ok_or_else(|| "shared bake produced no result".to_string()),
-                    // Bake has no cheap re-run marker (the block's param value is `Some` from the
-                    // factory too), so it always solves — no idempotency probe (`current` = None).
-                    footswitch::FsLevelPlan::Bake {
-                        engaged,
-                        clear_stale,
-                        mirror_scenes,
-                    } => leveller::measure_footswitch(
-                        job.switch,
-                        lev,
-                        engaged,
-                        &stim,
-                        job.target_lufs + offset,
-                        "baked",
-                        None,
-                        &lev_param,
-                    )
-                    .inspect(|r| {
-                        if save && r.clamp_reason.is_none() {
-                            pending.push((
-                                idx,
-                                leveller::FsPendingWrite {
-                                    switch: job.switch,
-                                    lev: lev_owned(),
-                                    write: leveller::FsWrite::Bake {
-                                        clear_stale: *clear_stale,
-                                        mirror_scenes: mirror_scenes.clone(),
-                                    },
-                                    value: r.final_value,
+                // Unreachable by construction (`plans[idx]` is `Some` for every row); an
+                // honest per-row error beats a panic inside a device run.
+                None => Err("internal: no plan built for this footswitch row".to_string()),
+                Some(footswitch::FsLevelPlan::Clamp(msg)) => Err(msg.clone()),
+                // A sibling switch already baked this (node, param, target) — reuse its
+                // result. `rep` is a JOB index (translated at alignment), so it indexes
+                // `results` directly.
+                Some(footswitch::FsLevelPlan::BakeShared { rep }) => results[*rep]
+                    .clone()
+                    .map(|mut r| {
+                        r.switch = job.switch;
+                        r
+                    })
+                    .ok_or_else(|| "shared bake produced no result".to_string()),
+                // Bake has no cheap re-run marker (the block's param value is `Some` from the
+                // factory too), so it always solves — no idempotency probe (`current` = None).
+                Some(footswitch::FsLevelPlan::Bake {
+                    engaged,
+                    clear_stale,
+                    mirror_scenes,
+                }) => leveller::measure_footswitch(
+                    job.switch,
+                    job.scene_context,
+                    lev,
+                    engaged,
+                    &stim,
+                    job.target_lufs + offset,
+                    "baked",
+                    None,
+                    &lev_param,
+                )
+                .inspect(|r| {
+                    if save && r.clamp_reason.is_none() {
+                        pending.push((
+                            idx,
+                            leveller::FsPendingWrite {
+                                switch: job.switch,
+                                lev: lev_owned(),
+                                write: leveller::FsWrite::Bake {
+                                    clear_stale: *clear_stale,
+                                    mirror_scenes: mirror_scenes.clone(),
                                 },
-                            ));
-                        }
-                    }),
-                    footswitch::FsLevelPlan::Assign { engaged } => {
-                        match resolve_footswitch_job(&ftsw, &preset, job) {
-                            Err(e) => Err(e),
-                            Ok((value_b, spec)) => {
-                                // Re-run anchor: a prior assign's stored valueA (None = fresh).
-                                // Also the wet-floor anchor — the solve raises `lev_param`'s
-                                // anchor to this ENGAGED value itself (`FsParamTarget::anchored`).
-                                let current = footswitch::existing_param_fn_value_a(
-                                    &ftsw,
-                                    job.switch,
-                                    &job.lev_node_id,
-                                    &job.lev_parameter_id,
-                                )
-                                .map(|v| v as f32);
-                                leveller::measure_footswitch(
-                                    job.switch,
-                                    lev,
-                                    engaged,
-                                    &stim,
-                                    job.target_lufs + offset,
-                                    "assigned",
-                                    current,
-                                    &lev_param,
-                                )
-                                // Skip the write when the leveler left the value unchanged — its
-                                // `final_value == current` is the idempotency signal (no wire field).
-                                .inspect(|r| {
-                                    if save
-                                        && r.clamp_reason.is_none()
-                                        && Some(r.final_value) != current
-                                    {
-                                        pending.push((
-                                            idx,
-                                            leveller::FsPendingWrite {
-                                                switch: job.switch,
-                                                lev: lev_owned(),
-                                                write: leveller::FsWrite::Assign { value_b, spec },
-                                                value: r.final_value,
-                                            },
-                                        ));
-                                    }
-                                })
-                            }
+                                value: r.final_value,
+                            },
+                        ));
+                    }
+                }),
+                Some(footswitch::FsLevelPlan::Assign { engaged }) => {
+                    match resolve_footswitch_job(&ftsw, &preset, job) {
+                        Err(e) => Err(e),
+                        Ok((value_b, spec)) => {
+                            // Re-run anchor: a prior assign's stored valueA (None = fresh).
+                            // Also the wet-floor anchor — the solve raises `lev_param`'s
+                            // anchor to this ENGAGED value itself (`FsParamTarget::anchored`).
+                            let current = footswitch::existing_param_fn_value_a(
+                                &ftsw,
+                                job.switch,
+                                &job.lev_node_id,
+                                &job.lev_parameter_id,
+                            )
+                            .map(|v| v as f32);
+                            leveller::measure_footswitch(
+                                job.switch,
+                                job.scene_context,
+                                lev,
+                                engaged,
+                                &stim,
+                                job.target_lufs + offset,
+                                "assigned",
+                                current,
+                                &lev_param,
+                            )
+                            // Skip the write when the leveler left the value unchanged — its
+                            // `final_value == current` is the idempotency signal (no wire field).
+                            .inspect(|r| {
+                                if save
+                                    && r.clamp_reason.is_none()
+                                    && Some(r.final_value) != current
+                                {
+                                    pending.push((
+                                        idx,
+                                        leveller::FsPendingWrite {
+                                            switch: job.switch,
+                                            lev: lev_owned(),
+                                            write: leveller::FsWrite::Assign { value_b, spec },
+                                            value: r.final_value,
+                                        },
+                                    ));
+                                }
+                            })
                         }
                     }
-                },
+                }
             };
             // A Stop mid-sweep surfaces as the CANCELLED sentinel, not a failure — report
             // it like the top-of-loop check would rather than as an errored switch.
@@ -559,7 +643,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                 // same written write). `plans`, `written` and `results` are all JOB-indexed
                 // and `rep` was translated at alignment, so no remap happens here.
                 for (idx, plan) in plans.iter().enumerate() {
-                    if let Some(footswitch::FsLevelPlan::BakeShared { rep }) = plan {
+                    if let footswitch::FsLevelPlan::BakeShared { rep } = plan {
                         if written.contains(rep) {
                             let rep_mismatch =
                                 results[*rep].as_ref().and_then(|r| r.persist_mismatch);
@@ -611,15 +695,16 @@ mod tests {
             lev_node_id: "amp".into(),
             lev_parameter_id: "drive".into(),
             target_lufs: -20.0,
-            mode: FsJobMode::Level,
             display_label: None,
+            scene_context: None,
         }
     }
 
-    // The wire default: a payload with NO `mode` key deserializes as a LEVEL row, so every
-    // pre-existing caller (the frontend, the probe, the e2e bridge) keeps its meaning.
+    // PER-ROW TARGET is the wire contract: each row carries its OWN `targetLufs`, so one
+    // batch can level a preset whose rows ask for different loudnesses (one prepass, one
+    // runner, one deferred save). The verify-only `mode` key is GONE — every row levels.
     #[test]
-    fn job_mode_defaults_to_level() {
+    fn a_job_carries_its_own_target_and_handle() {
         let job: FootswitchLevelJob = serde_json::from_value(serde_json::json!({
             "switch": 0,
             "levGroupId": "G1",
@@ -628,20 +713,20 @@ mod tests {
             "targetLufs": -20.0
         }))
         .expect("deserialize");
-        assert_eq!(job.mode, FsJobMode::Level);
+        assert_eq!(job.target_lufs, -20.0);
+        assert_eq!(job.lev_parameter_id, "drive");
     }
 
-    // A verify row carries no handle at all — the three `lev*` coordinates are defaulted so
-    // the frontend can omit them rather than inventing a placeholder the solve would sweep.
+    // A payload from an older frontend still carrying `mode` must not fail to deserialize —
+    // the key is simply ignored and the row levels like any other.
     #[test]
-    fn verify_job_may_omit_the_leveling_handle() {
+    fn a_legacy_mode_key_is_ignored_rather_than_rejected() {
         let job: FootswitchLevelJob = serde_json::from_value(serde_json::json!({
             "switch": 3,
             "targetLufs": -23.0,
             "mode": "verify"
         }))
         .expect("deserialize");
-        assert_eq!(job.mode, FsJobMode::Verify);
         assert!(job.lev_group_id.is_empty());
         assert!(job.lev_node_id.is_empty());
         assert!(job.lev_parameter_id.is_empty());

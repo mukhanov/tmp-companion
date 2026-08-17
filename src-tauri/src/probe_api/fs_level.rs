@@ -317,7 +317,7 @@ pub fn probe_fs_sweep(
     for v in values {
         // A silent point is DATA here (the knob's bottom end), not a failure — record it
         // and keep sweeping instead of aborting the whole curve like the solver does.
-        match leveller::measure_fs_at((group, node, param), &engaged, &stim, *v) {
+        match leveller::measure_fs_at(None, (group, node, param), &engaged, &stim, *v) {
             Ok(l) => {
                 out += &format!(
                     "  {param}={v:.3} → integrated {:.3} LUFS  short-term-max {:.3}  spread {:.2} LU\n",
@@ -657,9 +657,9 @@ pub fn probe_level_footswitch(
         lev_parameter_id: lev_param.to_string(),
         target_lufs,
         // probe: solve-and-write, never the verify-only row.
-        mode: crate::commands::level_footswitch::FsJobMode::Level,
         // probe: no UI row label to preserve.
         display_label: None,
+        scene_context: None,
     };
     let plan = footswitch::plan_footswitch_jobs(
         &ftsw,
@@ -787,8 +787,8 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
                 lev_node_id: p.node_id.clone(),
                 lev_parameter_id: p.parameter_id.clone(),
                 target_lufs: -24.0,
-                mode: crate::commands::level_footswitch::FsJobMode::Level,
                 display_label: None,
+                scene_context: None,
             })
         })
         .collect();

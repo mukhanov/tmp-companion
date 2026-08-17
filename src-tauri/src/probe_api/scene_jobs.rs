@@ -498,6 +498,9 @@ pub(crate) fn build_scene_jobs_with_handles(
                         // `target_mode` per wire job.
                         target_mode: leveller::SceneTargetMode::Match,
                         handle: None,
+                        // Filled by `leveller::prepass_scene_ceilings` when the caller runs
+                        // the reordered (measure-everything-first) run.
+                        prepass: None,
                     }
                 }
                 Err(reason) => skip_scene_job(*scene, target_lufs, reason),
@@ -517,6 +520,8 @@ fn skip_scene_job(scene: u32, target_lufs: f64, reason: String) -> leveller::Sce
         rebalanceable: false,
         target_mode: leveller::SceneTargetMode::Match,
         handle: None,
+        // A skip job is never measured, so it never carries a prepass reading.
+        prepass: None,
     }
 }
 
@@ -579,6 +584,7 @@ fn handle_scene_job(
         rebalanceable: false,
         target_mode: leveller::SceneTargetMode::Match,
         handle: Some(target),
+        prepass: None,
     }
 }
 

@@ -3,6 +3,15 @@
 use crate::*;
 
 /// One leveling job from the UI: a preset slot + the LUFS target to hit.
+///
+/// PER-ROW HANDLE AND TARGET (the base row's half of the contract). `target_lufs` is THIS
+/// row's target — the user's per-row override when they set one, else the global; the wizard
+/// resolves that before dispatch, so nothing here needs a "global vs override" flag.
+/// `block_*` is the row's optional user-chosen HANDLE: present = level by driving that block
+/// control, absent = the **`presetLevel` pseudo-handle**, which is the base row's default and
+/// the only handle no block can express (it is the preset's master amplitude, not a node
+/// param). Scene rows carry the same pair on `SceneLevelJobArg`, footswitch rows on
+/// `FootswitchLevelJob` — three row kinds, one shape.
 #[derive(serde::Deserialize)]
 pub(crate) struct LevelJob {
     slot: u32,

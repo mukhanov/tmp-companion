@@ -433,6 +433,14 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 // to the user (D4), so it needs the un-mixed capture's stereo-measured
                 // Loudness alongside the average-mixdown `samples` bands/PSD run on —
                 // see `doctor_capture_with_loudness`'s doc.
+                // ⟦P1/P4⟧ PREMISE-CHECK SEAM — see `validate_log::emit_doctor`'s doc.
+                let validate = crate::validate_log::doctor_log_path().map(|_| {
+                    crate::validate_log::ValidationRow::doctor(
+                        item.list_index,
+                        item.scene,
+                        item.footswitch,
+                    )
+                });
                 let (samples, rate, stereo_loudness) = leveller::doctor_capture_with_loudness(
                     item.list_index,
                     item.scene,
@@ -442,6 +450,7 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                     Some(0.5),
                     tail_ms,
                     skip_load,
+                    validate.as_ref(),
                 )?;
                 // Align the body/tail split to where the stimulus actually starts
                 // (I/O latency); low confidence keeps the legacy un-aligned split.

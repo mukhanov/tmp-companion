@@ -661,6 +661,7 @@ mod truncation_fallback_tests {
                 link_group: None,
                 functions: Vec::new(),
                 level_params: Vec::new(),
+                all_params: Vec::new(),
             }],
             silence_hint: None,
         }

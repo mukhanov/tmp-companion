@@ -160,6 +160,7 @@ pub fn run_e2e_server() {
             common_reachable_target,
             cancel_scene_leveling,
             level_footswitches_apply,
+            list_footswitch_scene_contexts,
             doctor_check,
             cancel_doctor_check,
             doctor_apply,
