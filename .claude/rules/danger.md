@@ -26,6 +26,8 @@ Full hardware evidence for the linked entries is in [`notes/gotchas.md`](../../n
 
 - **DANGER** — **A silent/failed re-amp inject reads as the device's STATIONARY OUTPUT FLOOR**, and `measure_c` would accept it as a valid `C` without the production floor guards. In a rapid 20-engage `probe --stim-ab` sweep, **19 of 20** captures measured the post-DSP floor rather than the stimulus. [→ evidence](../../notes/gotchas.md#a-silentfailed-re-amp-inject-reads-as-the-devices-stationary-output-floor-and-measure_c-would-accept-it-as-a-valid-c-without-the-production-floor-guards-below)
 
+- **An engage that follows a bare `loadScene` recall with NO intervening command is DEAD** — the capture reads the stationary floor exactly as if the inject failed. Any command between the recall and the engage rescues it; `leveller::capture_on_session` heartbeats the naked shape (every idle gap ≤300 ms, engage ~900 ms post-recall). [→ evidence](../../notes/gotchas.md#an-engage-after-a-naked-scene-recall-latches-silence--break-the-idle-with-heartbeats)
+
 - **Re-amp engages reliably only ONCE per connection.** Fresh-connect per engage. The `ReAmpModeChanged` echo is flaky and is NOT proof of engagement — a finite captured loudness is. [→ evidence](../../notes/gotchas.md#re-amp-engages-reliably-only-once-per-connection)
 
 - **Re-amp latches preset state at engage** — the captured tap reflects only the `presetLevel` set BEFORE engaging. Set level, then engage.

@@ -940,8 +940,12 @@ fn capture_full_at_params(
 }
 
 /// Force-bypass isolation → optional reference level → engage → `reamp_capture` →
-/// guaranteed re-amp off, on an ALREADY-OPEN session. Does NOT load a preset or
-/// recall a scene — the caller does that first, if at all, since re-`load_scene`ing
+/// guaranteed re-amp off, on an ALREADY-OPEN session. When there is NEITHER an
+/// isolation write NOR a reference level (the NAKED shape), two `heartbeat`s are
+/// interleaved into the pre-engage settles so the engage never lands on a long
+/// idle gap after the caller's scene recall — see the block comment on that
+/// branch below. Does NOT load a preset or recall a scene — the caller does
+/// that first, if at all, since re-`load_scene`ing
 /// between writes reverts the prior write's unsaved value (`set_knobs`'s doc); this
 /// seam exists precisely so a caller that has ALREADY applied unsaved edits on `s`
 /// (Doctor's `ops_session`) can capture them without a further recall silently
@@ -967,6 +971,32 @@ pub(crate) fn capture_on_session(
     // leaving the edit buffer's presetLevel untouched.
     if let Some(ref_level) = ref_level {
         set_knob(s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0), None)?;
+    }
+    // NAKED-SHAPE idle breaker: with no isolation write and no reference level, this
+    // seam has sent nothing itself before the engage, which would otherwise land on a
+    // ~600 ms idle gap after the caller's `load_scene` recall and read the device's
+    // stationary output floor instead of the stimulus. `Session::heartbeat` is the
+    // designed keep-alive and writes nothing: recall → 300 → hb → 300 → hb → 300 →
+    // engage keeps every idle gap ≤300 ms and lands the engage ~900 ms post-recall.
+    // HW evidence, the two candidate mechanisms, and why the timing is two-sided:
+    // gotchas.md "An engage after a naked scene recall latches silence".
+    //
+    // PRODUCTION fix, not harness-only: the naked shape is reached by
+    // `capture_asis_full` (probe --measure-scene / --measure-current), by
+    // `measure_sound_asis_strict`'s scene rows (empty bypass, no reference level),
+    // and by Doctor's apply A/B whenever the diagnosed sound needs no isolation. Two
+    // shapes over-fire benignly toward the proven-green timing: caller-side
+    // `fs_params` writes (invisible here — the line is already warm) and the
+    // no-recall captures (no mute window to outlive) — both cost one extra 300 ms
+    // settle on one-shot paths, never in a hot loop.
+    //
+    // Write-bearing paths (any `force_bypass` entry, or a `ref_level`) deliberately
+    // skip this: their transact round-trips already break the idle and land the
+    // engage ≥~850 ms post-recall — HW-validated green, do not perturb.
+    if force_bypass.is_empty() && ref_level.is_none() {
+        s.heartbeat()?;
+        settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+        s.heartbeat()?;
     }
     // Settle UNCONDITIONALLY before the engage: the caller (or the loop above) may
     // have just issued bypass/param writes even when `ref_level` is `None` — the
