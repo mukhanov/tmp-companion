@@ -954,15 +954,38 @@ mod fixture_gates {
         assert_eq!(base_node_bypass(&p, "comp1"), Some(true));
 
         // Neutrality: an enabled block must be transparent, or base fires verdicts.
-        let dp = |node: &str| -> serde_json::Value {
+        let node = |id: &str| -> serde_json::Value {
             p["audioGraph"]["guitarNodes"]["G1"]
                 .as_array()
                 .expect("G1")
                 .iter()
-                .find(|n| n["nodeId"] == node)
-                .unwrap_or_else(|| panic!("{node} missing"))["dspUnitParameters"]
+                .find(|n| n["nodeId"] == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
                 .clone()
         };
+        let dp = |id: &str| node(id)["dspUnitParameters"].clone();
+
+        // Cab identity is LOAD-BEARING for the verdict table below: FIZZY and BRIGHT are
+        // seam-only BECAUSE this cab (the V30 IR on both sims, plus its 7 kHz LPF) leaves
+        // no air band for a boost to lift and no room for a whole-spectrum tilt.
+        assert_eq!(
+            node("cab1")["FenderId"],
+            "ACD_CabSimTMS",
+            "cab1 model identity"
+        );
+        let cab = dp("cab1");
+        for k in ["cabsimid", "cab2simid"] {
+            assert_eq!(cab[k], "Mar1960aV30Alt", "cab1.{k}");
+        }
+        assert_eq!(
+            cab["cabsim2enabled"].as_bool(),
+            Some(true),
+            "cab1.cabsim2enabled (the second V30 is in the blend)"
+        );
+        for k in ["lpf", "lpfcab2"] {
+            assert_eq!(cab[k].as_f64(), Some(7000.0), "cab1.{k}");
+        }
+
         let eq = dp("eq10");
         for band in [
             "gain62hz",
@@ -1965,6 +1988,72 @@ mod fixture_gates {
              or fix COVERAGE.md's Spec cell to name the file that actually covers it. (A \
              citation in some OTHER spec file no longer counts: that is the drift this \
              gate exists to catch.)"
+        );
+    }
+
+    /// Every `*.online.spec.ts` must appear in `scripts/e2e.sh`'s default online SPECS
+    /// line. `doctor-apply.online` sat outside that hand-maintained literal and "had
+    /// never run in either tier despite existing to be the one-off HW validation"
+    /// (e2e.sh's own comment) — this gate makes that failure mode impossible to repeat.
+    #[test]
+    fn every_online_spec_is_in_the_default_online_set() {
+        let sh = std::fs::read_to_string("../scripts/e2e.sh").expect("read scripts/e2e.sh");
+        let set_line = sh
+            .lines()
+            .find(|l| l.contains("SPECS=(") && l.contains("all"))
+            .expect("scripts/e2e.sh: the default-SPECS resolve line (SPECS=(…)) is gone");
+        let mut checked = 0;
+        for entry in std::fs::read_dir("../e2e/specs").expect("read e2e/specs") {
+            let path = entry.expect("dir entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(spec) = name.strip_suffix(".spec.ts") else {
+                continue;
+            };
+            if !spec.ends_with(".online") {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                set_line.contains(&format!(" {spec} "))
+                    || set_line.contains(&format!("({spec} "))
+                    || set_line.contains(&format!(" {spec})")),
+                "{name} exists but '{spec}' is not in scripts/e2e.sh's default online SPECS \
+                 set — it would never run in ANY tier (offline testIgnores *.online.spec.ts)"
+            );
+        }
+        assert!(
+            checked >= 2,
+            "expected at least 2 *.online.spec.ts files ({checked} found) — a naming-scheme \
+             change would otherwise make this gate pass vacuously"
+        );
+    }
+
+    /// `scripts/validate-hbe.sh` carries an executable SHELL MIRROR of
+    /// [`probe_api::SCRATCH_SLOTS`] (its own guard refuses slots outside it). Its comment
+    /// says "update this line in the SAME commit" — this gate enforces that instead of
+    /// trusting it: the mirror drifted to 400–405 once while the zone was 400–409, which
+    /// would have refused four legitimate scratch slots.
+    #[test]
+    fn validate_hbe_scratch_slots_mirror_matches_the_rust_declaration() {
+        let sh =
+            std::fs::read_to_string("../scripts/validate-hbe.sh").expect("read validate-hbe.sh");
+        let line = sh
+            .lines()
+            .find(|l| l.starts_with("SCRATCH_SLOTS="))
+            .expect("validate-hbe.sh: the SCRATCH_SLOTS mirror line is gone");
+        let mirrored: Vec<u32> = line
+            .trim_start_matches("SCRATCH_SLOTS=")
+            .trim_matches('"')
+            .split_whitespace()
+            .map(|s| s.parse().expect("mirror entries are slot numbers"))
+            .collect();
+        assert_eq!(
+            mirrored,
+            crate::probe_api::SCRATCH_SLOTS.to_vec(),
+            "scripts/validate-hbe.sh's SCRATCH_SLOTS mirror != probe_api::SCRATCH_SLOTS — \
+             update the script in the same commit as the Rust declaration"
         );
     }
 }

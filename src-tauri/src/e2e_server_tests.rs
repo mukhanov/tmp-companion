@@ -1940,6 +1940,30 @@ fn fresh_load_barrier_time_gate_proceeds_on_an_unharvestable_witness() {
     );
 }
 
+/// Block DISCOVERY is a same-slot device load like any other, and the Level wizard's Base
+/// handle picker (`list_level_blocks`) fires it seconds after a run's own save. Ungated, its
+/// load materializes the PRE-save doc inside the commit window — the preset-24 corruption
+/// class (`danger.md`). The barrier belongs at the shared load seam, so this drives
+/// `load_then_discover_blocks` directly rather than the Tauri command wrapper.
+#[test]
+fn load_then_discover_blocks_gates_on_a_pending_same_slot_save() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let sim = install_barrier_sim(1_500);
+    save_level_401(&sim, 0.81);
+    crate::leveller::register_slot_save(401, crate::leveller::SaveWitness::PresetLevel(0.81));
+    let _ = crate::load_then_discover_blocks(401);
+    // The discovery load must have landed on the COMMITTED doc. `0.32` (the fixture's
+    // pre-save level) means the load raced the commit and re-materialized stale bytes —
+    // the load whose lazy commit silently reverts the save that preceded it.
+    assert!(
+        (sim.preset_level() - 0.81).abs() < 1e-3,
+        "block discovery materialized the PRE-save doc inside the commit window \
+         (preset-24 class), got {}",
+        sim.preset_level()
+    );
+}
+
 /// D3 gate: a scene row given the USER'S OWN handle is solved by the generic param secant
 /// (`solve_param_secant`) instead of the amp joint-k, and still lands on target through the
 /// Scene-Edit-aware write path. The handle here is the Hiwatt's `outputLevel` in scene 0 —

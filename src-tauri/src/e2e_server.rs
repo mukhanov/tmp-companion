@@ -421,7 +421,7 @@ fn e2e_patch_snapshot_slot(slot: u32, name: &str) -> bool {
 /// ONLINE-e2e DETERMINISTIC scratch setup: sweep stray imports, then place EVERY
 /// committed scenario preset (`e2e/fixtures/scenario-presets.json` — the SAME
 /// presetJsons baked into the offline backup fixture) at its list index
-/// (400-405; the spec drives the slot set, nothing here hardcodes it). The heavy lifting lives in `probe_api::seed_scenario` — shared with
+/// (400-409; the spec drives the slot set, nothing here hardcodes it). The heavy lifting lives in `probe_api::seed_scenario` — shared with
 /// `probe --seed-scenario`, which the RUNNER prefers (a fresh process per seed, run
 /// before the server starts, dodges the in-process `0xe00002c5` open lockout that
 /// aborted in-spec seeds). This command is the fallback for specs run without the

@@ -1,6 +1,8 @@
 // src/views/level/useFootswitchSceneContexts.ts — the Set-up step's per-preset
 // footswitch scene-context cache (D3). `list_footswitch_scene_contexts` is a real
-// device read (one field-8 fetch), so it fires LAZILY — on first open of a
+// device read (one field-8 fetch — plus a multi-second whole-library backup re-read
+// when a large preset's `ftsw` tail is cut, see `lib/invoke`), so it fires LAZILY —
+// on first open of a
 // footswitch row's scene-context picker, once per PRESET. A thin wrapper over
 // `useLazySlotCache` — see that hook for the shared fetch/cache mechanics and its
 // no-self-heal-within-a-mount contract.

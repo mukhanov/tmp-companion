@@ -507,6 +507,9 @@ pub(crate) fn stimulus_spread_lu(stimulus: &[f32]) -> f64 {
 /// How long a `saveCurrentPreset` commit stays racy (HW: 45–100 s observed; 150 s gives
 /// margin). Past this, `ensure_fresh_load` stops waiting and proceeds — the commit is
 /// time-bounded, so camping on an unharvestable witness forever would brick a run.
+/// Mirrors: `probe_api::seed_scenario` derives its landed-import verify window from this
+/// constant, and `scripts/validate-hbe.sh` carries the same 150 as a shell literal —
+/// change one, change all three.
 pub(crate) const COMMIT_WINDOW_SECS: u64 = 150;
 /// Agreement band for a harvested witness vs its registered value — matches `PERSIST_TOL`'s
 /// float-formatting slack, far below any real leveling step.

@@ -18,7 +18,7 @@ const WORKERS = Number(process.env.TMP_E2E_WORKERS ?? "3");
 // at a server opened against the real device. Device is exclusive-seize → `workers: 1`.
 export default defineConfig({
   testDir: "./specs",
-  // Two spec files are online-only ORACLES in their entirety — `*.online.spec.ts` needs a
+  // Some spec files are online-only ORACLES in their entirety — `*.online.spec.ts` needs a
   // real device, and level-strict needs real audio (the offline capture is a stimulus
   // passthrough). Offline they can only ever `test.skip(...)`, but the skip is decided
   // INSIDE the test body, so Playwright had already run the file's fixtures and hooks —

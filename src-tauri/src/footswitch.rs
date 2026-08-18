@@ -421,7 +421,7 @@ pub fn engaged_bypass_for_switch(
     out
 }
 
-/// The two device states a VERIFY-only row measures — what the preset sounds like with
+/// The two device states an ON/OFF delta measurement compares — what the preset sounds like with
 /// `switch` ENGAGED versus DISENGAGED, as the writes each state needs. Symmetric BY
 /// CONSTRUCTION: both force-lists start from the same sibling isolation
 /// ([`siblings_off_excluding`]), so the ONLY difference between the two captures is this

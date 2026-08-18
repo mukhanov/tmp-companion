@@ -14,7 +14,7 @@
 # SimDevice e2e_server + vite). ONLINE is fully managed: it pre-flights the device via a
 # handshake-verified server start, runs each heavy spec in its own invocation (the device is
 # exclusive-seize and the level spec is two ~3-min tests), and ALWAYS recovers the unit on
-# exit — reamp-off + guarded scratch-clear (400-404) + recall 001 — even on Ctrl-C or a
+# exit — reamp-off + guarded scratch-clear (400-409) + recall 001 — even on Ctrl-C or a
 # failed/killed run (a killed level run otherwise strands the unit re-amp-engaged / input-muted).
 #
 # Both modes first kill any stale e2e_server across this worktree's whole port stride (filtered
@@ -323,12 +323,15 @@ fi
 # guard below enforces that for `doctor`; this one writes and saves through the same paths).
 # It was absent from this set AND self-skipping on an env var the Playwright process never
 # sees, so it had never run in either tier despite existing to be the one-off HW validation.
-case " ${SPECS[*]:-} " in *" all "*|"  ") SPECS=(songs copy doctor doctor-apply.online level level-rerun level-strict) ;; esac
+case " ${SPECS[*]:-} " in *" all "*|"  ") SPECS=(songs copy doctor doctor-apply.online doctor-oracle.online level level-rerun level-strict) ;; esac
 
 # ORDERING GUARD (enforced, not just documented): doctor must run BEFORE any leveling
 # spec — every level* spec writes (the wizard always saves post-disclaimer), and
 # leveling equalizes the relative scene loudness the doctor's consistency check keys
-# on, so the reverse order silently weakens the doctor oracle.
+# on, so the reverse order silently weakens the doctor oracle. ONLY the bare `doctor`
+# spec is order-sensitive: the other doctor specs (doctor-apply.online, doctor-oracle.online)
+# work presets the level* specs never save to, and the run-start seed self-repairs, so
+# they need no guard and the matcher stays exact on purpose.
 seen_leveling=0
 for s in "${SPECS[@]:-}"; do
   case "$s" in level|level-*) seen_leveling=1 ;; esac

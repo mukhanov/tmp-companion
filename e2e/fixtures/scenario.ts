@@ -68,7 +68,7 @@ export async function listPresets(page: Page): Promise<Preset[]> {
   return (await invoke(page, "list_presets")) as Preset[];
 }
 
-/** Ensure every scenario preset exists at its slot (400-405). Offline: baked into the
+/** Ensure every scenario preset exists at its slot (400-409). Offline: baked into the
  *  fixture + snapshot, so a name check suffices (SimDevice state is disposable).
  *  ONLINE: always route through the ownership-verified seed — it verifies every
  *  occupied target by fixture CONTENT MARKER (not name; a user preset coincidentally
@@ -255,7 +255,7 @@ export async function isOnline(page: Page): Promise<boolean> {
 }
 
 /** End-of-scenario teardown. ONLINE the fixtures stay RESIDENT in the scratch slots
- *  (400-405): the run-start pristine-checking seed self-repairs anything a run leveled,
+ *  (400-409): the run-start pristine-checking seed self-repairs anything a run leveled,
  *  so clearing here only forces the next run to re-import everything (~2 min of device
  *  churn per run for nothing — adversarial-reviewed 2026-08-01). Set
  *  TMP_E2E_CLEAR_SCENARIO=1 (or run `probe --clear <slot> <name>` per slot) for the

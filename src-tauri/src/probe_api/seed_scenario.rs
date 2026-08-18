@@ -321,10 +321,13 @@ fn pristine_check(body: &[u8], fixture_json: &str) -> Result<(), PristineMiss> {
 // and never read the landed body back, which is why that loop stayed invisible.
 
 /// The lazy-commit window a `saveCurrentPreset` needs before a field-8 read answers
-/// with the committed bytes (HW: T+45–100 s, `danger.md`). A verify read fired inside
-/// it can still see PRE-commit content and pass on a body the firmware is about to
-/// replace, which is worse than not checking at all.
-const COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(100);
+/// with the committed bytes. A verify read fired inside it can still see PRE-commit
+/// content and pass on a body the firmware is about to replace, which is worse than not
+/// checking at all — so this MIRRORS `leveller::COMMIT_WINDOW_SECS` (the mirror roster
+/// lives on that declaration) rather than carrying a second literal that can drift
+/// below it.
+const COMMIT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(crate::leveller::COMMIT_WINDOW_SECS);
 
 /// Where the empty-body substitution is written up — quoted in the hard error so the
 /// next encounter starts at the HW bisect instead of repeating it. Section TITLE, not
