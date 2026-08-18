@@ -494,9 +494,6 @@ pub(crate) fn build_scene_jobs_with_handles(
                         knobs,
                         skip: None,
                         rebalanceable,
-                        // The amp-`outputLevel` default; the app command overrides
-                        // `target_mode` per wire job.
-                        target_mode: leveller::SceneTargetMode::Match,
                         handle: None,
                         // Filled by `leveller::prepass_scene_ceilings` when the caller runs
                         // the reordered (measure-everything-first) run.
@@ -518,7 +515,6 @@ fn skip_scene_job(scene: u32, target_lufs: f64, reason: String) -> leveller::Sce
         knobs: Vec::new(),
         skip: Some(reason),
         rebalanceable: false,
-        target_mode: leveller::SceneTargetMode::Match,
         handle: None,
         // A skip job is never measured, so it never carries a prepass reading.
         prepass: None,
@@ -582,7 +578,6 @@ fn handle_scene_job(
         // A user-chosen handle is one control, not a lane pair: joint-k's mix-preserving
         // rebalance has nothing to act on.
         rebalanceable: false,
-        target_mode: leveller::SceneTargetMode::Match,
         handle: Some(target),
         prepass: None,
     }
@@ -601,7 +596,7 @@ fn handle_scene_job(
 /// opens next gets a properly-spaced session boundary. A failed read returns `None` and every
 /// consumer degrades to its pre-read behaviour.
 pub(crate) fn read_saved_preset(list_index: u32) -> Option<serde_json::Value> {
-    let result = match crate::commands::level_footswitch::read_slot_preset_parsed(list_index) {
+    let result = match crate::read_slot_preset_parsed(list_index) {
         Ok((preset, _, _)) => Some(preset),
         Err(e) => {
             log::warn!("scene jobs slot {list_index}: field-8 saved-preset read failed ({e})");

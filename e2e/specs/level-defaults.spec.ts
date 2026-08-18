@@ -78,6 +78,18 @@ test.describe("Level — first-run defaults + physics outcomes (offline, sidecar
     await expect(page.getByText(/Clamped .* already maxed/)).toBeVisible();
     await expect(page.getByText(/1 clamped/)).toBeVisible();
     await expect(page.getByText(/clamped · [−-]20\.\d/)).toBeVisible();
+    // NEW COVERAGE (PR #144's ClampKind taxonomy): a plain headroom clamp on a Base row
+    // (no off-branch clamp_reason, no wet floor) reports `ClampKind::SceneCeiling` — the
+    // ONE ClampKind whose message is UI-observable offline through a real run: Base
+    // levels via `level_preset`'s direct return, not the per-scene/per-footswitch Channel
+    // the offline bridge no-ops (`.claude/rules/e2e.md`). Copied VERBATIM from
+    // `headroom_trade::ClampKind::message()` / `CLAMP_MESSAGES.scene_ceiling` — never
+    // re-word it here if the backend's wording changes; update this string instead.
+    await expect(
+      page.getByText(
+        "this sound cannot reach the target — its level control is already at the limit",
+      ),
+    ).toBeVisible();
 
     await expectReampBalanced(page, reampBase);
   });

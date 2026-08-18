@@ -288,9 +288,16 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                 // leveling at all. A read hiccup (or, offline, a preset-read the fake device
                 // doesn't model) must not fail the whole Base run — degrade to no isolation
                 // (pre-this-feature behavior) instead of propagating the error.
-                let force_bypass: Vec<(String, String, bool)> = match read_slot_preset_parsed(slot)
-                {
-                    Ok((preset, _, _)) => {
+                // SOFT check on `ftsw`: the isolation list is derived from it, but the
+                // pre-run `presetLevel` and `lastLoadedScene` come out of the SAME body
+                // and survive a cut that takes `ftsw` — refusing the whole read would
+                // throw away the revert anchor and the save's restore scene to protect a
+                // best-effort quality improvement.
+                let force_bypass: Vec<(String, String, bool)> = match read_slot_preset_sections(
+                    slot,
+                    &["ftsw"],
+                ) {
+                    Ok((preset, _, _, tail)) => {
                         // The same read carries the pre-run presetLevel — the revert anchor —
                         // and the original `lastLoadedScene`, which the save must re-stamp
                         // (the base-context measurement leaves base active; saving there
@@ -303,12 +310,25 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                             &preset,
                             opts.restore_scene,
                         );
-                        footswitch::all_onoff_blocks(
-                            preset.get("ftsw").unwrap_or(&serde_json::Value::Null),
-                        )
-                        .into_iter()
-                        .map(|(g, n)| (g, n, true))
-                        .collect()
+                        if !tail.truncated.is_empty() {
+                            // A PARTIAL `ftsw` yields a partial isolation list — some
+                            // footswitch blocks left on while base is measured, which
+                            // reads as a louder base and writes the wrong presetLevel.
+                            // No isolation is the honest degrade; partial is not.
+                            log::warn!(
+                                "level_preset slot={slot}: field-8 read cut before the ftsw \
+                                 section — leveling without base isolation rather than with \
+                                 a partial one"
+                            );
+                            Vec::new()
+                        } else {
+                            footswitch::all_onoff_blocks(
+                                preset.get("ftsw").unwrap_or(&serde_json::Value::Null),
+                            )
+                            .into_iter()
+                            .map(|(g, n)| (g, n, true))
+                            .collect()
+                        }
                     }
                     Err(e) => {
                         log::warn!(

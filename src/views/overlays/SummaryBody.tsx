@@ -21,14 +21,14 @@ import { Icon, type IconName } from "../../ui/Icon";
 import { Tag } from "../../ui/Tag";
 import { WizardFooter, WizTitle } from "./WizardShell";
 import { ByEarChip } from "./ByEarChip";
+import { TradeDisclosure } from "./TradeDisclosure";
 import { fmtLufs } from "../../lib/format";
 import { restorePresetLevel } from "../../lib/invoke";
+import { CLAMP_MESSAGES, type TradeSummary } from "../../lib/types";
 import {
   ceilingOf,
   offbranchStatus,
   presetLine,
-  targetOffsetSuffix,
-  verifyDeltaText,
   type RunItem,
 } from "../level/leveling";
 
@@ -189,13 +189,7 @@ function ResultRow({ it, restore }: ResultRowProps) {
   } else if (it.outcome === "done") {
     icon = <Icon name="check" size={14} stroke={t.good} strokeWidth={2} />;
     statusColor = t.good;
-    status = `${fmtLufs(it.value)} LUFS${targetOffsetSuffix(it.targetOffsetLu)}`;
-  } else if (it.outcome === "verified") {
-    // Nothing was written, only measured — never the "done" checkmark/color, which
-    // would claim a write that never happened.
-    icon = <Icon name="info" size={13} stroke={t.ink2} strokeWidth={1.7} />;
-    statusColor = t.ink2;
-    status = verifyDeltaText(it.verifyDeltaLu);
+    status = `${fmtLufs(it.value)} LUFS`;
   } else if (it.outcome === "skipped") {
     icon = <Icon name="x" size={12} stroke={t.mutedInk} strokeWidth={2} />;
     statusColor = t.mutedInk;
@@ -294,6 +288,24 @@ function ResultRow({ it, restore }: ResultRowProps) {
         >
           {presetLine(it)}
         </span>
+        {/* CLAMP_MESSAGES is the UI's own copy for the backend's ClampKind taxonomy —
+            see its doc for why this isn't the backend's own wording. Always visible
+            (click-only app; a hover title wouldn't satisfy it), and shown regardless
+            of whether a trade also ran (D4/D5: a trade never hides a row's own
+            honest clamp). */}
+        {it.outcome === "clamped" && it.clampKind && (
+          <span
+            style={{
+              fontFamily: t.sans,
+              fontSize: 10.5,
+              lineHeight: 1.4,
+              color: t.sevWarn,
+              textWrap: "pretty",
+            }}
+          >
+            {CLAMP_MESSAGES[it.clampKind]}
+          </span>
+        )}
       </span>
       <span
         style={{
@@ -432,11 +444,14 @@ export function SummaryBody({
   });
   const clampedCeiling =
     clampedCeilings.length > 0 ? Math.min(...clampedCeilings) : null;
+  // Headroom trades (D4/D5) — EVERY row of a traded batch carries the SAME
+  // `TradeSummary` (`LevelResult.trade`), so de-dupe to one disclosure per slot.
+  const tradesBySlot = new Map<number, TradeSummary>();
+  items.forEach((it) => {
+    if (it.trade && !tradesBySlot.has(it.slot))
+      tradesBySlot.set(it.slot, it.trade);
+  });
   const leveled = items.filter((it) => it.outcome === "done");
-  // VERIFY footswitch rows — measured, nothing written. Never counted as "leveled"
-  // (that would claim a write that never happened), but also not a bad outcome —
-  // excluded from `allGood`'s bad-class check the same way `leveled` is.
-  const verified = items.filter((it) => it.outcome === "verified");
   const skipped = items.filter((it) => it.outcome === "skipped");
   const notrun = items.filter((it) => it.outcome == null); // only on a stopped run
   const total = items.length;
@@ -463,23 +478,9 @@ export function SummaryBody({
   if (items.some((it) => byEarOf(it) === "rebalance"))
     byEarReasons.push("parallel amps balanced by approximate isolation");
 
-  // Title honesty: a run with verify-only rows mixed in can't say "leveled" for the
-  // whole batch (those rows were only measured, nothing written), and a run that
-  // FULLY succeeded but included verify rows must not read as partial either — the
-  // old `"3 of 3 sounds checked"` for an all-clean, all-verified run reads exactly
-  // like a failure count (BUG→GATE). One `{leveled, verified, bad}` tally drives the
-  // whole title now: `bad` is everything that's neither leveled nor verified
-  // (offbranch/clamped/unconverged/skipped/not-run) — the SAME classes `allGood`
-  // already gates on, so `bad === 0` is just `allGood` restated as a count.
-  const bad = total - leveled.length - verified.length;
-  const title =
-    bad === 0 && allGood
-      ? verified.length > 0
-        ? `All ${String(total)} sound${total === 1 ? "" : "s"} checked (${String(verified.length)} measured only)`
-        : `All ${String(total)} sound${total === 1 ? "" : "s"} leveled`
-      : verified.length > 0
-        ? `${String(leveled.length)} of ${String(total)} leveled, ${String(verified.length)} measured`
-        : `${String(leveled.length)} of ${String(total)} leveled`;
+  const title = allGood
+    ? `All ${String(total)} sound${total === 1 ? "" : "s"} leveled`
+    : `${String(leveled.length)} of ${String(total)} leveled`;
 
   // Action-first sub-tally — only the classes that need a next step.
   const bits: string[] = [];
@@ -495,7 +496,6 @@ export function SummaryBody({
     { label: "Clamped", color: t.sevWarn, rows: clamped },
     { label: "Off target", color: t.sevWarn, rows: unconverged },
     { label: "Leveled", color: t.good, rows: leveled },
-    { label: "Verified", color: t.ink2, rows: verified },
     { label: "Skipped", color: t.faint, rows: skipped },
     { label: "Not leveled", color: t.faint, rows: notrun },
   ];
@@ -656,6 +656,30 @@ export function SummaryBody({
               )}
             </Banner>
           )}
+        </div>
+      )}
+
+      {/* headroom-trade disclosure (D4/D5) — one compact block per traded preset,
+          never hidden behind the clamp banner above (a traded row still shows its
+          own clamp message in the list below when applicable). */}
+      {tradesBySlot.size > 0 && (
+        <div
+          style={{
+            flexShrink: 0,
+            padding: `${String(t.space4)}px ${String(t.space9)}px 0`,
+            display: "flex",
+            flexDirection: "column",
+            gap: t.space4,
+          }}
+        >
+          {[...tradesBySlot].map(([slot, trade]) => (
+            <TradeDisclosure
+              key={slot}
+              trade={trade}
+              slot={slot}
+              items={items}
+            />
+          ))}
         </div>
       )}
 

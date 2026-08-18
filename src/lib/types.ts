@@ -164,12 +164,91 @@ export interface LevelResult {
    * does NOT hold the value this result reports (do not trust the number);
    * false = re-read and confirmed; null = not checked. */
   persist_mismatch: boolean | null;
-  /** Scene rows in `SceneTargetMode.Offset` ONLY: how far this scene's effective target
-   * was shifted from the requested one to preserve its authored loudness relationship
-   * (LU) — `target_lufs` above is already the shifted value; this says by how much (the
-   * frontend can't derive it, since its own requested number was shifted again by the
-   * playback offset before the run). Null everywhere else (incl. `Match` mode). */
-  target_offset_lu: number | null;
+  /** The clamp's CAUSE from the shared taxonomy (mirrors `headroom_trade::ClampKind`) —
+   * null when the row is not clamped. Additive alongside `clamp_reason`, whose contract
+   * ("the leveled signal isn't reaching USB 1/2") is unchanged: this is the
+   * machine-readable cause. Render its `CLAMP_MESSAGES[kind]` verbatim — never re-word it. */
+  clamp_kind: ClampKind | null;
+  /** THE HEADROOM TRADE this run made (or, on a preview, WOULD make) — see `TradeSummary`.
+   * Stamped on EVERY row of a batch that traded (the trade moved the whole preset's gain
+   * structure, not one row's). Null on every untraded run and on every lane that has no
+   * trade (base, block, footswitch). */
+  trade: TradeSummary | null;
+}
+
+/** WHICH sound a trade row / clamp error describes (mirrors `headroom_trade::SoundId`,
+ * camelCase tagged union — `kind` discriminates). Additive on the wire: mirror only the
+ * variants below and treat the union as OPEN for future additive kinds. No `"base"` arm:
+ * `TradeSummary.benefiting` is scene-only by construction (the trade never benefits base
+ * — see its doc), so the wire never carries one. */
+export interface SoundId {
+  kind: "scene";
+  sceneSlot: number;
+}
+
+/** Why a sound could not be put on its target (mirrors `headroom_trade::ClampKind`,
+ * snake_case tokens). Distinct per cause so the UI can tell them apart without
+ * pattern-matching free text. */
+export type ClampKind =
+  | "scene_ceiling"
+  | "wet_floor"
+  | "trade_floor"
+  | "partial_trade"
+  | "no_authority";
+
+/** One user-facing sentence per `ClampKind` — the UI's OWN copy for the backend's clamp
+ * taxonomy (keyed by `ClampKind`, mirrors `headroom_trade::ClampKind`). This is a SEPARATE
+ * wording from `ClampKind::message()`, whose only caller builds an internal Rust error
+ * string; nothing cross-checks the two, so a taxonomy change on the backend does not fail
+ * loudly here — update this table by hand alongside it. */
+export const CLAMP_MESSAGES: Record<ClampKind, string> = {
+  scene_ceiling:
+    "this sound cannot reach the target — its level control is already at the limit",
+  wet_floor:
+    "this sound cannot reach the target without dropping the mix below the level that preserves the effect",
+  trade_floor:
+    "the base amp level ran out of room holding the base sound on target while headroom was traded for this one",
+  partial_trade:
+    "the traded headroom was backed out because a dependent write did not land — nothing was saved",
+  no_authority:
+    "the level control has no effect on the USB 1/2 output for this sound",
+};
+
+/** Why a headroom-trade raise was trimmed below what the worst benefiting deficit wanted
+ * (mirrors `headroom_trade::TradeCap`, snake_case). */
+export type TradeCap = "preset_level_max" | "base_fader_floor";
+
+/** ONE base amp a headroom trade moved (or WOULD move) — mirrors `headroom_trade::
+ * TradeAmpMove`. SNAKE_CASE: leveling-lane RESULT payloads stay snake_case even though
+ * command ARGS are camelCase (see the layer note on `TradeSummary`). */
+export interface TradeAmpMove {
+  group_id: string;
+  node_id: string;
+  parameter_id: string;
+  /** The `outputLevel` the preset carried BEFORE the trade — the Restore anchor. */
+  previous_value: number;
+  /** The SOLVED value the hold landed on. Null on an advisory: the fader response isn't
+   * algebraically predictable, so a run that didn't actually solve it invents nothing. */
+  value: number | null;
+}
+
+/** THE HEADROOM TRADE, on the wire (mirrors `headroom_trade::TradeSummary`, snake_case —
+ * leveling-lane RESULTS stay snake_case; only command ARGS are camelCase). `applied: false`
+ * = ADVISORY — a no-save run planned the trade but did not execute it, so every clamped
+ * benefiting row keeps its honest clamp; disclose it as "would trade…". */
+export interface TradeSummary {
+  applied: boolean;
+  /** dB added to the base `presetLevel`. */
+  raise_db: number;
+  previous_preset_level: number;
+  /** The raised `presetLevel` — exact either way, so an advisory can state it without
+   * measuring. */
+  preset_level: number;
+  base_amps: TradeAmpMove[];
+  /** Why the raise was trimmed below what the worst benefiting clamp wanted, if it was. */
+  cap: TradeCap | null;
+  /** The sounds the raise was bought for, by identity. */
+  benefiting: SoundId[];
 }
 
 /** Result of leveling one block-acting footswitch's engaged state
@@ -210,11 +289,9 @@ export interface FootswitchLevelResult {
    * false = re-read and confirmed; null = not checked (no save, nothing written, the
    * re-read failed, or a VERIFY row, which never writes). */
   persist_mismatch: boolean | null;
-  /** VERIFY rows ONLY: engaged loudness MINUS disengaged loudness (LU) — how much this
-   * switch changes the sound, measured with nothing written. Null on every LEVEL row,
-   * which is also the discriminator: a verify row always carries a delta, never a write
-   * (`saved: false`, `final_value` unchanged). Positive = engaging makes it louder. */
-  on_off_delta_lu: number | null;
+  /** The clamp's CAUSE from the shared taxonomy — see `LevelResult.clamp_kind`. Additive
+   * alongside `clamp_reason`/`wet_floor`, which keep their documented contracts verbatim. */
+  clamp_kind: ClampKind | null;
 }
 
 /** Result of leveling a whole setlist to one common target
@@ -258,7 +335,25 @@ export interface SceneHandleRow {
   /** 0-based `scenes[]` wire index — FS scenes only (base handles are the preset lane's
    * own picker, `list_level_blocks`). */
   sceneSlot: number;
+  /** The safe-preselect list: level-safe candidates only, never `"other"`. */
   candidates: SceneHandleCandidate[];
+  /** EVERY numeric control of every block in this scene, class-annotated and level-class
+   * first — the combined block+param picker's source (a superset of `candidates`). */
+  allCandidates: SceneHandleCandidate[];
+}
+
+/** One switch's SCENE-CONTEXT answer for the leveling picker (D3) — mirrors
+ * `footswitch::FsSceneContext`, camelCase wire form. PICKER-PRESELECT ONLY: both fields
+ * are derived from a cache the real device ignores on recall, so neither may ever decide
+ * what a run WRITES — they only drive the wizard's default pick. */
+export interface FsSceneContext {
+  switch: number;
+  /** The 0-based `scenes[]` wire slots whose overlay ENABLES this switch, in scene order. */
+  enablingScenes: number[];
+  /** What to preselect: a scene slot iff EXACTLY ONE scene enables the switch, else null
+   * (base). The user may still override to any scene, including a non-enabling one — the
+   * picker flags that choice rather than blocking it. */
+  suggested: number | null;
 }
 
 /** A level-type block control discoverable from a preset

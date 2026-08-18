@@ -2,6 +2,46 @@
 use super::*;
 use crate::doctor;
 
+/// BUG→GATE (the silent-wrong-diagnosis class): a large preset's field-8 read is cut
+/// before its `ftsw` section, so the isolation fallback has no footswitch assignments.
+/// A FOOTSWITCH sound is DEFINED by those assignments — with none, the capture engages
+/// nothing and diagnoses the base sound under the switch's name. That sound must be
+/// reported as skipped, not measured. A BASE sound keeps the documented best-effort
+/// degrade: its isolation only silences other switches, so a missing one shifts the
+/// baseline without misnaming the sound.
+///
+/// Drives `resolve_sound_isolation` through its empty-graph branch with the cache
+/// pre-seeded, so no device read happens.
+#[test]
+fn an_unreadable_ftsw_skips_a_footswitch_sound_but_not_a_base_sound() {
+    let unreadable = |footswitch: Option<u32>| {
+        let mut cache = std::collections::HashMap::new();
+        // What the fallback read leaves behind when the body could not be read or its
+        // `ftsw` tail never arrived.
+        cache.insert(7u32, serde_json::Value::Null);
+        resolve_sound_isolation(&[], &[], None, footswitch, 7, &mut cache)
+    };
+    let fs = unreadable(Some(2));
+    let msg = fs.unresolved.expect("a footswitch sound must be skipped");
+    assert!(msg.contains("footswitch 3"), "1-based switch label: {msg}");
+    assert!(msg.contains("too large to read over USB"), "{msg}");
+
+    assert!(
+        unreadable(None).unresolved.is_none(),
+        "a base sound still degrades to no isolation rather than erroring"
+    );
+
+    // A readable `ftsw` resolves normally — the guard must not misfire on a preset whose
+    // switches are simply all empty (a legitimate saved state).
+    let mut cache = std::collections::HashMap::new();
+    cache.insert(7u32, serde_json::json!({ "ftsw": [[], [], []] }));
+    assert!(
+        resolve_sound_isolation(&[], &[], None, Some(2), 7, &mut cache)
+            .unresolved
+            .is_none()
+    );
+}
+
 /// The exact camelCase JSON the Doctor apply frontend sends deserializes into
 /// [`DoctorApplyJob`] — a `param` op and an `insert_node` op (the DoctorOp tag
 /// values + field renames pinned by doctor.rs's `doctor_op_serializes_camel_case`).

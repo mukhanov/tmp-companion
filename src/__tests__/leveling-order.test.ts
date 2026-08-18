@@ -108,11 +108,12 @@ describe("chosenFrom run-order", () => {
     });
   });
 
-  it("emits footswitches AFTER scenes, defaulting to a VERIFY row (no handle)", () => {
+  it("emits footswitches AFTER scenes, defaulting to its tone-safe candidate (D2)", () => {
     // Alpha (slot 0): 2 scenes + 1 footswitch (switch index 4 → tag FS5). Order must be
-    // Base → scenes → footswitch. P2: a footswitch row starts VERIFY-only — it is only
-    // ever WRITTEN once the user has explicitly given it a handle in Set up (the old
-    // silent auto-pick-and-write default is gone).
+    // Base → scenes → footswitch. Every row levels now (D2 — the backend removed the
+    // verify-only footswitch mode entirely): the default target is the switch's
+    // (only, here) candidate, measured against the preset's BASE sound (D3's
+    // `sceneContext: null`) until the Set up step's picker resolves a `suggested` scene.
     const fswInfo = new Map<number, FootswitchInfo[]>([[0, [fsw(4, "Solo")]]]);
     const sel = new Set([
       fswKey(0, 0),
@@ -131,12 +132,12 @@ describe("chosenFrom run-order", () => {
       isBase: false,
       sceneName: "Solo",
       tag: "FS5", // switch index 4 → human FS number 5
-      // A "verify" target is a discriminated-union member with NO lev* keys at all
-      // (item 5) — asserting them as `null` would fail `toMatchObject` now that
-      // they're structurally absent, not present-but-null.
       footswitch: {
         switchIndex: 4,
-        mode: "verify",
+        levGroupId: "G1",
+        levNodeId: "N4",
+        levParameterId: "gain",
+        sceneContext: null,
       },
     });
   });
@@ -281,37 +282,39 @@ describe("chosenFrom run-order", () => {
     expect(params[defaultParamIndex(params)].parameter_id).toBe("loudness");
   });
 
-  it("chosenFrom defaults a footswitch to VERIFY but carries the full candidate list", () => {
+  it("chosenFrom defaults a footswitch to its tone-safe candidate + a base scene context", () => {
     const fswInfo = new Map<number, FootswitchInfo[]>([
       [0, [fswMulti(4, "Solo")]],
     ]);
     const out = chosenFrom(new Set([fswKey(0, 0)]), rows, sceneInfo, fswInfo);
     expect(out).toHaveLength(1);
-    // No handle until the user explicitly opts in (Set up's "Make level-neutral") —
-    // the discriminated union (item 5) means a "verify" target structurally CANNOT
-    // carry `levParameterId` at all, so `mode` alone is now the whole assertion.
-    expect(out[0].footswitch?.mode).toBe("verify");
-    // The full candidate list survives for the Set up picker to offer — its own
-    // tone-safe default is still the LOUDNESS param (level), not alphabetical-first
-    // (gain), once the user opts in.
+    // Every row levels now (D2 — the backend removed the verify-only footswitch mode
+    // entirely) — the default target is the tone-safe candidate (LEVEL, not
+    // alphabetical-first GAIN), measured against the preset's BASE sound (D3's
+    // `sceneContext: null`) until the Set up step's picker resolves a `suggested` scene.
+    expect(out[0].footswitch).toEqual({
+      switchIndex: 4,
+      levGroupId: "G1",
+      levNodeId: "N4",
+      levParameterId: "level",
+      sceneContext: null,
+    });
+    // The full candidate list survives for the Set up picker to offer.
     expect(out[0].levelParams?.map((c) => c.parameter_id)).toEqual([
       "gain",
       "level",
       "tone",
     ]);
-    const levelParams = out[0].levelParams ?? [];
-    const idx = defaultParamIndex(levelParams);
-    expect(idx >= 0 ? levelParams[idx].parameter_id : null).toBe("level");
   });
 
-  it("targetFromCandidate builds coords from any chosen candidate (user override to gain)", () => {
+  it("targetFromCandidate builds coords + scene context from any chosen candidate (user override to gain)", () => {
     const gain = fswMulti(4, "Solo").level_params[0];
-    expect(targetFromCandidate(4, gain)).toEqual({
+    expect(targetFromCandidate(4, 2, gain)).toEqual({
       switchIndex: 4,
       levGroupId: "G1",
       levNodeId: "N4",
       levParameterId: "gain",
-      mode: "level",
+      sceneContext: 2,
     });
   });
 
@@ -367,7 +370,7 @@ describe("ceilingOf", () => {
         levGroupId: "G1",
         levNodeId: "N0",
         levParameterId: "loudness",
-        mode: "level",
+        sceneContext: null,
       },
       outcome: "clamped",
       value: -6.0, // e.g. clamped because it's too LOUD

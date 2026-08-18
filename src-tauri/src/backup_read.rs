@@ -130,12 +130,47 @@ impl BackupReadResult {
     }
 }
 
-/// Decode a streamed device backup archive (GNU-tar + LZ4-frame) IN MEMORY and read
-/// every preset + scene count out of its `databaseBackup` (= `/data/normalDb.db3`)
-/// SQLite entry via the system `sqlite3`. The DB is written to a temp file (sqlite
-/// needs a path) that is DELETED on every exit; the archive itself is never written
-/// to disk — nothing persists (no stacking backups).
-pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
+/// The backup's SQLite DB on a temp path (sqlite needs a path, not bytes), DELETED on
+/// every exit — the archive itself is never written to disk, so nothing persists.
+struct TempDb(std::path::PathBuf);
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One `sqlite3 -json` query against an extracted backup DB. An empty result set is
+/// `[]`, not an error.
+fn run_sql(db: &TempDb, sql: &str) -> Result<serde_json::Value, String> {
+    let out = std::process::Command::new("sqlite3")
+        .arg("-json")
+        .arg(&db.0)
+        .arg(sql)
+        .output()
+        .map_err(|e| format!("sqlite3 spawn ({e}); is the CLI on PATH?"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(serde_json::Value::Array(vec![]));
+    }
+    serde_json::from_str(s).map_err(|e| format!("parse sqlite json: {e}"))
+}
+
+/// The archive's member list plus its two extracted entries.
+struct BackupEntries {
+    db: TempDb,
+    members: Vec<(String, u64)>,
+    db_len: usize,
+    settings_bytes: Option<Vec<u8>>,
+}
+
+/// The tar/LZ4 half of a backup read: blob → the user-preset DB on a temp path. Shared
+/// by the whole-library [`read_backup_archive`] and the single-slot
+/// [`preset_json_from_backup`], so both see the same archive shape and the same errors.
+fn extract_backup_entries(blob: &[u8]) -> Result<BackupEntries, String> {
     use std::io::Read;
 
     if blob.is_empty() {
@@ -208,38 +243,90 @@ pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
         )
     })?;
 
-    // Write the DB to a temp file (sqlite needs a path); delete it on every exit.
-    struct TempDb(std::path::PathBuf);
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
     let db_path = std::env::temp_dir().join(format!(
         "tmp-companion-backup-{}-{}.db3",
         std::process::id(),
         blob.len()
     ));
     std::fs::write(&db_path, &db_bytes).map_err(|e| format!("write temp db: {e}"))?;
-    let _guard = TempDb(db_path.clone());
+    Ok(BackupEntries {
+        db: TempDb(db_path),
+        members,
+        db_len: db_bytes.len(),
+        settings_bytes,
+    })
+}
 
-    let run_sql = |sql: &str| -> Result<serde_json::Value, String> {
-        let out = std::process::Command::new("sqlite3")
-            .arg("-json")
-            .arg(&db_path)
-            .arg(sql)
-            .output()
-            .map_err(|e| format!("sqlite3 spawn ({e}); is the CLI on PATH?"))?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        let s = String::from_utf8_lossy(&out.stdout);
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(serde_json::Value::Array(vec![]));
-        }
-        serde_json::from_str(s).map_err(|e| format!("parse sqlite json: {e}"))
-    };
+/// The COMPLETE saved `presetJson` for ONE user slot, off a device backup — the
+/// canonical full-preset source when a slot-addressed field-8 read comes back
+/// TAIL-TRUNCATED. That truncation is per-slot-DETERMINISTIC, so re-reading the same
+/// slot cannot lengthen it; the backup DB is the only transport that carries the whole
+/// document.
+///
+/// `device_slot` is the DB `slot` = list index + 1 (see [`BackupPresetRow::slot`]).
+/// NAME-GUARDED (danger.md's address-space rule): the caller states the name it expects
+/// at that slot and the row is refused on a mismatch, because a second connection sits
+/// between whatever read the name and this backup transfer — a preset body silently
+/// taken from the WRONG slot would drive writes and a save against the wrong preset.
+pub(crate) fn preset_json_from_backup(
+    blob: &[u8],
+    device_slot: i64,
+    expect_name: &str,
+) -> Result<serde_json::Value, String> {
+    let entries = extract_backup_entries(blob)?;
+    let rows = run_sql(
+        &entries.db,
+        &format!(
+            "SELECT slot, displayName, presetJson FROM UserPresets WHERE slot = {device_slot}"
+        ),
+    )?;
+    backup_row_preset_json(&rows, device_slot, expect_name)
+}
+
+/// [`preset_json_from_backup`]'s decision, split out so the name guard is testable with
+/// no archive in the loop: take the row for `device_slot` and refuse it unless it still
+/// names `expect_name`. Pure.
+fn backup_row_preset_json(
+    rows: &serde_json::Value,
+    device_slot: i64,
+    expect_name: &str,
+) -> Result<serde_json::Value, String> {
+    let row = rows
+        .as_array()
+        .and_then(|a| a.first())
+        .ok_or_else(|| format!("device slot {device_slot} has no row in the backup DB"))?;
+    let name = row
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if name != expect_name {
+        return Err(format!(
+            "backup row for device slot {device_slot} is named {name:?}, not the expected \
+             {expect_name:?} — refusing to read a preset body from a slot that moved"
+        ));
+    }
+    let js = row
+        .get("presetJson")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("backup row for device slot {device_slot} carries no presetJson"))?;
+    serde_json::from_str(js)
+        .map_err(|e| format!("backup presetJson for device slot {device_slot} did not parse: {e}"))
+}
+
+/// Decode a streamed device backup archive (GNU-tar + LZ4-frame) IN MEMORY and read
+/// every preset + scene count out of its `databaseBackup` (= `/data/normalDb.db3`)
+/// SQLite entry via the system `sqlite3`. The DB is written to a temp file (sqlite
+/// needs a path) that is DELETED on every exit; the archive itself is never written
+/// to disk — nothing persists (no stacking backups).
+pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
+    let entries = extract_backup_entries(blob)?;
+    let BackupEntries {
+        db,
+        members,
+        db_len,
+        settings_bytes,
+    } = entries;
+    let run_sql = |sql: &str| -> Result<serde_json::Value, String> { run_sql(&db, sql) };
 
     // Pull the full plaintext preset doc per row; scene names + footswitch tags are
     // parsed in Rust by the SAME decoder the live field-3 / field-8 path uses
@@ -411,7 +498,7 @@ pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
 
     Ok(BackupReadResult {
         members,
-        db_bytes: db_bytes.len(),
+        db_bytes: db_len,
         total_rows,
         scene_mode,
         presets,

@@ -1,6 +1,40 @@
 use super::*;
 use crate::session;
 
+/// The truncation fallback: a slot-addressed field-8 read of a LARGE preset is cut
+/// before its `ftsw`/`scenes` tail (per-slot-deterministic — a re-read cannot lengthen
+/// it), so the caller re-reads the COMPLETE body off a device backup. The read must be
+/// NAME-GUARDED in the same address space as the writes it feeds (danger.md): a second
+/// connection sits between whatever named the slot and this transfer, and a body taken
+/// from the wrong slot would drive footswitch writes and a save against another preset.
+#[test]
+fn backup_slot_read_returns_the_complete_body_and_refuses_a_slot_that_moved() {
+    // A body whose tail sections are exactly what a truncated field-8 read loses.
+    let preset_json = r#"{"audioGraph":{"template":"gtrSeries","guitarNodes":{"G1":[{"nodeId":"ACD_Comp","FenderId":"ACD_Comp","dspUnitParameters":{"bypass":false}}]}},"ftsw":[[{"func":"on-off","groupId":"G1","nodeId":"ACD_Comp"}],[]],"info":{"displayName":"Big Rig"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        preset_json.replace('\'', "''")
+    ));
+
+    // Device slot 401 = list index 400. The whole document comes back, `ftsw` included.
+    let doc = preset_json_from_backup(&archive, 401, "Big Rig").expect("complete body");
+    assert_eq!(
+        doc["ftsw"].as_array().map(Vec::len),
+        Some(2),
+        "the backup carries the ftsw section the field-8 partial cut off"
+    );
+    assert_eq!(doc["scenes"][0]["sceneName"], "Rhythm");
+
+    // The occupant changed since the slot was named → refuse, never substitute.
+    let err = preset_json_from_backup(&archive, 401, "Some Other Preset")
+        .expect_err("a renamed occupant must refuse");
+    assert!(err.contains("Big Rig") && err.contains("refusing"), "{err}");
+
+    // A slot with no row is a refusal too, not an empty preset.
+    assert!(preset_json_from_backup(&archive, 402, "Big Rig").is_err());
+}
+
 #[test]
 fn backup_preset_scenes_parse_names_and_fs_tags() {
     // The DB presetJson is the same plaintext shape as the live field-3 doc:

@@ -23,11 +23,6 @@ pub(crate) struct SceneLevelProgressItem {
     status: String,
     result: Option<leveller::LevelResult>,
     message: Option<String>,
-    /// THE HEADROOM TRADE, disclosed as it happens. Set on the `"trade"` status item emitted
-    /// between the ceiling prepass and the writes, and on a cancelled-after-trade item as
-    /// well; `None` on every ordinary row. Additive: a consumer that doesn't know the status
-    /// ignores the item, and the same summary is also stamped on every returned result row.
-    trade: Option<crate::headroom_trade::TradeSummary>,
 }
 
 /// One scene-leveling request from the wizard: a wire scene slot + its OWN loudness
@@ -38,10 +33,6 @@ pub(crate) struct SceneLevelProgressItem {
 pub(crate) struct SceneLevelJobArg {
     scene_slot: u32,
     target_lufs: f64,
-    /// How to read `target_lufs` — see [`leveller::SceneTargetMode`]. Defaulted to `match`
-    /// (today's behavior) so an existing payload with no `targetMode` key is unchanged.
-    #[serde(default)]
-    target_mode: leveller::SceneTargetMode,
     /// The user's OWN control for this scene. Absent = the amp-`outputLevel` path (joint-k,
     /// rebalance, every existing caller).
     #[serde(default)]
@@ -384,8 +375,7 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
             }
             // Error on ANY slot mismatch between the built jobs and the wire jobs — a silent
             // default (especially NaN, which `.min(k_cap)` would collapse to the cap and slam
-            // the amp) must never reach a solve. This is also where each row's target MODE is
-            // stamped: one reconciliation pass over the wire jobs, not two.
+            // the amp) must never reach a solve.
             for sj in scene_jobs.iter_mut() {
                 let arg = jobs
                     .iter()
@@ -400,7 +390,6 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     ));
                 }
                 sj.target_lufs = arg.target_lufs + offset;
-                sj.target_mode = arg.target_mode;
             }
             if let Some(j) = jobs
                 .iter()
@@ -434,15 +423,6 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                 save_run,
                 cancelled,
             );
-            if let Some(summary) = trade.summary.clone() {
-                let _ = on_result.send(SceneLevelProgressItem {
-                    scene_slot: session::BASE_SCENE_SLOT,
-                    status: "trade".to_string(),
-                    result: None,
-                    message: None,
-                    trade: Some(summary),
-                });
-            }
             let on_scene = |scene, done: Option<&leveller::BatchedSceneOutcome>| {
                 let _ = on_result.send(scene_progress_item(slot, save_run, scene, done));
             };
@@ -502,7 +482,6 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                         status: "cancelled".to_string(),
                         result: None,
                         message: Some(leveller::CANCELLED.to_string()),
-                        trade: summary.clone(),
                     });
                 }
                 Ok(outcomes
@@ -523,7 +502,6 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                     status: "cancelled".to_string(),
                     result: None,
                     message: Some(e),
-                    trade: None,
                 });
                 Ok(Vec::new())
             }
@@ -994,7 +972,6 @@ fn scene_progress_item(
             status: "active".to_string(),
             result: None,
             message: None,
-            trade: None,
         },
         Some(o) => match &o.failure {
             None => SceneLevelProgressItem {
@@ -1002,14 +979,12 @@ fn scene_progress_item(
                 status: "done".to_string(),
                 result: Some(outcome_to_level_result(slot, save, o)),
                 message: None,
-                trade: None,
             },
             Some(e) => SceneLevelProgressItem {
                 scene_slot: scene,
                 status: "error".to_string(),
                 result: None,
                 message: Some(e.clone()),
-                trade: None,
             },
         },
     }
@@ -1060,9 +1035,6 @@ fn outcome_to_level_result(
         // path in `level_preset` estimates it).
         true_peak_dbtp: None,
         persist_mismatch: o.persist_mismatch,
-        // `target_lufs` above is already the EFFECTIVE (offset-shifted) target; this is the
-        // shift itself, which the frontend can't derive from what it sent.
-        target_offset_lu: o.target_offset_lu,
         // Stamped by the caller when the batch traded — the trade is a BATCH fact, not a
         // per-outcome one, so the outcome cannot carry it.
         trade: None,
@@ -1143,7 +1115,10 @@ pub(crate) async fn list_scene_level_handles(
     slot: u32,
 ) -> Result<Vec<SceneHandleRow>, String> {
     with_released_seize(state.session.clone(), move || {
-        let (preset, _, _) = read_slot_preset_parsed(slot)?;
+        // The row set is `scenes.len()` — the tail section a large preset's field-8 read
+        // cuts first — so a truncated body would silently offer the player a handle
+        // picker missing its last scenes.
+        let (preset, _, _) = read_slot_preset_complete(slot, &["scenes"])?;
         Ok(scene_handle_rows(&preset))
     })
     .await
@@ -1436,7 +1411,6 @@ pub(crate) async fn redistribute_headroom<R: tauri::Runtime>(
                     status: "cancelled".to_string(),
                     result: None,
                     message: Some(e.clone()),
-                    trade: None,
                 });
                 Err(e)
             }
@@ -1663,7 +1637,6 @@ mod trade_planner_tests {
             knobs,
             skip: None,
             rebalanceable: false,
-            target_mode: leveller::SceneTargetMode::Match,
             handle: None,
             prepass: Some(leveller::ScenePrepass { asis, spread: 1.0 }),
         }

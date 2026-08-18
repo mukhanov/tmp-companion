@@ -78,7 +78,7 @@ fn offline_copy_journey_through_real_backend() {
         ),
     );
     // Pre-fill the startup snapshot so connect/list serve it with no monitor thread —
-    // the 6 scenario presets at slots 400-405 (matching the backup fixture).
+    // the 10 scenario presets at slots 400-409 (matching the backup fixture).
     let presets = vec![
         crate::session::PresetEntry {
             slot: 400,
@@ -1940,99 +1940,6 @@ fn fresh_load_barrier_time_gate_proceeds_on_an_unharvestable_witness() {
     );
 }
 
-/// D2 gate: `SceneTargetMode::Offset` must PRESERVE each scene's authored loudness
-/// relationship rather than flatten every scene onto one number — and the outcome must
-/// report the EFFECTIVE target it solved against, not the requested one (reporting the
-/// request would make every offset row read as missed by exactly the offset, and would
-/// decide `clamped` on the wrong number).
-///
-/// Slot 404's authored scene ceilings are -17 (scene 0) and -15 (scene 1)
-/// (`scenario-loudness.json`), so against scene 0 as the batch reference scene 1 sits +2 LU
-/// louder: a run at -23 must aim -23 for the reference and -21 for scene 1. (Scene 2 is
-/// deliberately out of this batch — it does not converge offline in MATCH mode either, a
-/// pre-existing sim/fixture quirk this gate must not inherit.)
-#[test]
-fn scene_offset_mode_preserves_each_scenes_distance_and_reports_the_effective_target() {
-    let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-    ]);
-    let sim = crate::sim_device::SimDevice::new();
-    crate::sim_device::set_live(&sim);
-    let sf = sim.clone();
-    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
-    let stim = test_stim();
-
-    let scene_slots = vec![0u32, 1];
-    let candidates =
-        crate::probe_api::level::load_and_filter_amp_candidates(404).expect("404 amp candidates");
-    let (docs, _restore) =
-        crate::probe_api::scene_jobs::prepass_scene_docs(404, &scene_slots).expect("prepass");
-    let saved = crate::read_saved_preset(404);
-    let mut jobs = crate::build_scene_jobs(&scene_slots, &candidates, &docs, -23.0, saved.as_ref())
-        .expect("scene jobs");
-    for j in jobs.iter_mut() {
-        j.target_mode = crate::leveller::SceneTargetMode::Offset;
-    }
-    let outcomes = crate::leveller::level_scenes_oneshot(
-        404,
-        &jobs,
-        &stim,
-        false,
-        None,
-        saved.as_ref(),
-        // No headroom trade in this fixture run.
-        None,
-        |_, _| {},
-        || false,
-    )
-    .expect("offset run");
-
-    let at = |slot: u32| {
-        outcomes
-            .iter()
-            .find(|o| o.scene_slot == slot)
-            .unwrap_or_else(|| panic!("scene {slot} outcome"))
-    };
-    for (slot, want_target, want_offset) in [
-        // The REFERENCE row: its own offset is 0 by definition, so it lands on the plain
-        // target — an offset batch's first sound levels exactly like a match batch's.
-        (0u32, -23.0, 0.0),
-        (1, -21.0, 2.0),
-    ] {
-        let o = at(slot);
-        assert!(
-            o.failure.is_none(),
-            "scene {slot} must solve: {:?}",
-            o.failure
-        );
-        assert!(
-            (o.target_lufs - want_target).abs() < 0.3,
-            "scene {slot} must be solved against {want_target} (its authored distance from the \
-             reference), got {:.2}",
-            o.target_lufs
-        );
-        let applied = o.target_offset_lu.expect("an offset row reports its shift");
-        assert!(
-            (applied - want_offset).abs() < 0.3,
-            "scene {slot} applied offset should be {want_offset:+.1} LU, got {applied:+.2}"
-        );
-        // And it actually GOT there — the offset feeds the solve, it is not just a label.
-        let achieved = o.final_lufs.expect("a solved scene reports its loudness");
-        assert!(
-            (achieved - want_target).abs() < 0.5,
-            "scene {slot} achieved {achieved:.2}, wanted {want_target} — {o:?}"
-        );
-    }
-}
-
 /// D3 gate: a scene row given the USER'S OWN handle is solved by the generic param secant
 /// (`solve_param_secant`) instead of the amp joint-k, and still lands on target through the
 /// Scene-Edit-aware write path. The handle here is the Hiwatt's `outputLevel` in scene 0 —
@@ -2086,7 +1993,6 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         }],
         skip: None,
         rebalanceable: false,
-        target_mode: crate::leveller::SceneTargetMode::Match,
         handle: Some(handle),
         // Legacy order: the solve takes its own as-is capture (no reordered prepass here).
         prepass: None,

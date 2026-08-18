@@ -66,6 +66,7 @@ mod search;
 mod session;
 #[cfg(any(test, feature = "e2e"))]
 mod sim_device;
+mod slot_read;
 mod spectrum;
 // `pub` so the `gen_samples` bin (a separate crate) can reach the shared
 // catalog as `tmp_companion_lib::topologies`.
@@ -103,6 +104,9 @@ pub use saved_blocks::*;
 pub use session::PresetEntry;
 use session::Session;
 pub use session::{ActiveGraph, GraphNode, Stage};
+// The truncation-aware saved-preset read seam — re-exported at the crate root so the
+// ~20 probe_api call sites and the leveling commands keep addressing it as `crate::read_slot_preset_*`.
+pub(crate) use slot_read::*;
 
 #[macro_use]
 mod commands;
@@ -934,156 +938,224 @@ mod fixture_gates {
         let (name, _, p) = fixture(407);
         assert_eq!(name, "E2E Doctor Oracle");
 
-        // Base precondition: amp+cab live, every defect block bypassed.
-        assert_eq!(base_node_bypass(&p, "ACD_TwinReverb65NoFx"), Some(false));
+        // Base precondition: amp+cab live, defect blocks ENABLED-NEUTRAL via single-entry
+        // ftsw rows — a dual-entry row gets the whole import gutted at commit (see
+        // notes/gotchas.md's "A dual-entry footswitch row…" entry). Only comp1 (SPIKY's
+        // on-off target) stays bypassed in base.
+        assert_eq!(base_node_bypass(&p, "ACD_HiwattDR103CanMod"), Some(false));
         assert_eq!(base_node_bypass(&p, "cab1"), Some(false));
-        for node in ["eq10", "peq5", "hlp1", "plate1", "comp1"] {
+        for node in ["eq10", "peq5", "hlp1", "plate1"] {
             assert_eq!(
                 base_node_bypass(&p, node),
-                Some(true),
-                "{node}: every defect block must be bypassed in base (\"base must fire nothing\")"
+                Some(false),
+                "{node}: defect blocks ride enabled-neutral in base (single-entry rows)"
             );
         }
+        assert_eq!(base_node_bypass(&p, "comp1"), Some(true));
 
-        // The per-defect param constants table (label -> node -> [(param, valueA,
-        // valueB)]), P0-informed, tune-later per the module's own report. Each row
-        // is a MIXED-shape switch: one on-off entry (un-bypass) + its param entries,
-        // except SPIKY (on-off only — no verified CompressorSimpleSoftKnee controlId
-        // exists anywhere in this repo; inventing one risks the exact "wrong id
-        // silently no-ops" trap doctor.rs's own EQ10_BANDS comment warns about).
-        type DefectRow = (
-            u32,
-            &'static str,
-            &'static str,
-            &'static [(&'static str, f64, f64)],
+        // Neutrality: an enabled block must be transparent, or base fires verdicts.
+        let dp = |node: &str| -> serde_json::Value {
+            p["audioGraph"]["guitarNodes"]["G1"]
+                .as_array()
+                .expect("G1")
+                .iter()
+                .find(|n| n["nodeId"] == node)
+                .unwrap_or_else(|| panic!("{node} missing"))["dspUnitParameters"]
+                .clone()
+        };
+        let eq = dp("eq10");
+        for band in [
+            "gain62hz",
+            "gain125hz",
+            "gain250hz",
+            "gain500hz",
+            "gain1khz",
+            "gain2khz",
+            "gain4khz",
+            "gain8khz",
+        ] {
+            assert_eq!(eq[band].as_f64(), Some(0.0), "eq10.{band} neutral in base");
+        }
+        let peq = dp("peq5");
+        for (k, v) in [
+            ("filter2frequency", 420.0),
+            ("filter2q", 8.0),
+            ("filter2gaindb", 0.0),
+            ("filter3frequency", 2600.0),
+            ("filter3q", 14.0),
+            ("filter3gaindb", 0.0),
+        ] {
+            assert_eq!(peq[k].as_f64(), Some(v), "peq5.{k}");
+        }
+        // Every peq5 filter is either explicitly bypassed or pinned to an explicit
+        // NEUTRAL type-2 peaking shape: the firmware fills unauthored filters as
+        // ACTIVE type-4 filters at 1 kHz (q 0.707, gaindb 0), and a gaindb-based
+        // neutrality check cannot see them — HW-measured 2026-08-18, the default
+        // filter1/filter5 pair cost ~20 dB of level and read as muddy+dark on an
+        // otherwise clean chain. filter1 (BOOMY's 80 Hz bump) and filter4 (HARSH's
+        // 1.8 kHz bump) are deliberately ENABLED-neutral defect vehicles.
+        assert_eq!(
+            peq["filter5bypass"].as_bool(),
+            Some(true),
+            "peq5.filter5bypass (firmware-default active filter)"
         );
+        for k in [
+            "filter1bypass",
+            "filter2bypass",
+            "filter3bypass",
+            "filter4bypass",
+        ] {
+            assert_eq!(
+                peq[k].as_bool(),
+                Some(false),
+                "peq5.{k} (defect filters stay live)"
+            );
+        }
+        for (k, v) in [
+            ("filter1type", 2.0),
+            ("filter1frequency", 80.0),
+            ("filter1q", 1.0),
+            ("filter1gaindb", 0.0),
+            ("filter4type", 2.0),
+            ("filter4frequency", 1800.0),
+            ("filter4q", 2.5),
+            ("filter4gaindb", 0.0),
+        ] {
+            assert_eq!(peq[k].as_f64(), Some(v), "peq5.{k}");
+        }
+        let hlp = dp("hlp1");
+        assert_eq!(hlp["hpffc"].as_f64(), Some(20.0), "hlp1 HPF open in base");
+        assert_eq!(
+            hlp["lpffc"].as_f64(),
+            Some(20000.0),
+            "hlp1 LPF open in base"
+        );
+        // Steep orders are LOAD-BEARING for THIN/DARK: at the firmware-default
+        // order the hpffc/lpffc toggles read as broad tilt ("bright"/nothing)
+        // instead of a local band cliff ("thin"/"dark") — HW-tuned 2026-08-18.
+        assert_eq!(hlp["hpforder"].as_i64(), Some(3), "hlp1.hpforder");
+        assert_eq!(hlp["lpforder"].as_i64(), Some(3), "hlp1.lpforder");
+        let plate = dp("plate1");
+        assert_eq!(plate["wetdrymix"].as_f64(), Some(0.0), "plate dry in base");
+        assert_eq!(
+            plate["decay"].as_f64(),
+            Some(0.7),
+            "WASHED's decay is pre-baked in base (inaudible at mix 0) — the switch \
+             only moves wetdrymix, keeping the row single-entry"
+        );
+
+        // The per-defect param table (label -> node -> (param, valueA, valueB)),
+        // P0-informed, tune-later per the module's own report. ONE param entry per
+        // switch row (the dual-entry import discard above); the filter anchors the
+        // old multi-entry rows carried (RESONANT/BOXY frequency+Q) now live in the
+        // BASE peq5 params asserted above. SPIKY is on-off only — no verified
+        // CompressorSimpleSoftKnee controlId exists anywhere in this repo; inventing
+        // one risks the exact "wrong id silently no-ops" trap doctor.rs's own
+        // EQ10_BANDS comment warns about.
+        type DefectRow = (u32, &'static str, &'static str, &'static str, f64, f64);
         let table: &[DefectRow] = &[
-            (1, "CONTROL", "eq10", &[("gain1khz", 0.0, 0.0)]),
-            (2, "MUDDY", "eq10", &[("gain250hz", 12.0, 0.0)]),
-            (
-                3,
-                "BOOMY",
-                "eq10",
-                &[("gain62hz", 12.0, 0.0), ("gain125hz", 9.0, 0.0)],
-            ),
-            (
-                4,
-                "HARSH",
-                "eq10",
-                &[("gain1khz", 10.0, 0.0), ("gain2khz", 10.0, 0.0)],
-            ),
-            (5, "FIZZY", "eq10", &[("gain8khz", 12.0, 0.0)]),
-            (
-                6,
-                "LOST",
-                "eq10",
-                &[("gain500hz", -12.0, 0.0), ("gain1khz", -12.0, 0.0)],
-            ),
+            (1, "CONTROL", "eq10", "gain1khz", 0.0, 0.0),
+            (2, "MUDDY", "eq10", "gain250hz", 12.0, 0.0),
+            // BOOMY is seam-only: even a +18 dB peaking bump at 80 Hz reads as a
+            // broad low tilt (locals[lows] +1.7 vs the 2.5 gate) — the boomy rule
+            // as calibrated wants a narrow low bump with QUIET low-mids, which no
+            // single accepted param produced (HW 2026-08-18).
+            (3, "BOOMY", "peq5", "filter1gaindb", 18.0, 0.0),
+            // HARSH standalone is seam-only (locals[high-mids] saturates ~+1.4 at
+            // q 1.5–2.5); the harsh VERDICT is covered online by RESONANT's q14
+            // spike, which fires harsh+resonant together (HW 2026-08-18).
+            (4, "HARSH", "peq5", "filter4gaindb", 15.0, 0.0),
+            // FIZZY is seam-only on this chain: the V30 cab IR leaves nothing above
+            // ~10 kHz for any EQ boost to lift (HW 2026-08-18: +12 dB at 16 kHz moved
+            // the air band +0.2 dB), and an on-off row bypassing the cab poisons every
+            // OTHER sound's capture through the doctor's force-bypass isolation. The
+            // row validates the param-write seam; no fizzy verdict fires online.
+            (5, "FIZZY", "eq10", "gain16khz", 12.0, 0.0),
+            (6, "LOST", "eq10", "gain500hz", -12.0, 0.0),
+            // BRIGHT is seam-only: no single param tilts the whole spectrum past
+            // the 3 dB/oct bright gate through this cab, and the DR103's tone-stack
+            // knobs (treble/presence) are ACCEPTED by the FS param seam but change
+            // nothing in the captured audio (HW 2026-08-18) — kept as the amp-knob
+            // write-acceptance probe.
             (
                 7,
                 "BRIGHT",
-                "eq10",
-                &[
-                    ("gain2khz", 8.0, 0.0),
-                    ("gain4khz", 8.0, 0.0),
-                    ("gain8khz", 8.0, 0.0),
-                ],
+                "ACD_HiwattDR103CanMod",
+                "treble",
+                1.0,
+                0.4000000059604645,
             ),
-            (
-                8,
-                "CUTTHRU",
-                "eq10",
-                &[
-                    ("gain62hz", 10.0, 0.0),
-                    ("gain125hz", 10.0, 0.0),
-                    ("gain250hz", 6.0, 0.0),
-                ],
-            ),
-            (
-                9,
-                "RESONANT",
-                "peq5",
-                &[
-                    ("filter3frequency", 2600.0, 2600.0),
-                    ("filter3gaindb", 12.0, 0.0),
-                    ("filter3q", 14.0, 14.0),
-                    ("filter4frequency", 2600.0, 2600.0),
-                    ("filter4gaindb", 12.0, 0.0),
-                    ("filter4q", 14.0, 14.0),
-                ],
-            ),
-            (
-                10,
-                "BOXY",
-                "peq5",
-                &[
-                    ("filter2frequency", 420.0, 420.0),
-                    ("filter2gaindb", 12.0, 0.0),
-                    ("filter2q", 8.0, 8.0),
-                    ("filter3frequency", 420.0, 420.0),
-                    ("filter3gaindb", 12.0, 0.0),
-                    ("filter3q", 8.0, 8.0),
-                ],
-            ),
-            (11, "THIN", "hlp1", &[("hpffc", 800.0, 20.0)]),
-            (12, "DARK", "hlp1", &[("lpffc", 1100.0, 20000.0)]),
-            (
-                13,
-                "WASHED",
-                "plate1",
-                &[("wetdrymix", 0.65, 0.0), ("decay", 0.7, 0.3)],
-            ),
-            (14, "SPIKY", "comp1", &[]),
+            // CUTTHRU is the deliberate HEALTHY-change row (CONTROL's audible
+            // counterpart): a mid push that helps cut through, below every gate.
+            (8, "CUTTHRU", "eq10", "gain500hz", 6.0, 0.0),
+            // RESONANT's q14 +18 spike fires "harsh" AND "resonant" together.
+            (9, "RESONANT", "peq5", "filter3gaindb", 18.0, 0.0),
+            // +18, not +12: at +12 the boxy locals sat ON the gate (+2.9/+1.8
+            // across two otherwise-identical sweeps) — a coin-flip oracle row.
+            (10, "BOXY", "peq5", "filter2gaindb", 18.0, 0.0),
+            // THIN needs a LOCAL lows cliff, not a broad tilt: at hpffc 800 the cut
+            // reads as "bright" (tilt) and at 250 the tilt margin was 0.18 dB/oct —
+            // inside the 3σ repeatability band. 200 Hz + the base's 4th-order slope
+            // keeps locals[lows] deep while the tilt stays clear of the bright gate.
+            (11, "THIN", "hlp1", "hpffc", 200.0, 20.0),
+            (12, "DARK", "hlp1", "lpffc", 1100.0, 20000.0),
+            (13, "WASHED", "plate1", "wetdrymix", 0.65, 0.0),
         ];
 
         let ftsw = p["ftsw"].as_array().expect("ftsw");
-        for (idx, label, node, params) in table {
-            let entries = ftsw[*idx as usize].as_array().unwrap_or_else(|| {
-                panic!("ftsw[{idx}] ({label}): expected a mixed-shape entry array")
-            });
+        for (idx, label, node, pid, va, vb) in table {
+            let entries = ftsw[*idx as usize]
+                .as_array()
+                .unwrap_or_else(|| panic!("ftsw[{idx}] ({label}): expected an entry array"));
             assert_eq!(
-                entries.first().and_then(|e| e["func"].as_str()),
-                Some("on-off"),
-                "ftsw[{idx}] ({label}): first entry must be the on-off un-bypass"
+                entries.len(),
+                1,
+                "ftsw[{idx}] ({label}): exactly ONE entry per row — fw 1.8.45 discards \
+                 the whole import on a dual-entry row"
+            );
+            let e = &entries[0];
+            assert_eq!(e["func"], "param", "ftsw[{idx}] ({label})");
+            assert_eq!(e["nodeId"], *node, "ftsw[{idx}] ({label})");
+            assert_eq!(e["parameterId"], *pid, "ftsw[{idx}] ({label})");
+            assert_eq!(
+                e["valueA"].as_f64(),
+                Some(*va),
+                "ftsw[{idx}] ({label}) valueA"
             );
             assert_eq!(
-                entries[0]["nodes"][0]["nodeId"].as_str(),
-                Some(*node),
-                "ftsw[{idx}] ({label}): on-off must target {node}"
+                e["valueB"].as_f64(),
+                Some(*vb),
+                "ftsw[{idx}] ({label}) valueB"
             );
-            let param_entries = &entries[1..];
-            assert_eq!(
-                param_entries.len(),
-                params.len(),
-                "ftsw[{idx}] ({label}): param entry count must match the table"
+            assert!(
+                e["valueType"].is_number(),
+                "ftsw[{idx}] ({label}): param entry must carry a numeric valueType"
             );
-            for (i, (pid, va, vb)) in params.iter().enumerate() {
-                let e = &param_entries[i];
-                assert_eq!(e["func"], "param");
-                assert_eq!(e["nodeId"], *node);
-                assert_eq!(e["parameterId"], *pid);
-                assert_eq!(
-                    e["valueA"].as_f64(),
-                    Some(*va),
-                    "ftsw[{idx}] ({label}).{pid} valueA"
-                );
-                assert_eq!(
-                    e["valueB"].as_f64(),
-                    Some(*vb),
-                    "ftsw[{idx}] ({label}).{pid} valueB"
-                );
-            }
-            // A defect switch must actually CHANGE something. Anchor entries (a peaking
-            // filter's frequency/Q pinned equal on both sides) are legitimate, so the
-            // invariant is per ROW, not per entry: at least one param entry moves. CONTROL
-            // is the deliberate no-op discriminator; SPIKY is on-off-only (no entries).
-            if *label != "CONTROL" && !params.is_empty() {
+            // A defect switch must actually CHANGE something; CONTROL is the
+            // deliberate no-op discriminator.
+            if *label != "CONTROL" {
                 assert!(
-                    params.iter().any(|(_, va, vb)| va != vb),
-                    "ftsw[{idx}] ({label}): no param entry changes value — the defect \
-                     switch is a no-op"
+                    va != vb,
+                    "ftsw[{idx}] ({label}): the defect switch is a no-op"
                 );
             }
+        }
+
+        // SPIKY (14): the one on-off row — toggles comp1 into the chain.
+        let spiky = ftsw[14].as_array().expect("ftsw[14] (SPIKY)");
+        assert_eq!(spiky.len(), 1, "SPIKY: exactly one entry");
+        assert_eq!(spiky[0]["func"], "on-off");
+        assert_eq!(
+            spiky[0]["nodes"][0]["nodeId"].as_str(),
+            Some("comp1"),
+            "SPIKY targets comp1"
+        );
+
+        // Scene rows (15/16) stay single-entry scene funcs.
+        for idx in [15usize, 16] {
+            let row = ftsw[idx].as_array().expect("scene row");
+            assert_eq!(row.len(), 1, "ftsw[{idx}]: exactly one entry");
+            assert_eq!(row[0]["func"], "scene", "ftsw[{idx}]");
         }
     }
 
@@ -1418,6 +1490,61 @@ mod fixture_gates {
             !missing.is_empty(),
             "deleting valueType from a param entry must make the gate condition fail"
         );
+    }
+
+    /// NON-REGRESSION GATE (HW bisect 2026-08-18): every fixture ftsw ROW must carry at
+    /// most ONE entry — a dual-entry row makes fw 1.8.45 silently replace the whole
+    /// imported preset with an EMPTY body. See notes/gotchas.md's "A dual-entry footswitch
+    /// row makes the firmware silently replace the whole imported preset with an EMPTY
+    /// body" entry.
+    #[test]
+    fn every_fixture_footswitch_row_carries_at_most_one_entry() {
+        fn stacked_rows(p: &serde_json::Value) -> Vec<usize> {
+            p["ftsw"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .enumerate()
+                        .filter(|(_, r)| r.as_array().is_some_and(|a| a.len() > 1))
+                        .map(|(i, _)| i)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        let mut singles = 0usize;
+        for (idx, name, _, p) in fixtures() {
+            singles += p["ftsw"].as_array().map_or(0, |rows| {
+                rows.iter()
+                    .filter(|r| r.as_array().is_some_and(|a| a.len() == 1))
+                    .count()
+            });
+            let stacked = stacked_rows(&p);
+            assert!(
+                stacked.is_empty(),
+                "{name} ({idx}): ftsw rows {stacked:?} stack multiple entries — see \
+                 notes/gotchas.md's dual-entry footswitch discard entry"
+            );
+        }
+        assert!(
+            singles >= 10,
+            "expected the fixture set to carry populated single-entry rows ({singles} \
+             found) — a schema rename would otherwise make this gate pass vacuously"
+        );
+
+        // NEGATIVE CHECK: fork the oracle's MUDDY row with a second entry and
+        // confirm the same predicate flags exactly that row.
+        let (_, _, oracle) = fixture(407);
+        let mut forked = oracle.clone();
+        let extra = forked["ftsw"][2][0].clone();
+        assert!(
+            extra["func"] == "param",
+            "oracle ftsw[2] moved — update this fork's index"
+        );
+        forked["ftsw"][2]
+            .as_array_mut()
+            .expect("MUDDY row")
+            .push(extra);
+        assert_eq!(stacked_rows(&forked), vec![2]);
     }
 
     /// NON-REGRESSION GATE for the fixture-scene corruption class (real 1.8.45 unit,

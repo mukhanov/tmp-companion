@@ -1,7 +1,7 @@
 import { expect, type Page } from "@playwright/test";
 
 // Shared scenario setup for the dual-mode specs. The working presets live at slots
-// 400-404 (the high scratch zone, clear of the user's real presets) and are the SAME
+// 400-409 (the high scratch zone, clear of the user's real presets) and are the SAME
 // fixed presets in both modes (deterministic — same blocks every run, validated against).
 // OFFLINE they are baked into the backup fixture + the startup snapshot, so `ensureScenario`
 // finds them and skips. ONLINE they start empty, so `ensureScenario` imports the identical
@@ -266,7 +266,7 @@ export async function isOnline(page: Page): Promise<boolean> {
  *  OFFLINE this is a NO-OP, because it has nothing left to undo: the `page` fixture POSTs
  *  `/sim/reset` before EVERY test, and that rebuilds the whole SimDevice from scratch —
  *  presets, scenes, songs, setlists, the re-amp latch and any armed capture fault — then
- *  reinstalls the 400-404 snapshot. So isolation between tests comes from the reset, not
+ *  reinstalls the 400-409 snapshot. So isolation between tests comes from the reset, not
  *  from this teardown, and the 7 bridged commands here were pure cost. Two things that do
  *  survive the reset are deliberately unaffected: the cumulative re-amp counters (every
  *  spec baseline-DIFFS them via `expectReampBalanced`) and `SCENARIO_VERIFIED` (read only

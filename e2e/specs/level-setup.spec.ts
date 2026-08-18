@@ -23,6 +23,13 @@ import {
 // Fixture map (e2e/fixtures/COVERAGE.md): SCENARIO[0] "E2E Rig" (400) carries the Other-
 // class wah (WAH, sw8), the unlabeled raw-dB Boost (sw2), the wet-mix SPRING (sw3), and the
 // isolated/shared_with_base/lowers_only scene-overlay spread across its 4 scenes.
+//
+// PR #144 REWORK: the verify-only footswitch default + its "Make level-neutral" opt-in,
+// and the scene row's match/offset target-mode chip, are BOTH GONE — every row (Base/Scene/
+// Footswitch) now levels against ONE user-chosen `BlockLevelPick` handle (D2). Base rows
+// default to the "Preset level" pseudo-option, Scene rows to "Amp output level"; footswitch
+// rows always carry a real pre-seeded handle (no pseudo-option). The picker's own trigger
+// (`title="Choose this sound's leveling control"`) replaced the old target-mode chip trigger.
 
 interface FootswitchLevelResult {
   switch: number;
@@ -30,6 +37,9 @@ interface FootswitchLevelResult {
   unconverged: boolean;
   clamp_reason: string | null;
   wet_floor: boolean;
+  /** The clamp's cause from the shared taxonomy (mirrors `headroom_trade::ClampKind`) —
+   *  see `src/lib/types.ts`'s `ClampKind`/`CLAMP_MESSAGES`. Null when not clamped. */
+  clamp_kind: string | null;
   saved: boolean;
   final_value: number;
   predicted_lufs: number;
@@ -76,12 +86,13 @@ test.describe("Level Setup — Other-class filtering, unlabeled naming (list-lev
     await page.close();
   });
 
-  // COVERAGE rows 22, 19, 15 — unlabeled switch rendering, plus the UI manifestation of
-  // the Other-class case: `footswitchesPerIndex` (src/views/level/libraryScan.ts) filters to
+  // COVERAGE rows 22, 19 — unlabeled switch rendering, plus the UI manifestation of the
+  // Other-class case: `footswitchesPerIndex` (src/views/level/libraryScan.ts) filters to
   // LEVELABLE switches only, so 400's WAH (sw8, every param classifies Other — no level
-  // candidate) never reaches the Level tab's selection tree at all — not a verify-only row,
-  // an ABSENT one. This is a matrix correction, not a bug: it's the danger.md Pick trap's
-  // absence-side proof (never options[0]) plus the filter's own contract.
+  // candidate) never reaches the Level tab's selection tree at all — never a row at all
+  // (row 15, whose own verify-only-row use case PR #144 removed outright — see its own
+  // COVERAGE.md entry). This is a matrix correction, not a bug: it's the danger.md Pick
+  // trap's absence-side proof (never options[0]) plus the filter's own contract.
   test("400: WAH (Other-class) is absent from the tree; the unlabeled Boost switch names itself from its block", async ({
     page,
   }) => {
@@ -115,7 +126,7 @@ test.describe("Level Setup — Other-class filtering, unlabeled naming (list-lev
   });
 });
 
-test.describe("Level Setup — scene handle picker (isolated / shared_with_base / lowers_only) + target-mode chip", () => {
+test.describe("Level Setup — scene handle picker (isolated / shared_with_base / lowers_only)", () => {
   test.afterEach(async ({ page }) => {
     await reampOff(page);
   });
@@ -125,12 +136,14 @@ test.describe("Level Setup — scene handle picker (isolated / shared_with_base 
     await page.close();
   });
 
-  // COVERAGE rows 9, 10, 12, 13 — all Setup-time (the picker's candidate annotations + the
-  // target-mode chip), never a run. 400's 4 scenes carry all three overlay scopes for the
+  // COVERAGE rows 10, 12, 13 — all Setup-time (the picker's candidate annotations), never a
+  // run. Row 9 (the old target-mode chip's offset mode) is GONE with the chip itself — PR
+  // #144 replaced it with the combined D2 handle picker, so there is no more "match target
+  // vs keep offset" choice to assert. 400's 4 scenes carry all three overlay scopes for the
   // ACD_Boost handle: Rhythm/Lead/Ceiling are FULL overlays (isolated), Shared is
   // bypass-only (shared_with_base); Ceiling's amp `outputLevel` overlay sits at 1.0 (the
   // range top) — the lowers_only headroom case.
-  test("400: Rhythm is isolated, Shared warns shared_with_base, Ceiling annotates lowers_only; the mode chip toggles", async ({
+  test("400: Rhythm is isolated, Shared warns shared_with_base, Ceiling annotates lowers_only; picking a handle updates the trigger", async ({
     page,
   }) => {
     test.skip(
@@ -160,12 +173,14 @@ test.describe("Level Setup — scene handle picker (isolated / shared_with_base 
     // "the row index IS the 0-based wire sceneSlot" — see e2e/fixtures/scenario-
     // presets.json's slot-400 `scenes` list) — a true identity, stable under a
     // fixture edit, so it needs no translation the way a footswitch hook does
-    // (`f<slot>:sw<n>`, below). `hasText` on the scene NAME alone is not enough to
-    // disambiguate — every unselected row's own target-mode Pick defaults to "Rhythm"
-    // as ITS bound label too, so a plain text filter for "Rhythm" matches every
-    // selected row's target cell, not just the Rhythm scene row.
+    // (`f<slot>:sw<n>`, below). The trigger is `BlockLevelPick`'s own (its fixed
+    // `title`, not scene-name text — every unselected row's own picker also DEFAULTS
+    // to the "Amp output level" pseudo-option, so a text filter on that label would
+    // collide across rows too).
     const rowTrigger = (key: string) =>
-      page.locator(`[data-setup-row="${key}"] div[title*='target mode']`);
+      page.locator(
+        `[data-setup-row="${key}"] div[title="Choose this sound's leveling control"]`,
+      );
 
     // Rhythm (s400:0): ACD_Boost's OWN overlay in this scene is FULL (isolated) — its
     // candidate row must carry no shared_with_base warning. NOTE: the picker's candidate
@@ -190,7 +205,9 @@ test.describe("Level Setup — scene handle picker (isolated / shared_with_base 
     await expect(
       boostCandidate.getByText(/shared with the base preset/),
     ).toHaveCount(0);
-    await expect(rowTrigger("s400:0")).toContainText("match target");
+    // Untouched (still the "Amp output level" pseudo-default — this row's own handle was
+    // never picked).
+    await expect(rowTrigger("s400:0")).toContainText("Amp output level");
     await closeAnyOpenPicker(page);
 
     // Shared (s400:3): ACD_Boost's overlay is bypass-only in this scene → its OWN row
@@ -212,20 +229,19 @@ test.describe("Level Setup — scene handle picker (isolated / shared_with_base 
     // carries a full overlay) — so BOTH their candidate rows legitimately annotate "can
     // only lower" and a whole-menu text assertion hits a strict-mode collision. Scope to
     // JC120's own row (Boost's `gain` = 2.5, nowhere near its [0,12] top, is NOT
-    // lowers_only here). Then the target-mode chip: switch it to "Keep its offset" and
-    // confirm the trigger updates.
+    // lowers_only here). Then PICK it (the D2 handle choice replacing the old target-mode
+    // chip) and confirm the trigger updates to name the chosen block+param.
     await rowTrigger("s400:2").click();
     const jc120Candidate = page.locator(
       '[data-block-param-pick="ACD_JC120:outputLevel"]',
     );
     await expect(jc120Candidate.getByText("can only lower")).toBeVisible();
-    await page.getByText("Keep its offset", { exact: true }).click();
-    await closeAnyOpenPicker(page);
-    await expect(rowTrigger("s400:2")).toContainText("keep offset");
+    await jc120Candidate.click(); // picking closes the menu itself — no closeAnyOpenPicker needed
+    await expect(rowTrigger("s400:2")).toContainText("Output level");
   });
 });
 
-test.describe("Level Setup — footswitch opt-in write path (raw-dB Boost) vs the verify-only default (SimDevice event log)", () => {
+test.describe("Level Setup — footswitch rows pre-seed a real handle (verify-only removed)", () => {
   test.afterEach(async ({ page }) => {
     await reampOff(page);
   });
@@ -235,17 +251,13 @@ test.describe("Level Setup — footswitch opt-in write path (raw-dB Boost) vs th
     await page.close();
   });
 
-  // COVERAGE rows 16/20's Setup-time UI half: the opt-in affordance ("Make level-neutral"
-  // flips a footswitch row out of its P2 verify-only default) plus its sibling STAYING at
-  // the default. The rendered per-row Summary/write outcome is Channel-gated offline (this
-  // file's header) — not the affordance itself, which is a plain state flip in Setup, so
-  // this half is asserted through the real UI. The actual WRITE this opt-in leads to is
-  // proven separately below via the same command the run would call, over a raw invoke —
-  // the UI's opted-in run's own write is not independently re-observable offline once the
-  // per-footswitch result stops streaming, and re-deriving it through the fragile
-  // card-portaled picker (two nested portals: the row's FsParamPick, then its candidate
-  // menu) bought nothing this file's raw-invoke seam doesn't already prove more directly.
-  test("Make level-neutral flips Boost out of verify-only; SPRING stays at the default", async ({
+  // COVERAGE rows 15, 16/17/20's Setup-time half, post-PR-#144: the backend dropped the
+  // verify-only footswitch mode entirely, so there is no more "Verify only" tag or
+  // "Make level-neutral" opt-in to flip — every row is PRE-SEEDED with the tone-safe
+  // `defaultParamIndex` candidate (leveling.ts's `chosenFrom`) at Setup-open time, shown
+  // non-interactively when it's the row's only option (mirrors BlockLevelPick's own
+  // doc: "a `wet_mix` candidate is flagged...", "the single best candidate...").
+  test("400: Boost pre-seeds Gain, SPRING pre-seeds Mix — no verify-only state exists", async ({
     page,
   }) => {
     test.skip(
@@ -274,24 +286,21 @@ test.describe("Level Setup — footswitch opt-in write path (raw-dB Boost) vs th
     const boostRow = page.locator('[data-setup-row="f400:sw2"]');
     const springRow = page.locator('[data-setup-row="f400:sw3"]');
 
-    // Both start verify-only (the P2 default — no row is ever auto-picked).
-    await expect(boostRow.getByText("Verify only")).toBeVisible();
-    await expect(springRow.getByText("Verify only")).toBeVisible();
-
-    await boostRow.getByRole("button", { name: "Make level-neutral" }).click();
-
-    // Boost flipped: its "Verify only" tag is gone, replaced by the param picker. Every
-    // row is PRE-SEEDED with `defaultParamIndex` (leveling.ts) — the tone-safe candidate
-    // rank, level/db over wet-mix — at Setup-open time regardless of fsMode (SetupBody's
-    // initial `rows` state), so flipping fsMode alone doesn't leave the picker unpicked:
-    // this is a deliberate sensible default (a REAL existing candidate), not the
-    // danger.md Pick trap (a STALE value outside the current option set falling back to
-    // options[0]). Boost's sole candidate is `gain` — its only option, pre-picked, shown
-    // "Gain" and non-interactive ("nothing to choose").
     await expect(boostRow.getByText("Verify only")).toHaveCount(0);
-    await expect(boostRow.getByText("Gain", { exact: true })).toBeVisible();
-    // SPRING never moved.
-    await expect(springRow.getByText("Verify only")).toBeVisible();
+    await expect(springRow.getByText("Verify only")).toHaveCount(0);
+    // The D2 trigger names BOTH the switch and the pre-picked param ("BOOST · Gain"/
+    // "SPRING · Mix") — never a bare param name, since a footswitch row's candidates can
+    // span several nodes and the switch's own name disambiguates them.
+    const boostTrigger = boostRow.locator(
+      'div[title="Choose this sound\'s leveling control"]',
+    );
+    const springTrigger = springRow.locator(
+      'div[title="Choose this sound\'s leveling control"]',
+    );
+    // Boost's sole candidate is `gain` — pre-picked.
+    await expect(boostTrigger).toContainText("Gain");
+    // SPRING's sole candidate is `mix` — pre-picked.
+    await expect(springTrigger).toContainText("Mix");
   });
 });
 
@@ -473,6 +482,14 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
       `the clamp's cause must be the wet floor: ${JSON.stringify(unreachable)}`,
     ).toBe(true);
     expect(unreachable.clamp_reason).toBe(null);
+    // The shared ClampKind taxonomy names the SAME cause (CLAMP_MESSAGES.wet_floor in
+    // src/lib/types.ts renders this verbatim wherever a row's clamp is UI-observable —
+    // this wire-level check is the twin the Channel seam allows offline; see this file's
+    // header).
+    expect(
+      unreachable.clamp_kind,
+      `clamp_kind must name the wet floor too: ${JSON.stringify(unreachable)}`,
+    ).toBe("wet_floor");
     expect(
       Math.abs(unreachable.final_value - 0.105),
       `the written value must BE the floor: ${JSON.stringify(unreachable)}`,
@@ -498,6 +515,10 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
       reachable.wet_floor,
       "wet_floor tracks the OUTCOME, not the param's class",
     ).toBe(false);
+    expect(
+      reachable.clamp_kind,
+      "an unclamped row carries no clamp cause",
+    ).toBe(null);
     expect(reachable.saved, "an in-range target must persist").toBe(true);
 
     const events = await simEvents(page);

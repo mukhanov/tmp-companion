@@ -3077,6 +3077,72 @@ pub(crate) fn tolerant_parse_json(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&padded).ok()
 }
 
+/// Did the read deliver `key`'s section WHOLE — i.e. did the bytes reach its closing
+/// bracket?
+///
+/// A slot-addressed field-8 read returns a device-TRUNCATED partial on a large preset,
+/// and [`tolerant_parse_json`] salvages the prefix: the document parses, a tail section
+/// is simply gone, and a caller reading it sees "this preset has no footswitches" on a
+/// preset that has ten. The parsed value cannot tell those apart — a section that never
+/// arrived and a section the preset genuinely does not carry both read as an absent key,
+/// and a section cut mid-way reads as a short-but-plausible array. Only the RAW bytes
+/// carry the answer, which is why this scans them.
+///
+/// Order-free on purpose: it neither assumes where `key` sits in the document nor how
+/// many entries the section should hold (a real device export has been seen with 9
+/// `ftsw` rows, not 20). A body that strict-parses is complete by construction, so an
+/// absent or empty section in one is GENUINE, not a truncation.
+pub(crate) fn json_section_complete(text: &str, key: &str) -> bool {
+    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+        return true;
+    }
+    let needle = format!("\"{key}\"");
+    // Every occurrence, not the first: the key name can also appear as a string VALUE
+    // (a footswitch `customLabel`, say), which is not the section.
+    text.match_indices(&needle)
+        .any(|(i, _)| section_closes(&text[i + needle.len()..]))
+}
+
+/// Does the `: [ … ]` / `: { … }` immediately after a key close within `tail`? Escape-
+/// and string-aware, like [`tolerant_parse_json`]'s scanner — the field-8 tail can cut
+/// anywhere, including inside a string.
+fn section_closes(tail: &str) -> bool {
+    let Some(tail) = tail.trim_start().strip_prefix(':') else {
+        return false;
+    };
+    let tail = tail.trim_start();
+    let open = match tail.chars().next() {
+        Some(c @ ('[' | '{')) => c,
+        // OBJECT/ARRAY sections only. A scalar value (a number, a string) here always
+        // reads as INCOMPLETE — this scanner has no way to tell a scalar's own tail
+        // truncation from an intact one, so it never signals "closed" for one. Callers
+        // must not pass a scalar key to `json_section_complete`.
+        _ => return false,
+    };
+    let close = if open == '[' { ']' } else { '}' };
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    for c in tail.chars() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_str => esc = true,
+            '"' => in_str = !in_str,
+            _ if in_str => {}
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Recover a JSON string value from a truncated payload. The live active-preset
 /// stream can end in the middle of `"template":"gtrParallel2"`, after enough
 /// bytes to identify the routing template but before strict/tolerant parsing can
@@ -4707,6 +4773,51 @@ mod tests {
     fn tolerant_parse_passes_through_valid_json() {
         let v = super::tolerant_parse_json(r#"{"a":1,"b":[2,3]}"#).unwrap();
         assert_eq!(v["a"], 1);
+    }
+
+    /// The silent-wrong-plan class: a large preset's field-8 read comes back
+    /// TAIL-TRUNCATED, `tolerant_parse_json` salvages the prefix, and a planner reading
+    /// the salvaged `ftsw` sees "no footswitches" on a preset that has them. The
+    /// discriminator must separate a section that never ARRIVED from one the preset
+    /// legitimately carries empty — a preset really can have 20 empty `ftsw` rows, and a
+    /// real device export has been seen with 9 rows rather than 20, so neither
+    /// emptiness nor row count can be the test.
+    #[test]
+    fn json_section_complete_separates_a_truncated_tail_from_a_genuinely_empty_section() {
+        let body = r#"{"ampControl":{"a":false},"audioGraph":{"guitarNodes":{"G1":[{"nodeId":"N"}]}},"ftsw":[[{"func":"on-off","customLabel":"BOOST"}],[]],"info":{"displayName":"Big"},"scenes":[{"sceneName":"A"}]}"#;
+        assert!(super::json_section_complete(body, "ftsw"));
+        assert!(super::json_section_complete(body, "scenes"));
+
+        // Cut INSIDE `scenes` — the tail is gone but `ftsw` already arrived whole, so
+        // footswitch planning off this body is sound and must not be refused.
+        let cut = body.find(r#""scenes":[{"sceneName"#).expect("cut point");
+        let mid_scenes = &body[..cut + r#""scenes":[{"sceneN"#.len()];
+        assert!(super::json_section_complete(mid_scenes, "ftsw"));
+        assert!(!super::json_section_complete(mid_scenes, "scenes"));
+
+        // Cut INSIDE `ftsw` — the salvaged array is a plausible-looking prefix, which is
+        // exactly the shape that used to plan zero jobs silently.
+        let cut = body.find(r#","customLabel"#).expect("cut point");
+        let mid_ftsw = &body[..cut];
+        assert!(super::tolerant_parse_json(mid_ftsw).is_some());
+        assert!(!super::json_section_complete(mid_ftsw, "ftsw"));
+
+        // Cut BEFORE `ftsw` — the key never appears at all.
+        let cut = body.find(r#","ftsw""#).expect("cut point");
+        assert!(!super::json_section_complete(&body[..cut], "ftsw"));
+
+        // A COMPLETE body whose sections are empty is legitimate, not truncated: 20
+        // empty rows is a real preset (no footswitch assignments), and `"scenes":[]` is
+        // the device shape for a scene-less preset.
+        let rows = vec!["[]"; 20].join(",");
+        let empty = format!(r#"{{"ftsw":[{rows}],"scenes":[]}}"#);
+        assert!(super::json_section_complete(&empty, "ftsw"));
+        assert!(super::json_section_complete(&empty, "scenes"));
+
+        // The key appearing as a string VALUE is not the section — a body whose only
+        // "ftsw" is a footswitch label must still read as truncated.
+        let labelled = r#"{"audioGraph":{"guitarNodes":{"G1":[{"customLabel":"ftsw"#;
+        assert!(!super::json_section_complete(labelled, "ftsw"));
     }
 
     // ─── Live-push decoders (shared by the monitor + the listener) ────────────

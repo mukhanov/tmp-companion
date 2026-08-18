@@ -85,6 +85,13 @@ fn saved_bypass_map(nodes: &[doctor::DoctorNode]) -> std::collections::HashMap<S
 pub(crate) struct SoundIsolation {
     pub(crate) bypass: Vec<(String, String, bool)>,
     pub(crate) params: Vec<(String, String, String, f32)>,
+    /// Set when this sound's state could not be resolved at all — the caller must
+    /// report the sound as errored instead of capturing it. A FOOTSWITCH sound IS its
+    /// isolation (`ftsw` decides which blocks are on and which params jump), so an
+    /// unresolvable one captures the base sound and diagnoses the wrong thing under the
+    /// switch's name. Base sounds stay best-effort: their isolation only silences other
+    /// switches, so a missing one degrades the baseline rather than misnaming it.
+    pub(crate) unresolved: Option<String>,
 }
 
 /// Resolve the pre-engage writes for a diagnosed sound — one policy for
@@ -109,6 +116,7 @@ fn resolve_sound_isolation(
         return SoundIsolation {
             bypass: Vec::new(),
             params: Vec::new(),
+            unresolved: None,
         };
     }
     if !nodes.is_empty() {
@@ -119,6 +127,7 @@ fn resolve_sound_isolation(
                 footswitch,
             ),
             params: footswitch::derived_param_writes(footswitches, footswitch),
+            unresolved: None,
         }
     } else {
         // Base/footswitch sounds fall back to the legacy live field-8 read
@@ -128,7 +137,10 @@ fn resolve_sound_isolation(
         // degrades to no isolation (best-effort, like `level_preset`), never
         // fails the run.
         if let std::collections::hash_map::Entry::Vacant(e) = preset_cache.entry(list_index) {
-            let preset = match read_slot_preset_parsed(list_index) {
+            // `ftsw` is required of this read: a large preset's field-8 body is cut
+            // before it, and a partial one derives a partial isolation — which for a
+            // footswitch sound means capturing something the switch does not make.
+            let preset = match read_slot_preset_complete(list_index, &["ftsw"]) {
                 Ok((p, _, _)) => p,
                 Err(err) => {
                     log::warn!(
@@ -155,6 +167,19 @@ fn resolve_sound_isolation(
                         .collect()
                 })
                 .unwrap_or_default(),
+            // A footswitch SOUND is defined by `ftsw` — no readable `ftsw` means the
+            // capture would engage nothing and diagnose the base sound under the
+            // switch's name. Report the sound instead of inventing it. A base sound
+            // keeps the documented best-effort degrade.
+            unresolved: footswitch.filter(|_| ftsw.as_array().is_none()).map(|sw| {
+                format!(
+                    "footswitch {} on preset {}: the saved footswitch assignments could not \
+                     be read (the preset is too large to read over USB), so this switch's \
+                     sound cannot be isolated — skipped",
+                    sw + 1,
+                    list_index + 1
+                )
+            }),
         }
     }
 }
@@ -420,6 +445,13 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 item.list_index,
                 &mut preset_cache,
             );
+            // An unresolvable footswitch sound never reaches a capture: folding it into
+            // `stim` reports it through the loop's own per-sound error path (a skipped
+            // sound, never an aborted run) instead of measuring the wrong sound.
+            let stim = match &iso.unresolved {
+                Some(e) => Err(e.clone()),
+                None => stim,
+            };
             let family = instrument_of(item);
             let skip_load = doctor_skip_load(prev.as_ref(), item.list_index, item.scene.is_some());
             let tail_ms = u64::from(doctor::doctor_tail_ms(&item.nodes));
@@ -1054,6 +1086,11 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                 job.list_index,
                 &mut std::collections::HashMap::new(),
             );
+            // Same rule as the diagnosis loop: an unisolatable footswitch sound must not
+            // be auditioned — the A/B would compare two captures of the wrong sound.
+            if let Some(e) = &iso.unresolved {
+                return Err(e.clone());
+            }
             // The Doctor capture tail for this chain — the ONE home of the policy
             // (`doctor::doctor_tail_ms`); empty `nodes` conservatively keeps the
             // full wash-analysis tail, same default as before this fix.

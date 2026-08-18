@@ -62,26 +62,6 @@ pub(crate) fn cancel_footswitch_leveling() {
     crate::request_op_abort();
 }
 
-/// Read a slot's field-8 preset JSON on a fresh quiet session and return the parsed preset, a
-/// DIAGNOSTIC "has FS scenes" flag (`Some(empty)` = definitely no FS scenes; truncated/unknown or
-/// non-empty → conservative `true`) and the raw byte length. Shared by the footswitch leveling
-/// command + probes (the connect→drain→read→parse→scene-check boilerplate). The flag is NO LONGER
-/// a gate: `footswitch::plan_footswitch_jobs` decides bake-vs-assign PER NODE off this same parsed
-/// document (`scene_jobs::scene_overlays_change_param`) — only `probe --fs-list` still prints it.
-pub(crate) fn read_slot_preset_parsed(
-    slot: u32,
-) -> Result<(serde_json::Value, bool, usize), String> {
-    let mut s = Session::connect()?;
-    s.drain_until_quiet(250, 20)?;
-    let json = s
-        .read_slot_preset_json(slot + 1)?
-        .ok_or_else(|| format!("no preset data for slot {}", slot + 1))?;
-    let preset = session::tolerant_parse_json(&String::from_utf8_lossy(&json))
-        .ok_or_else(|| "preset JSON did not parse".to_string())?;
-    let has_fs_scenes = session::scene_names_from_slot_json(&json).is_none_or(|n| !n.is_empty());
-    Ok((preset, has_fs_scenes, json.len()))
-}
-
 /// A numeric `dspUnitParameter` of `node_id` (e.g. the lev param's current value = `valueB`).
 pub(crate) fn node_param_f64(
     preset: &serde_json::Value,
@@ -216,7 +196,9 @@ pub(crate) async fn list_footswitch_scene_contexts(
     slot: u32,
 ) -> Result<Vec<footswitch::FsSceneContext>, String> {
     with_released_seize(state.session.clone(), move || {
-        let (preset, _, _) = read_slot_preset_parsed(slot)?;
+        // Every row of the picker comes out of `ftsw`, so a body that lost it would show
+        // the player a switch-less preset rather than an error.
+        let (preset, _, _) = read_slot_preset_complete(slot, &["ftsw"])?;
         Ok(footswitch::scene_contexts_for_switches(&preset))
     })
     .await
@@ -254,8 +236,11 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
         // Stream advisory live LUFS while each capture runs (dropped at closure end).
         let _lufs = LiveLufsGuard::install(app_evt);
         // THE single field-8 read: it resolves every job AND is the planner's scene-overlay
-        // source (per-node bake gate) — never add a second read here.
-        let (preset, _, _) = read_slot_preset_parsed(slot)?;
+        // source (per-node bake gate) — never add a second read here. `ftsw` is REQUIRED:
+        // a body cut before it plans zero jobs and reports a clean run on a preset whose
+        // switches were never touched, so the read either delivers it or the run refuses
+        // (before any device state moves).
+        let (preset, _, _) = read_slot_preset_complete(slot, &["ftsw"])?;
         crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
         let ftsw = preset
             .get("ftsw")

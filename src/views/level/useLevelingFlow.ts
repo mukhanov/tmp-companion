@@ -58,6 +58,8 @@ import type {
   Profile,
   LevelBlock,
   SilenceHint,
+  ClampKind,
+  TradeSummary,
 } from "../../lib/types";
 
 // AMP model ids (the catalog's amp categories) — the amp's outputLevel knob is the
@@ -127,15 +129,14 @@ interface LevelOutcomeFields {
   /** Footswitch rows only — `LevelResult` (preset/scene) has no such field, so it stays
    *  optional and those lanes simply never report an unconverged row. */
   unconverged?: boolean;
-  /** Footswitch VERIFY rows ONLY: engaged − disengaged loudness (LU) — see
-   *  `FootswitchLevelResult.on_off_delta_lu`. Its presence IS the verify discriminator
-   *  (a LEVEL row and every scene/preset row never carry it). */
-  on_off_delta_lu?: number | null;
   /** Footswitch rows only: the clamp's pinned bound is the wet/mix floor, not headroom —
    *  see `FootswitchLevelResult.wet_floor`. */
   wet_floor?: boolean;
-  /** Scene rows in Offset target mode only — see `LevelResult.target_offset_lu`. */
-  target_offset_lu?: number | null;
+  /** The clamp's CAUSE from the shared taxonomy — see `LevelResult.clamp_kind`. */
+  clamp_kind?: ClampKind | null;
+  /** THE HEADROOM TRADE this row's batch made — see `LevelResult.trade`. Footswitch
+   *  results have no trade lane, so this stays optional/undefined there. */
+  trade?: TradeSummary | null;
 }
 
 // A `clamp_reason` is set ONLY when the leveled signal isn't effectively reaching the USB 1/2
@@ -145,20 +146,15 @@ interface LevelOutcomeFields {
 // A plain headroom/authority clamp (the knob has real effect but can't reach target) has
 // `clamped` set with NO reason → "clamped at X". `unconverged` is last of the miss states
 // (the backend's own precedence): it is only ever set when `clamped` is not, and it means
-// the knob had room left, so a re-run helps. `on_off_delta_lu` wins over everything else —
-// its PRESENCE is the backend's own verify discriminator (see
-// `FootswitchLevelResult.on_off_delta_lu`'s doc), so a verify row is never mistaken for a
-// solved "done" (which would claim a write that never happened).
+// the knob had room left, so a re-run helps.
 const outcomeOf = (r: LevelOutcomeFields): RunItem["outcome"] =>
-  r.on_off_delta_lu != null
-    ? "verified"
-    : r.clamp_reason != null
-      ? "offbranch"
-      : r.clamped
-        ? "clamped"
-        : r.unconverged
-          ? "unconverged"
-          : "done";
+  r.clamp_reason != null
+    ? "offbranch"
+    : r.clamped
+      ? "clamped"
+      : r.unconverged
+        ? "unconverged"
+        : "done";
 const valueOf = (r: LevelOutcomeFields): number =>
   r.verify_lufs ?? r.predicted_lufs;
 // Resolve to a SINGLE by-ear cause. If a row is both dynamic AND rebalance-uncertain (rare —
@@ -417,8 +413,8 @@ export function useLevelingFlow({
             entry.item.activeMessage = null;
             entry.item.outcome = outcomeOf(result);
             entry.item.value = valueOf(result);
-            entry.item.verifyDeltaLu = result.on_off_delta_lu ?? null;
-            entry.item.targetOffsetLu = result.target_offset_lu ?? null;
+            entry.item.clampKind = result.clamp_kind ?? null;
+            entry.item.trade = result.trade ?? null;
             entry.item.spreadLu = result.dynamic_spread_lu;
             entry.item.verifyByEar = causeOf(result);
             finishItem(entry.item, entry.idx);
@@ -490,7 +486,13 @@ export function useLevelingFlow({
           try {
             if (it.isBase) {
               const res = await levelPreset(
-                buildLevelJob(it.slot, targetLufs, profile, true),
+                buildLevelJob(
+                  it.slot,
+                  targetLufs,
+                  profile,
+                  true,
+                  it.baseHandle,
+                ),
               );
               it.outcome = outcomeOf(res);
               it.value = valueOf(res);
@@ -499,6 +501,8 @@ export function useLevelingFlow({
               it.previousLevel = res.previous_level;
               it.truePeakDbtp = res.true_peak_dbtp;
               it.verifyByEar = causeOf(res);
+              it.clampKind = res.clamp_kind ?? null;
+              it.trade = res.trade ?? null;
             } else {
               // A scene item with no wire slot — nothing to level.
               it.outcome = "skipped";
@@ -631,14 +635,12 @@ export function useLevelingFlow({
             {
               slot: it.slot,
               // Unlike the footswitch job's `lev*` fields (plain `String`s that reject an
-              // explicit `null`), `targetMode`/`handle` are `Option`/serde-defaulted on the
-              // Rust side — an `undefined` value here is simply OMITTED by JSON
-              // serialization (never sent as `null`), so a plain field assignment reaches
-              // the same wire shape as the old conditional spread.
+              // explicit `null`), `handle` is `Option`/serde-defaulted on the Rust side —
+              // an `undefined` value here is simply OMITTED by JSON serialization (never
+              // sent as `null`).
               jobs: group.map((g) => ({
                 sceneSlot: g.sceneSlot ?? 0,
                 targetLufs: targetOf(g),
-                targetMode: g.targetMode,
                 handle: g.handle,
               })),
               candidates: cands,

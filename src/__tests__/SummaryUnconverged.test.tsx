@@ -26,7 +26,7 @@ const fsRow = (over: Partial<RunItem>): RunItem => ({
     levGroupId: "G1",
     levNodeId: "amp",
     levParameterId: "outputLevel",
-    mode: "level",
+    sceneContext: null,
   },
   instId: "none",
   targetName: "Lead",

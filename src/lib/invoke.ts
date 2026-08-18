@@ -34,6 +34,7 @@ import type {
   SongSaveOutcome,
   PresetScenes,
   SceneHandleRow,
+  FsSceneContext,
   BackupReadResult,
   CopyJob,
   CopyApplyItem,
@@ -147,10 +148,6 @@ export interface SceneHandlePick {
 export interface SceneLevelJobWire {
   sceneSlot: number;
   targetLufs: number;
-  /** How to read `targetLufs`: "match" (every scene solves to it, the default — an
-   *  omitted key means the same thing) or "offset" (preserve the scene's authored
-   *  loudness RELATIONSHIP to the batch reference). Mirrors `leveller::SceneTargetMode`. */
-  targetMode?: "match" | "offset";
   /** The user's OWN control for this scene, INSTEAD of the active amp's outputLevel.
    *  Omitted/null = the amp path (every existing caller). */
   handle?: SceneHandlePick | null;
@@ -182,11 +179,23 @@ export const cancelSceneLeveling = (): Promise<void> =>
 
 /** Per-scene handle candidates for the Set-up step's scene control picker — every
  * FS scene's controls in ONE call, so a scene row's picker fetches lazily (on first
- * open) and caches per preset rather than firing per row. PURE apart from one field-8
- * read: no scene is recalled on the unit and nothing is measured. */
+ * open) and caches per preset rather than firing per row. No scene is recalled on the
+ * unit and nothing is measured — but it is NOT always just one field-8 read: on a
+ * truncated body (the `scenes` tail cut off) the backend falls back to a synchronous
+ * whole-library device-backup transfer (multi-second) before it can answer. */
 export const listSceneLevelHandles = (
   slot: number,
 ): Promise<SceneHandleRow[]> => invoke("list_scene_level_handles", { slot });
+
+/** Which scenes enable each footswitch of `slot` (D3) — the Set-up step's per-footswitch
+ * scene-context picker source. No scene is recalled on the unit and nothing is measured —
+ * but it is NOT always just one field-8 read: on a truncated body (the `ftsw` tail cut
+ * off) the backend falls back to a synchronous whole-library device-backup transfer
+ * (multi-second) before it can answer. */
+export const listFootswitchSceneContexts = (
+  slot: number,
+): Promise<FsSceneContext[]> =>
+  invoke("list_footswitch_scene_contexts", { slot });
 
 /** One knob's PRE-redistribution value — the Restore anchor. `sceneSlot` null = the base
  * amp (plain write); a number = that FS scene's overlay. Mirrors `commands::PreviousKnob`. */
@@ -264,30 +273,26 @@ export interface FootswitchLevelProgressItem {
  * solve. Mirrors `levelScenesApplyBatched`. */
 export interface FootswitchLevelJobWire {
   switch: number;
-  /** "level" (solve + write the handle below — the default when omitted, today's
-   *  behavior) or "verify" (measure engaged vs disengaged, write nothing). Mirrors
-   *  `FsJobMode`. */
-  mode?: "level" | "verify";
-  /** The leveling handle. Omit ALL THREE for a "verify" row — the backend defaults
-   *  them (never send an empty string; the Rust field is a plain `String`, not
-   *  `Option<String>`, so an explicit `null` fails to deserialize). */
-  levGroupId?: string;
-  levNodeId?: string;
-  levParameterId?: string;
+  /** The leveling handle — every row levels now (the old verify-only "no handle" row is
+   *  gone backend-side; an empty/missing handle is a per-row error, not a measure-only
+   *  mode). */
+  levGroupId: string;
+  levNodeId: string;
+  levParameterId: string;
   targetLufs: number;
   /** The switch's CURRENT display label (the Level list's row name). The backend
    * writes it as the switch's `customLabel` when it adds a second function to an
    * UNLABELLED switch — the unit displays "MULTI" for a multi-function switch with
    * no label, so this keeps the pedalboard display unchanged. */
   displayLabel?: string;
+  /** THE SCENE CONTEXT this switch's sound is measured and solved in (D3): a 0-based
+   *  `scenes[]` wire slot, or omitted/null = the preset's BASE sound. Mirrors
+   *  `FootswitchLevelJob::scene_context`. */
+  sceneContext?: number | null;
 }
 
 /** Build one `levelFootswitchesApply` job from a `FootswitchTarget` — the ONE place
- * that turns the discriminated union into the wire's optional-field shape. Verified
- * against `commands::level_footswitch::FootswitchLevelJob`: `lev_group_id`/
- * `lev_node_id`/`lev_parameter_id` are plain `String`s (not `Option<String>`) with
- * `#[serde(default)]`, so an explicit `null` FAILS TO DESERIALIZE — a verify-mode
- * target must omit the three keys entirely, never send them as `null`. */
+ * that turns the frontend's row shape into the wire's field names. */
 export function toFootswitchJobWire(
   target: FootswitchTarget,
   targetLufs: number,
@@ -295,16 +300,12 @@ export function toFootswitchJobWire(
 ): FootswitchLevelJobWire {
   return {
     switch: target.switchIndex,
-    mode: target.mode,
-    ...(target.mode === "level"
-      ? {
-          levGroupId: target.levGroupId,
-          levNodeId: target.levNodeId,
-          levParameterId: target.levParameterId,
-        }
-      : {}),
+    levGroupId: target.levGroupId,
+    levNodeId: target.levNodeId,
+    levParameterId: target.levParameterId,
     targetLufs,
     displayLabel,
+    sceneContext: target.sceneContext,
   };
 }
 
@@ -576,6 +577,7 @@ export const cmd = {
   restoreRedistribution,
   commonReachableTarget,
   listSceneLevelHandles,
+  listFootswitchSceneContexts,
   // Profiles + store
   getStore,
   saveProfiles,

@@ -223,12 +223,6 @@ pub struct LevelResult {
     /// = re-read and confirmed; `None` = not checked (no save, nothing written, the
     /// re-read failed, or a path without the verify).
     pub persist_mismatch: Option<bool>,
-    /// Scene rows in [`SceneTargetMode::Offset`] ONLY: how far this scene's effective
-    /// target was shifted from the requested one to preserve its authored loudness
-    /// relationship (LU). `target_lufs` above is ALREADY the shifted value; this says by
-    /// how much, which the frontend cannot derive (its own requested number was shifted
-    /// again by the playback compensation before the run). `None` everywhere else.
-    pub target_offset_lu: Option<f64>,
     /// THE HEADROOM TRADE this run made (or, on a preview, WOULD make) — see
     /// [`crate::headroom_trade::TradeSummary`] (disclosure rationale: its own doc). Stamped on
     /// EVERY row of a batch that traded, because the trade moved the whole preset's gain
@@ -1786,7 +1780,6 @@ pub fn level_preset(
                     previous_level: None,
                     true_peak_dbtp: None,
                     persist_mismatch: None,
-                    target_offset_lu: None,
                     trade: None,
                 });
             }
@@ -1835,7 +1828,6 @@ pub fn level_preset(
                         final_level,
                     )),
                     persist_mismatch: None,
-                    target_offset_lu: None,
                     trade: None,
                 });
             }
@@ -1885,7 +1877,6 @@ pub fn level_preset(
                 final_level,
             )),
             persist_mismatch: None,
-            target_offset_lu: None,
             trade: None,
         })
     })();
@@ -1987,7 +1978,6 @@ pub fn level_setlist(
             previous_level: None,
             true_peak_dbtp: None,
             persist_mismatch: None,
-            target_offset_lu: None,
             trade: None,
         });
     }
@@ -4134,11 +4124,6 @@ pub struct BatchedSceneOutcome {
     /// pre-wipe and must not be trusted; `Some(false)` = re-read and confirmed. `None` =
     /// not checked (the scene wrote nothing, the run didn't save, or the re-read failed).
     pub persist_mismatch: Option<bool>,
-    /// [`SceneTargetMode::Offset`] rows ONLY: how far this scene's effective target was
-    /// shifted from the requested one to preserve its authored relationship (LU;
-    /// `target_lufs` above is ALREADY the shifted one). `None` on a `Match` row;
-    /// `Some(0.0)` on the reference row itself, whose offset is 0 by definition.
-    pub target_offset_lu: Option<f64>,
 }
 
 /// One amp knob to drive within a scene: the control, its bounds, and its current
@@ -4149,32 +4134,6 @@ pub struct KnobTarget {
     pub lo: f32,
     pub hi: f32,
     pub current: f32,
-}
-
-/// What a scene row's `target_lufs` MEANS. Deserialized straight off the wire job
-/// (`"match"` / `"offset"`), so the wizard's two intents can't drift into two backend
-/// concepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SceneTargetMode {
-    /// Every scene is solved to the job target — today's behavior and the serde default,
-    /// so an existing caller's payload keeps its meaning with no `targetMode` key at all.
-    #[default]
-    Match,
-    /// Preserve the scene's AUTHORED loudness RELATIONSHIP: solve it to
-    /// `target + (its as-is loudness − the batch reference's as-is loudness)`, so a scene
-    /// the player wrote 4 LU above the reference stays 4 LU above it after the run.
-    ///
-    /// THE REFERENCE (chosen for cost — it must add ZERO captures): the FIRST job in the
-    /// batch that yields a real as-is measurement. Every scene is already measured as-is
-    /// once as the first step of its own solve, so the first one's reading is free; the
-    /// alternatives are not — "the loudest scene" can only be known after measuring them
-    /// all, which is a whole extra pass, and "the preset's base sound" costs a capture
-    /// whenever base isn't in the batch. The reference row itself therefore lands on the
-    /// plain target (offset 0), and the batch order the caller sends IS the choice of
-    /// reference. A row whose as-is measurement fails is skipped as a reference exactly as
-    /// it is skipped as a result, so the next row takes over.
-    Offset,
 }
 
 /// A pre-resolved per-scene leveling job. A scene carries a **set** of amp knobs:
@@ -4200,11 +4159,6 @@ pub struct SceneJob {
     /// output) — the rebalance flow may adjust the lanes' mix. False for series, single
     /// amp, and split-OUTPUT scenes (separate physical outs have no shared mix).
     pub rebalanceable: bool,
-    /// How to read `target_lufs` — see [`SceneTargetMode`]. Honored by
-    /// [`level_scenes_oneshot`] only; the rebalance and redistribution runners always
-    /// re-level every sound to its own target (`Match`), since their whole job is to
-    /// re-establish an absolute target after a gain-budget change.
-    pub target_mode: SceneTargetMode,
     /// The USER'S OWN leveling handle for this scene, when they chose one: the CLASSIFIED
     /// block param `knobs[0]` addresses. `None` = the amp-`outputLevel` joint-k path (every
     /// existing caller), which keeps joint-k, the amplitude-bounds requirement, and the
@@ -4400,7 +4354,6 @@ pub fn level_scenes_live_batched(
                     clamp_reason: None,
                     verify_by_ear: false,
                     persist_mismatch: None,
-                    target_offset_lu: None,
                     // The probe-only bench runner reports no taxonomy: it has no
                     // `clamp_reason`/wet-floor inputs to derive one from.
                     clamp_kind: None,
@@ -4421,7 +4374,6 @@ pub fn level_scenes_live_batched(
                     clamp_reason: None,
                     verify_by_ear: false,
                     persist_mismatch: None,
-                    target_offset_lu: None,
                 },
             };
             on_scene(job.scene_slot, Some(&outcome));
@@ -4558,15 +4510,11 @@ pub fn scene_ceiling_lufs(job: &SceneJob) -> Option<f64> {
 /// is recalled first so the save stamps the preset's original active scene. A
 /// per-scene failure becomes a failed outcome, never aborting the run.
 ///
-/// TWO per-row variations ride this runner, both defaulted OFF so an existing caller's
-/// batch is byte-identical:
-/// * [`SceneJob::handle`] — the user named their OWN control for that scene, so it is
-///   solved by [`handle_one_scene`] (the generic param secant) instead of the amp joint-k.
-///   The amp `outputLevel` remains the ONLY control this lane touches when no handle is
-///   given; a handle is an explicit, per-row user choice.
-/// * [`SceneJob::target_mode`] — `Offset` preserves the scene's authored loudness
-///   relationship instead of flattening every scene onto one number. The batch's reference
-///   is the first row that measures (see [`SceneTargetMode::Offset`]).
+/// ONE per-row variation rides this runner, defaulted OFF so an existing caller's batch is
+/// byte-identical: [`SceneJob::handle`] — the user named their OWN control for that scene, so
+/// it is solved by [`handle_one_scene`] (the generic param secant) instead of the amp
+/// joint-k. The amp `outputLevel` remains the ONLY control this lane touches when no handle
+/// is given; a handle is an explicit, per-row user choice.
 #[allow(clippy::too_many_arguments)]
 pub fn level_scenes_oneshot(
     slot: u32,
@@ -4587,41 +4535,22 @@ pub fn level_scenes_oneshot(
         hold,
         on_scene,
         cancelled,
-        // The batch's `Offset` REFERENCE: the first row that yields a real as-is
-        // measurement (see `SceneTargetMode::Offset` — the only choice that costs no extra
-        // capture). A row whose measurement fails leaves it unset, so the next row takes
-        // over; the reference row itself sees `None` and lands on the plain target.
-        {
-            let mut reference: Option<f64> = None;
-            move |job: &SceneJob| {
-                let solved = match &job.handle {
-                    Some(handle) => handle_one_scene(
-                        slot,
-                        job,
-                        handle,
-                        stimulus,
-                        job.target_lufs,
-                        save,
-                        saved,
-                        reference,
-                    ),
-                    None => jointk_one_scene(
-                        slot,
-                        job,
-                        stimulus,
-                        job.target_lufs,
-                        save,
-                        true,
-                        saved,
-                        reference,
-                        // A scene amp may legitimately be solved all the way to silence; only
-                        // the trade's BASE hold carries the fader floor.
-                        LEVEL_MIN,
-                    ),
-                }?;
-                reference.get_or_insert(solved.asis);
-                Ok(solved)
+        move |job: &SceneJob| match &job.handle {
+            Some(handle) => {
+                handle_one_scene(slot, job, handle, stimulus, job.target_lufs, save, saved)
             }
+            None => jointk_one_scene(
+                slot,
+                job,
+                stimulus,
+                job.target_lufs,
+                save,
+                true,
+                saved,
+                // A scene amp may legitimately be solved all the way to silence; only
+                // the trade's BASE hold carries the fader floor.
+                LEVEL_MIN,
+            ),
         },
     )
 }
@@ -4781,7 +4710,6 @@ pub fn apply_headroom_trade(
         true, // defer: the batch's ONE save persists this with everything else
         true, // verify + bounded-secant correction — the fader is not predictable
         saved,
-        None, // absolute hold, never an offset row
         // ⟦4a⟧ THE HOLD'S FLOOR (danger.md: `outputLevel = 0` is deep digital silence) — the
         // solve that pays for the raise stops at `BASE_FADER_FLOOR`, reported as `TradeFloor`
         // below.
@@ -4943,8 +4871,6 @@ pub fn redistribute_clamped_headroom(
             outcomes.push(o);
             continue;
         }
-        // Absolute re-level (see `SceneSolve::eff_target`): a gain-budget change exists to
-        // restore each sound's own target, so no offset reference is threaded here.
         let result = jointk_one_scene(
             slot,
             job,
@@ -4953,7 +4879,6 @@ pub fn redistribute_clamped_headroom(
             true,
             true,
             saved,
-            None,
             LEVEL_MIN,
         );
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
@@ -5081,14 +5006,13 @@ fn run_scene_jobs(
         }
         on_scene(job.scene_slot, None);
         let t0 = std::time::Instant::now();
-        let eff_target = job.target_lufs;
 
         // A skip job (unclassifiable scene: mic/split lane/no active amp/…) is reported
         // as a failed outcome and the run continues — never aborts the whole pass.
         if let Some(reason) = &job.skip {
             let outcome = failed_scene_outcome(
                 job.scene_slot,
-                eff_target,
+                job.target_lufs,
                 reason.clone(),
                 t0.elapsed().as_millis(),
             );
@@ -5124,25 +5048,15 @@ fn run_scene_jobs(
                         }
                     }));
                 }
-                // Stamp the EFFECTIVE target the solve aimed at, not the requested one: an
-                // offset row solved against `requested + (asis − reference)`, so reporting
-                // the request would make every offset row read as missed BY the offset and
-                // would decide `clamped` on the wrong number. `target_offset_lu` carries
-                // the shift itself — the frontend cannot derive it, since the requested
-                // target it sent was also shifted by the playback compensation. It rides on
-                // the solve (`effective_scene_target` computed it) and is stamped
-                // unconditionally: a lane that didn't offset reports `None` itself.
-                let target_offset_lu = s.target_offset_lu;
-                let mut outcome =
-                    solved_scene_outcome(job.scene_slot, s.eff_target, s, t0.elapsed().as_millis());
-                outcome.target_offset_lu = target_offset_lu;
-                outcome
+                solved_scene_outcome(job.scene_slot, job.target_lufs, s, t0.elapsed().as_millis())
             }
             Err(e) if e == CANCELLED => {
                 stopped = true;
                 break;
             }
-            Err(e) => failed_scene_outcome(job.scene_slot, eff_target, e, t0.elapsed().as_millis()),
+            Err(e) => {
+                failed_scene_outcome(job.scene_slot, job.target_lufs, e, t0.elapsed().as_millis())
+            }
         };
         on_scene(job.scene_slot, Some(&outcome));
         outcomes.push(outcome);
@@ -5553,21 +5467,6 @@ struct SceneSolve {
     pinned: Option<PinnedBound>,
     /// Rebalance "verify by ear" flag; `false` for the plain joint-k path.
     verify_by_ear: bool,
-    /// The target this solve ACTUALLY aimed at — the job target for `Match`, the
-    /// offset-shifted one for [`SceneTargetMode::Offset`]. `run_scene_jobs` stamps THIS on
-    /// the outcome: reporting the requested target next to an offset-solved result would
-    /// make every offset row read as missed-by-the-offset (and `clamped` decide on the
-    /// wrong number).
-    eff_target: f64,
-    /// How far `eff_target` was SHIFTED from the requested one, straight from
-    /// [`effective_scene_target`] — `None` on a `Match` row, `Some(0.0)` on the reference row
-    /// itself. Carried rather than recovered by subtraction: `run_scene_jobs` stamps it
-    /// as-is, so the target mode is read in exactly one place.
-    target_offset_lu: Option<f64>,
-    /// The scene's AS-IS loudness at its authored knob value — the measurement every solve
-    /// starts from, harvested here so the batch can adopt the first one as the
-    /// [`SceneTargetMode::Offset`] reference without paying a capture for it.
-    asis: f64,
 }
 
 /// Max secant CORRECTIONS after the first apply, shared by every re-amp-measured solve
@@ -5645,58 +5544,17 @@ fn scene_at_target(measured: f64, target: f64, clamped: bool) -> bool {
     !clamped && (measured - target).abs() <= KNOB_TOL_LU
 }
 
-/// The target a scene is ACTUALLY solved against. [`SceneTargetMode::Match`] (and every
-/// pre-reference row, whose `reference_asis` is still `None`) takes the requested target
-/// verbatim; [`SceneTargetMode::Offset`] shifts it by this scene's authored distance from
-/// the reference sound, `asis − reference_asis`, so the relationship the player wrote is
-/// preserved instead of flattened. Both numbers are already in offset-adjusted CAPTURE
-/// space (the command added the playback compensation to `requested` before the job was
-/// stamped, and `asis` is a measurement) — the Fletcher–Munson offset must NOT be applied a
-/// second time here. Pure, so the arithmetic is unit-testable without a device.
-///
-/// Returns `(effective target, the shift applied)` — the shift as a VALUE, not a fact the
-/// runner has to rediscover by subtracting the two targets. This is the ONE place the target
-/// MODE is read: [`SceneSolve::target_offset_lu`] carries the answer up to `run_scene_jobs`,
-/// which stamps it unconditionally. `None` = a `Match` row (not offset-moded at all);
-/// `Some(0.0)` = an offset row that IS the reference, which keeps the two distinguishable on
-/// the wire.
-pub(crate) fn effective_scene_target(
-    mode: SceneTargetMode,
-    requested: f64,
-    asis: f64,
-    reference_asis: Option<f64>,
-) -> (f64, Option<f64>) {
-    match (mode, reference_asis) {
-        (SceneTargetMode::Offset, Some(reference)) => {
-            let shift = asis - reference;
-            (requested + shift, Some(shift))
-        }
-        // An offset row with no reference YET is the batch's reference: its own shift is 0 by
-        // definition and it lands on the plain target, exactly like a match row's — but it
-        // still REPORTS as offset-moded.
-        (SceneTargetMode::Offset, None) => (requested, Some(0.0)),
-        (SceneTargetMode::Match, _) => (requested, None),
-    }
-}
-
-/// What every per-scene solve opens with, whatever it then solves ON: the scene's as-is
-/// reading and the target that reading resolves.
+/// What every per-scene solve opens with: the scene's as-is reading.
 struct Prologue {
-    /// AS-IS loudness at the scene's authored knob values — the solve's starting point AND
-    /// the batch's [`SceneTargetMode::Offset`] reference candidate.
+    /// AS-IS loudness at the scene's authored knob values — the solve's starting point.
     asis: f64,
     /// Dynamics spread (LU) of that same capture.
     spread: f64,
-    /// The target this scene is ACTUALLY solved against (see [`effective_scene_target`]).
-    eff_target: f64,
-    /// How far `eff_target` was shifted from the requested one; `None` = not shifted.
-    target_offset_lu: Option<f64>,
 }
 
 /// The prologue BOTH per-scene lanes share (`jointk_one_scene` on the amp's `outputLevel`,
 /// `handle_one_scene` on the user's own control): ONE isolated fresh re-amp capture of the
-/// scene as-is — no write, no Scene Edit, nothing to undo — split into level + spread, then
-/// resolved into the scene's own effective target.
+/// scene as-is — no write, no Scene Edit, nothing to undo.
 ///
 /// What is deliberately NOT here is the already-at-target short-circuit, because the two
 /// lanes' skip TESTS genuinely differ (same `KNOB_TOL_LU` band, different clamp input):
@@ -5711,12 +5569,7 @@ struct Prologue {
 /// taken — the batch already paid this capture up front so it could plan the headroom trade
 /// against every ceiling at once. A job with no prepass measures here exactly as before, so
 /// the rebalance/redistribution/bench callers are untouched.
-fn scene_prologue(
-    job: &SceneJob,
-    stimulus: &[f32],
-    requested: f64,
-    reference_asis: Option<f64>,
-) -> Result<Prologue, String> {
+fn scene_prologue(job: &SceneJob, stimulus: &[f32]) -> Result<Prologue, String> {
     // Hard-error on a persistent flat read (after the retry). Trade-off, made
     // consciously: a real scene crushed by a limiter (the UA1176 case) with spread ≤ the
     // trip gate would false-error — but the library's Base minimum is 0.12 and without the
@@ -5729,14 +5582,7 @@ fn scene_prologue(
             (loudness.integrated_lufs, loudness.spread_lu())
         }
     };
-    let (eff_target, target_offset_lu) =
-        effective_scene_target(job.target_mode, requested, asis, reference_asis);
-    Ok(Prologue {
-        asis,
-        spread,
-        eff_target,
-        target_offset_lu,
-    })
+    Ok(Prologue { asis, spread })
 }
 
 impl Prologue {
@@ -5754,9 +5600,6 @@ impl Prologue {
             writes: 0,
             clamp_reason: None,
             verify_by_ear: false,
-            eff_target: self.eff_target,
-            target_offset_lu: self.target_offset_lu,
-            asis: self.asis,
         }
     }
 }
@@ -5777,15 +5620,13 @@ fn jointk_one_scene(
     defer: bool,
     verify: bool,
     saved: Option<&serde_json::Value>,
-    reference_asis: Option<f64>,
     // The knob-set's DOWNWARD bound (see [`joint_k_floor`]): `LEVEL_MIN` for every scene lane,
     // [`crate::headroom_trade::BASE_FADER_FLOOR`] for the headroom trade's base hold, which
     // may not solve the base amp into digital silence.
     floor: f32,
 ) -> Result<SceneSolve, String> {
-    let prologue = scene_prologue(job, stimulus, target_lufs, reference_asis)?;
+    let prologue = scene_prologue(job, stimulus)?;
     let (measured, spread) = (prologue.asis, prologue.spread);
-    let target_lufs = prologue.eff_target;
     let JointK {
         levels,
         clamped,
@@ -5871,9 +5712,6 @@ fn jointk_one_scene(
         writes,
         clamp_reason,
         verify_by_ear: false,
-        eff_target: target_lufs,
-        target_offset_lu: prologue.target_offset_lu,
-        asis: measured,
     })
 }
 
@@ -5985,9 +5823,9 @@ const SCENE_HANDLE_CORRECT_MAX: u32 = 8;
 /// becomes a per-scene failed outcome, never a write that leaks to base.
 ///
 /// AS-IS FIRST, exactly like `jointk_one_scene`: one `measure_scene_asis` capture (no write
-/// at all) supplies the [`SceneTargetMode::Offset`] reference AND the idempotency skip, and
-/// the solve then seeds from the param's own range. That is why `current_value` is `None`
-/// below — the solve's own idempotency probe would re-measure this very point.
+/// at all) supplies the idempotency skip, and the solve then seeds from the param's own
+/// range. That is why `current_value` is `None` below — the solve's own idempotency probe
+/// would re-measure this very point.
 ///
 /// The write is DEFERRED like every other scene write (`defer`), so the batch's single
 /// `save_deferred_scene_writes` persists it: ONE save per preset, unchanged.
@@ -6000,7 +5838,6 @@ fn handle_one_scene(
     target_lufs: f64,
     defer: bool,
     saved: Option<&serde_json::Value>,
-    reference_asis: Option<f64>,
 ) -> Result<SceneSolve, String> {
     // CLASS GATE, before any device work — the same refusal wording every lane shares.
     if let Some(refusal) = handle.refuse_if_not_a_level_control() {
@@ -6015,9 +5852,8 @@ fn handle_one_scene(
             ))
         }
     };
-    let prologue = scene_prologue(job, stimulus, target_lufs, reference_asis)?;
+    let prologue = scene_prologue(job, stimulus)?;
     let (asis, spread) = (prologue.asis, prologue.spread);
-    let target_lufs = prologue.eff_target;
     // Already there → leave the handle untouched (the scene lane's `scene_at_target` rule,
     // on its own acceptance band). No closed-form solve runs here, so there is no clamp flag
     // to feed it — unlike `jointk_one_scene`, whose flag exists by this point.
@@ -6074,9 +5910,6 @@ fn handle_one_scene(
         writes: solved.iterations + 1,
         clamp_reason: solved.clamp_reason,
         verify_by_ear: false,
-        eff_target: target_lufs,
-        target_offset_lu: prologue.target_offset_lu,
-        asis,
     })
 }
 
@@ -6454,16 +6287,22 @@ pub fn level_scenes_rebalance(
         on_scene,
         cancelled,
         |job| {
-            let eff_target = job.target_lufs;
             // Non-mergeable scenes: plain joint-k (nothing to rebalance), self-correcting.
             if !job.rebalanceable || job.knobs.len() < 2 {
                 jointk_one_scene(
-                    slot, job, stimulus, eff_target, save, true, saved, None, LEVEL_MIN,
+                    slot,
+                    job,
+                    stimulus,
+                    job.target_lufs,
+                    save,
+                    true,
+                    saved,
+                    LEVEL_MIN,
                 )
             } else {
                 // Rebalanceable: 2-lane equalize → joint-k. (Only the first two knobs are the
                 // rebalance pair; the classifier never produces >2 for a single split.)
-                rebalance_one_scene(slot, job, stimulus, eff_target, save, true, saved)
+                rebalance_one_scene(slot, job, stimulus, job.target_lufs, save, true, saved)
             }
         },
     );
@@ -6616,21 +6455,6 @@ fn rebalance_one_scene(
         writes: 1 + retry_writes + corr_writes,
         clamp_reason,
         verify_by_ear,
-        // The rebalance runner always re-establishes an ABSOLUTE target (that is what a
-        // gain-budget change exists to restore), so it never offsets — it feeds no reference
-        // and takes none, which is what the `None` reference below says. Routed through the
-        // same helper so the mode's wire reporting stays identical to the other lanes'
-        // rather than hard-coded here. `asis` is the BALANCED pair's combined reading — the
-        // only as-is number the flow has.
-        eff_target: target_lufs,
-        target_offset_lu: effective_scene_target(
-            job.target_mode,
-            target_lufs,
-            combined.integrated_lufs,
-            None,
-        )
-        .1,
-        asis: combined.integrated_lufs,
     })
 }
 
@@ -6662,9 +6486,6 @@ fn solved_scene_outcome(
         clamp_reason: s.clamp_reason,
         verify_by_ear: s.verify_by_ear,
         persist_mismatch: None,
-        // Stamped by `run_scene_jobs`, which is the only caller that holds the REQUESTED
-        // target this effective one was shifted from.
-        target_offset_lu: None,
     }
 }
 
@@ -6691,7 +6512,6 @@ fn failed_scene_outcome(
         clamp_reason: None,
         verify_by_ear: false,
         persist_mismatch: None,
-        target_offset_lu: None,
     }
 }
 
@@ -6858,7 +6678,6 @@ pub fn level_preset_block(
             previous_level: None,
             true_peak_dbtp: None,
             persist_mismatch: None,
-            target_offset_lu: None,
             trade: None,
         })
     })();
@@ -8611,55 +8430,6 @@ mod tests {
     }
 
     /// A synthetic loudness reading for the injected-capture footswitch tests.
-    // ── Scene target modes (the offset rule, pure) ──────────────────────────────────
-
-    // `Match` is the default and the pre-existing behavior: every scene solves to the job
-    // target verbatim, whatever it measured and whatever the reference is.
-    #[test]
-    fn match_mode_ignores_the_as_is_reading_and_the_reference() {
-        assert_eq!(
-            effective_scene_target(SceneTargetMode::Match, -23.0, -14.0, Some(-19.0)),
-            (-23.0, None),
-            "no shift applied, and the row reports none"
-        );
-    }
-
-    // `Offset` preserves the AUTHORED relationship: a scene the player wrote 4 LU above the
-    // reference sound stays 4 LU above the target; one written 6 LU below stays 6 below.
-    #[test]
-    fn offset_mode_preserves_each_scenes_distance_from_the_reference() {
-        let reference = Some(-19.0);
-        // The SHIFT rides out WITH the target — the runner stamps it rather than recovering
-        // it by subtracting the requested target back off.
-        let (louder, louder_shift) =
-            effective_scene_target(SceneTargetMode::Offset, -23.0, -15.0, reference);
-        assert!(
-            (louder - (-19.0)).abs() < 1e-9,
-            "a scene 4 LU LOUDER than the reference solves 4 LU above target"
-        );
-        assert!((louder_shift.expect("shift reported") - 4.0).abs() < 1e-9);
-        let (quieter, quieter_shift) =
-            effective_scene_target(SceneTargetMode::Offset, -23.0, -25.0, reference);
-        assert!(
-            (quieter - (-29.0)).abs() < 1e-9,
-            "a scene 6 LU QUIETER than the reference solves 6 LU below target"
-        );
-        assert!((quieter_shift.expect("shift reported") - (-6.0)).abs() < 1e-9);
-    }
-
-    // The REFERENCE row itself (and every row measured before one exists — e.g. after the
-    // first row's measurement failed) lands on the plain target: its own offset is 0 by
-    // definition, so an offset batch's first sound is leveled exactly like a match batch's.
-    #[test]
-    fn offset_mode_without_a_reference_yet_is_the_plain_target() {
-        assert_eq!(
-            effective_scene_target(SceneTargetMode::Offset, -23.0, -15.0, None),
-            (-23.0, Some(0.0)),
-            "the reference row's own offset is 0 by definition — reported as a zero shift, \
-             not as `None` (which means the row isn't offset-moded at all)"
-        );
-    }
-
     fn fs_loud(integrated: f64) -> lufs::Loudness {
         lufs::Loudness {
             integrated_lufs: integrated,
@@ -9559,7 +9329,6 @@ mod reordered_run_tests {
             knobs,
             skip: None,
             rebalanceable: false,
-            target_mode: SceneTargetMode::Match,
             handle: None,
             prepass: None,
         }
@@ -9580,23 +9349,9 @@ mod reordered_run_tests {
     #[test]
     fn a_job_carrying_a_prepass_reading_resolves_without_measuring() {
         let j = measured(job(2, -18.0, vec![knob("amp", Some(2), 0.5)]), -21.25, 4.5);
-        let p = scene_prologue(&j, &[], j.target_lufs, None).expect("no device work");
+        let p = scene_prologue(&j, &[]).expect("no device work");
         assert!((p.asis - -21.25).abs() < 1e-9, "{}", p.asis);
         assert!((p.spread - 4.5).abs() < 1e-9);
-        assert!((p.eff_target - -18.0).abs() < 1e-9);
-        assert_eq!(p.target_offset_lu, None);
-    }
-
-    // The prepass reading feeds the OFFSET reference exactly like the inline capture did —
-    // hoisting the measurement must not change what a target mode means.
-    #[test]
-    fn a_prepass_reading_still_drives_the_offset_reference() {
-        let mut j = measured(job(3, -20.0, vec![knob("amp", Some(3), 0.5)]), -16.0, 3.0);
-        j.target_mode = SceneTargetMode::Offset;
-        let p = scene_prologue(&j, &[], j.target_lufs, Some(-20.0)).expect("no device work");
-        // Authored 4 LU above the reference ⇒ solved 4 LU above the requested target.
-        assert!((p.eff_target - -16.0).abs() < 1e-9, "{}", p.eff_target);
-        assert_eq!(p.target_offset_lu, Some(4.0));
     }
 
     // The amp-fader ceiling IS an exact extrapolation: `outputLevel` is linear in dB with

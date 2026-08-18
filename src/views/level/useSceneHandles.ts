@@ -2,7 +2,8 @@
 // candidate cache (moved out of SetupBody: a lazy, fetch-once-per-mount tri-state
 // cache — `list_scene_level_handles` is a real device read, so it fires on first
 // open of any row's picker, once per PRESET, never eagerly; Set up otherwise does
-// no device reads).
+// no device reads). A thin wrapper over `useLazySlotCache` — see that hook for the
+// shared fetch/cache mechanics and its no-self-heal-within-a-mount contract.
 //
 // `candidatesFor` returns an EXPLICIT fetch-state discriminant rather than
 // `SceneHandleCandidate[] | "loading" | "error" | undefined` — the old shape let a
@@ -11,27 +12,24 @@
 // VALID handle rendered "(removed)" until the fetch resolved (BUG→GATE). Naming
 // "unfetched" as its own state is what SceneLevelPick derives BOTH `stale` and
 // `triggerLabel` from now — see that component.
-//
-// No self-heal: an "error" result for a slot is cached for the rest of THIS
-// mount (`fetchedSlotsRef` marks the slot fetched even on failure) — re-opening
-// the wizard (a fresh SetupBody mount) is the only retry path. Same behavior as
-// the pre-hook code; documented here because it's easy to assume a picker retry
-// re-fetches.
-
-import { useRef, useState } from "react";
 
 import { listSceneLevelHandles } from "../../lib/invoke";
 import type { SceneHandleRow, SceneHandleCandidate } from "../../lib/types";
+import { useLazySlotCache } from "./useLazySlotCache";
 
 export type HandleFetchState =
   | { status: "unfetched" }
   | { status: "loading" }
   | { status: "error" }
-  | { status: "resolved"; candidates: SceneHandleCandidate[] };
-
-const UNFETCHED: HandleFetchState = { status: "unfetched" };
-const LOADING: HandleFetchState = { status: "loading" };
-const ERROR: HandleFetchState = { status: "error" };
+  | {
+      status: "resolved";
+      /** The safe-preselect list: level-safe candidates only, never `"other"`. */
+      candidates: SceneHandleCandidate[];
+      /** EVERY numeric control of every block in this scene, class-annotated and
+       *  level-class first — the combined block+param picker's source (a superset of
+       *  `candidates`). */
+      allCandidates: SceneHandleCandidate[];
+    };
 
 export interface UseSceneHandlesResult {
   /** Fire the lazy fetch for `slot`'s scene-handle rows. Idempotent — safe to call
@@ -42,32 +40,18 @@ export interface UseSceneHandlesResult {
 }
 
 export function useSceneHandles(): UseSceneHandlesResult {
-  const [handlesBySlot, setHandlesBySlot] = useState<
-    Partial<Record<number, SceneHandleRow[] | "loading" | "error">>
-  >({});
-  const fetchedSlotsRef = useRef(new Set<number>());
-
-  const prefetch = (slot: number) => {
-    if (fetchedSlotsRef.current.has(slot)) return;
-    fetchedSlotsRef.current.add(slot);
-    setHandlesBySlot((p) => ({ ...p, [slot]: "loading" }));
-    listSceneLevelHandles(slot)
-      .then((rows) => {
-        setHandlesBySlot((p) => ({ ...p, [slot]: rows }));
-      })
-      .catch(() => {
-        setHandlesBySlot((p) => ({ ...p, [slot]: "error" }));
-      });
-  };
+  const { prefetch, listFor } = useLazySlotCache(listSceneLevelHandles);
 
   const candidatesFor = (slot: number, sceneSlot: number): HandleFetchState => {
-    const v = handlesBySlot[slot];
-    if (v === undefined) return UNFETCHED;
-    if (v === "loading") return LOADING;
-    if (v === "error") return ERROR;
+    const st = listFor(slot);
+    if (st.status !== "resolved") return st;
+    const row: SceneHandleRow | undefined = st.list.find(
+      (r) => r.sceneSlot === sceneSlot,
+    );
     return {
       status: "resolved",
-      candidates: v.find((r) => r.sceneSlot === sceneSlot)?.candidates ?? [],
+      candidates: row?.candidates ?? [],
+      allCandidates: row?.allCandidates ?? [],
     };
   };
 

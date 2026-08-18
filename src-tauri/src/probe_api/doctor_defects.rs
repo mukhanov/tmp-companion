@@ -387,7 +387,9 @@ pub fn probe_doctor_fs(slot: u32, switch: u32) -> Result<String, String> {
         "guitar-humbucker",
     )?)?);
     let _reamp_off = super::ReampOffGuard;
-    let (preset, _, _) = crate::read_slot_preset_parsed(slot)?;
+    // The whole capture IS the switch's isolation state — a body cut before `ftsw` would
+    // silently capture the preset as-loaded and print verdicts for the wrong sound.
+    let (preset, _, _) = crate::read_slot_preset_complete(slot, &["ftsw"])?;
     let null = serde_json::Value::Null;
     let ftsw = preset.get("ftsw").unwrap_or(&null);
     let fb = crate::commands::doctor::doctor_force_bypass(ftsw, &preset, Some(switch));

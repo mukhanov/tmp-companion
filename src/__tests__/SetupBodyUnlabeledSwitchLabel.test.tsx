@@ -58,7 +58,16 @@ function fsOption(over: Partial<SetupOption> = {}): SetupOption {
     sceneName: "Boost",
     tag: "FS3",
     hasScenes: true,
-    footswitch: { switchIndex: 2, mode: "verify" },
+    // D2: every footswitch row already carries a real handle — the tone-safe DEFAULT
+    // (the Boost's `gain`, the block the row is currently named after), same as
+    // `chosenFrom` seeds it. `sceneContext: null` (D3) = the base sound.
+    footswitch: {
+      switchIndex: 2,
+      levGroupId: "G1",
+      levNodeId: "ACD_Boost",
+      levParameterId: "gain",
+      sceneContext: null,
+    },
     levelParams: [boostGain, screamerLevel],
     fsUnlabeled: true,
     ...over,
@@ -87,11 +96,10 @@ async function pickTubeScreamerAndStart(option: SetupOption) {
     </ThemeProvider>,
   );
   const user = userEvent.setup();
-  // Opt the row in to LEVEL mode. The picker opens on the tone-safe DEFAULT — the Boost's
-  // `gain` — which is also the block the row is currently named after.
-  await user.click(screen.getByText("Make level-neutral"));
-  await user.click(screen.getByText("Gain"));
-  // Override it with the OTHER block's `level`.
+  // Every row levels now (D2 — no "Make level-neutral" opt-in any more). Open the
+  // combined block+param picker, currently on the tone-safe DEFAULT (Boost · Gain)…
+  await user.click(screen.getByTitle("Choose this sound's leveling control"));
+  // …and override it with the OTHER block's `level`.
   await user.click(await screen.findByText("Level"));
   // The backup acknowledgment gates the primary button on a fresh run.
   await user.click(screen.getByText(/I.ve backed up with Pro Control/i));
@@ -109,7 +117,7 @@ describe("SetupBody — label provenance for an unlabeled footswitch", () => {
       switchIndex: 2,
       levNodeId: "ACD_TubeScreamer",
       levParameterId: "level",
-      mode: "level",
+      sceneContext: null,
     });
     // …and the name that becomes `displayLabel` names THAT block, not the default Boost.
     expect(choice.option.sceneName).toBe("Tube Screamer");

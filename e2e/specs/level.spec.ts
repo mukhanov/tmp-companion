@@ -139,13 +139,11 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     await expect(
       page.getByText(/levels this scene against/).first(),
     ).toBeVisible(); // a footswitch SCENE
-    // Footswitch rows default to VERIFY-only (measure ON/OFF, write nothing) — the
-    // "evens this footswitch out to your target" copy only appears once a row opts
-    // into LEVEL mode via "Make level-neutral".
+    // PR #144: the verify-only footswitch mode is gone — every block-acting FOOTSWITCH
+    // row now levels (the same "evens out" copy every such row carries, distinct from a
+    // scene row's "levels this scene against the preset's base").
     await expect(
-      page
-        .getByText(/measures this footswitch.s ON.OFF loudness difference/)
-        .first(),
+      page.getByText(/evens this footswitch out to your target/).first(),
     ).toBeVisible(); // a block-acting FOOTSWITCH
     // The bake/assign mechanism is never surfaced.
     await expect(page.getByText(/baked|assigned/i)).toHaveCount(0);

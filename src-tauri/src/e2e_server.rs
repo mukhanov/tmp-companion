@@ -240,9 +240,12 @@ fn e2e_install_offline_fake() {
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim); // expose its event log to /sim/events
     crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sim.clone())));
-    // The 6 scenario presets at slots 400-405 — same slots the online tier seeds by
+    // The 10 scenario presets at slots 400-409 — same slots the online tier seeds by
     // cloning, and the same presets baked into the backup fixture, so one set of specs
     // runs in both modes. `ensureScenario` finds them present offline and skips seeding.
+    // Keep this list in sync with `e2e/fixtures/scenario.ts`'s `SCENARIO` array (and the
+    // twin inline snapshot `e2e_server_tests.rs` builds for its own in-process tests) —
+    // nothing derives one from the other.
     let presets = vec![
         session::PresetEntry {
             slot: 400,
@@ -268,10 +271,26 @@ fn e2e_install_offline_fake() {
             slot: 405,
             name: "E2E Preset24".into(),
         },
+        session::PresetEntry {
+            slot: 406,
+            name: "E2E Combined Level".into(),
+        },
+        session::PresetEntry {
+            slot: 407,
+            name: "E2E Doctor Oracle".into(),
+        },
+        session::PresetEntry {
+            slot: 408,
+            name: "E2E Preset24 Min".into(),
+        },
+        session::PresetEntry {
+            slot: 409,
+            name: "E2E Hiwatt Min".into(),
+        },
     ];
     // Hero graph, decoded from the SAME backup fixture `read_library_via_backup` already
     // serves — the showcase installer below does the identical thing for its curated `.bin`.
-    // The fixture holds ONLY the 5 scenario presets (device slots 401-405, list 400-404), so
+    // The fixture holds all 10 scenario presets (device slots 401-410, list 400-409), so
     // the hero is simply its first entry; there is no preset 001 offline to prefer.
     //
     // Not cosmetic: with the snapshot's graph `None`, the frontend's `startScanAfterGraph`

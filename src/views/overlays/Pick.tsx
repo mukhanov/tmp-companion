@@ -43,6 +43,10 @@ export interface PickProps {
    *  presets both already showing "Lead"); the attribute selector has no such collision
    *  and doesn't depend on DOM append order. */
   tid?: string;
+  /** Fired once the menu has opened — a lazy per-preset fetch trigger (e.g. the
+   *  footswitch scene-context picker's `list_footswitch_scene_contexts`). Idempotent,
+   *  safe to call on every open. Omit for a Pick whose options need no device read. */
+  onOpen?: () => void;
 }
 
 export function Pick({
@@ -53,11 +57,12 @@ export function Pick({
   title,
   muted,
   tid,
+  onOpen,
 }: PickProps) {
   const { t } = useTheme();
   const cardRef = useContext(DialogCardCtx);
   const { open, anchor, pos, cardEl, menuRef, triggerRef, openMenu, close } =
-    usePickAnchor(cardRef);
+    usePickAnchor(cardRef, { onOpen });
   // `options[0]` is `PickOption | undefined` at runtime (the array can be empty), but
   // this tsconfig has no `noUncheckedIndexedAccess` — spell the real type out so the
   // empty-list fallback below isn't seen as redundant.

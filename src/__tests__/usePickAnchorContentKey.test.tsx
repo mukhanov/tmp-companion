@@ -3,11 +3,12 @@
 //
 // BUG→GATE. `usePickAnchor`'s measure/place layout effect depended only on `[open, anchor]`,
 // both fixed at `openMenu` time, while what it measures is `menuRef.current.offsetHeight`.
-// `SceneLevelPick` is the one picker whose body lands LATE: opening fires the lazy
-// per-preset candidate read, so the first paint is a one-line "Loading controls…" and the
-// real list appears a moment later. The placement therefore stayed the skeleton's — a tall
-// candidate list rendered straight off the bottom edge of the wizard card, never clamped
-// and never flipped above the trigger, with its rows unreachable.
+// `BlockLevelPick` (Scene/Base rows' combined block+param picker, D2) is the one picker
+// whose body lands LATE: opening fires the lazy per-preset candidate read, so the first
+// paint is a one-line "Loading controls…" and the real list appears a moment later. The
+// placement therefore stayed the skeleton's — a tall candidate list rendered straight off
+// the bottom edge of the wizard card, never clamped and never flipped above the trigger,
+// with its rows unreachable.
 //
 // The proxy this asserts is the menu's own `top`, which IS the effect's only output. The
 // trigger is placed low in the card on purpose: a short menu fits below it (no flip), a
@@ -20,10 +21,12 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
-import { SceneLevelPick } from "../views/overlays/SceneLevelPick";
+import { BlockLevelPick } from "../views/overlays/BlockLevelPick";
 import { WithCard } from "./pickCardTestUtils";
-import type { HandleFetchState } from "../views/level/useSceneHandles";
-import type { SceneHandleCandidate } from "../lib/types";
+import type {
+  BlockLevelFetch,
+  BlockLevelCandidate,
+} from "../views/overlays/BlockLevelPick";
 
 const CARD_H = 400;
 const CARD_W = 400;
@@ -81,7 +84,8 @@ function stubLayout() {
   Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
     configurable: true,
     get(this: HTMLElement) {
-      // Chrome (mode rows + the amp default) plus one row per rendered candidate.
+      // Chrome (the pseudo-option row + section header) plus one row per rendered
+      // candidate.
       const rows = this.querySelectorAll("[data-block-param-pick]").length;
       return 120 + rows * 60;
     },
@@ -105,16 +109,12 @@ function stubLayout() {
   };
 }
 
-const candidate = (nodeId: string): SceneHandleCandidate => ({
+const candidate = (nodeId: string): BlockLevelCandidate => ({
   groupId: "G1",
   nodeId,
   fenderId: "ACD_TwinReverb65NoFx",
   parameterId: "outputLevel",
-  class: "level_linear",
-  range: [0, 1],
-  current: 0.5,
-  scope: "isolated",
-  headroom: "full",
+  paramClass: "level_linear",
 });
 
 /** The portaled menu is the only `position: absolute` div carrying a `min-width`. */
@@ -131,12 +131,11 @@ describe("usePickAnchor — a menu whose content arrives after the open", () => 
     const restore = stubLayout();
     try {
       const user = userEvent.setup();
-      const props = (candidates: HandleFetchState) => (
+      const props = (candidates: BlockLevelFetch) => (
         <ThemeProvider>
           <WithCard>
-            <SceneLevelPick
-              targetMode="match"
-              onTargetModeChange={vi.fn()}
+            <BlockLevelPick
+              pseudoLabel="Amp output level"
               handle={null}
               onHandleChange={vi.fn()}
               candidates={candidates}
@@ -147,7 +146,7 @@ describe("usePickAnchor — a menu whose content arrives after the open", () => 
       );
 
       const { rerender } = render(props({ status: "loading" }));
-      await user.click(screen.getByText("Amp · match target"));
+      await user.click(screen.getByText("Amp output level"));
       await screen.findByText("Loading controls…");
 
       // Skeleton: 120px tall against a trigger at y 300-326 in a 400px card, so the hook
@@ -161,7 +160,7 @@ describe("usePickAnchor — a menu whose content arrives after the open", () => 
       rerender(
         props({
           status: "resolved",
-          candidates: ["a", "b", "c", "d"].map(candidate),
+          list: ["a", "b", "c", "d"].map(candidate),
         }),
       );
       await screen.findAllByText("Output level");

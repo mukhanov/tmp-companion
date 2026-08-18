@@ -223,9 +223,7 @@ function footswitchResultStub(over: Record<string, unknown> = {}) {
     dynamic_spread_lu: null,
     method: "baked",
     persist_mismatch: null,
-    // Set only on a VERIFY row (see `on_off_delta_lu`'s doc); a LEVEL row's default
-    // here is null — override it for a verify-row test.
-    on_off_delta_lu: null,
+    clamp_kind: null,
     ...over,
   };
 }
@@ -242,6 +240,7 @@ const SOLO_FOOTSWITCH = {
       fender_id: "ACD_BluesDriver",
       parameter_id: "gain",
       current: 0.5,
+      class: "level_linear",
     },
   ],
 };
@@ -256,8 +255,6 @@ function mockLevelingFixture(
     footswitch?: boolean;
     /** Put an envelope filter in the preset's block roster (the "envelope" cause). */
     envelopeBlock?: boolean;
-    /** The mocked `level_footswitches_apply` VERIFY-row delta (LU). */
-    verifyDeltaLu?: number;
   } = {},
 ) {
   vi.mocked(invoke).mockImplementation((command: string, args?: unknown) => {
@@ -310,30 +307,21 @@ function mockLevelingFixture(
           setlist_songs: [],
         });
       case "level_footswitches_apply": {
+        // Every row levels now (D2 — the backend removed the verify-only mode
+        // entirely), so every job resolves the same way.
         const job = args as {
-          jobs: { switch: number; mode?: string }[];
+          jobs: { switch: number }[];
           onResult?: { onmessage?: (item: unknown) => void };
         };
-        // Mirror the backend contract per-job: a VERIFY row's result carries
-        // `on_off_delta_lu` (and writes nothing); a LEVEL row solves + writes as
-        // before. `on_off_delta_lu` is the discriminator the frontend reads.
-        const resultFor = (mode: string | undefined) =>
-          mode === "verify"
-            ? footswitchResultStub({
-                on_off_delta_lu: opts.verifyDeltaLu ?? 2.3,
-                saved: false,
-                final_value: 0,
-              })
-            : footswitchResultStub();
         job.jobs.forEach((j) => {
           job.onResult?.onmessage?.({
             switch: j.switch,
             status: "done",
-            result: resultFor(j.mode),
+            result: footswitchResultStub(),
             message: null,
           });
         });
-        return Promise.resolve(job.jobs.map((j) => resultFor(j.mode)));
+        return Promise.resolve(job.jobs.map(() => footswitchResultStub()));
       }
       case "level_preset":
         return Promise.resolve(
@@ -556,43 +544,6 @@ describe("LevelView — full leveling wizard e2e", () => {
     expect(sceneJobs.map((j) => j.targetLufs)).toEqual([-26, -26]);
   });
 
-  // P2: the scene row's combined target-mode + control picker — picking "Keep its
-  // offset" must ride the dispatched `level_scenes_apply_batched` job's `targetMode`.
-  it("a scene's 'Keep its offset' pick sends targetMode:offset on the dispatched job", async () => {
-    mockLevelingFixture();
-    renderView(true);
-    const user = userEvent.setup();
-    await screen.findByText("Plexi");
-    await screen.findByText("2 scenes");
-    await user.click(screen.getByTitle("Show Base Preset + sounds"));
-    await user.click(await screen.findByText("Rhythm")); // tick just this one scene
-    await user.click(
-      await screen.findByRole("button", { name: /level 1 preset/i }),
-    );
-    await ackBackup(user);
-    expect(
-      await screen.findByText("Set instrument & target"),
-    ).toBeInTheDocument();
-    // Default trigger reads "Amp · match target" until changed.
-    await user.click(await screen.findByText("Amp · match target"));
-    await user.click(await screen.findByText("Keep its offset"));
-    await user.click(screen.getByRole("button", { name: /level 1 sound/i }));
-    expect(
-      await screen.findByText(/checked|leveled/, undefined, { timeout: 3000 }),
-    ).toBeInTheDocument();
-    const sceneCalls = vi
-      .mocked(invoke)
-      .mock.calls.filter(([cmd]) => cmd === "level_scenes_apply_batched");
-    expect(sceneCalls).toHaveLength(1);
-    const sceneJobs = (
-      sceneCalls[0][1] as {
-        jobs: { sceneSlot: number; targetMode?: string }[];
-      }
-    ).jobs;
-    expect(sceneJobs).toHaveLength(1);
-    expect(sceneJobs[0].targetMode).toBe("offset");
-  });
-
   it("re-leveling the same preset re-issues device commands (no stale cross-run cache)", async () => {
     // Staleness invariant: after a run writes new levels the connect-time backup is
     // stale for those slots, so a second run on the SAME preset must re-issue the
@@ -779,23 +730,13 @@ describe("LevelView — full leveling wizard e2e", () => {
     expect(
       await screen.findByText("Set instrument & target"),
     ).toBeInTheDocument();
-    // P2 default: a footswitch row starts VERIFY-only (never a silent auto-pick-and-
-    // write) — the sub-text says so until the user opts in.
-    expect(
-      screen.getByText("measures this footswitch's ON/OFF loudness difference"),
-    ).toBeInTheDocument();
-    // Opt in to LEVEL mode ("Make level-neutral") — this is the explicit per-row pick
-    // the P2 spec requires before anything gets written.
-    await user.click(screen.getByText("Make level-neutral"));
+    // D2: every row levels now (the verify-only default + "Make level-neutral" opt-in
+    // are gone) — the sub-text says so, and the row already carries a real handle
+    // (SOLO_FOOTSWITCH's one candidate, tone-safe-classified `level_linear`) with no
+    // picker interaction required.
     expect(
       screen.getByText("evens this footswitch out to your target"),
     ).toBeInTheDocument();
-    // SOLO_FOOTSWITCH's only candidate ("gain" on a non-amp block) classifies as
-    // "other" (tone-affecting, not a level control) — `defaultParamIndex` correctly
-    // refuses to auto-pick it (D6's no-silent-default rule), so the picker shows an
-    // explicit "Choose a parameter" prompt (D5's guard) the user must click through.
-    await user.click(screen.getByText("Choose a parameter"));
-    await user.click(await screen.findByText("Gain"));
     await user.click(screen.getByRole("button", { name: /level 1 sound/i }));
     expect(
       await screen.findByText("All 1 sound leveled", undefined, {
@@ -816,45 +757,6 @@ describe("LevelView — full leveling wizard e2e", () => {
     // The bake/assign `method` is never surfaced to the user.
     expect(screen.queryByText(/baked/i)).toBeNull();
     expect(screen.queryByText(/assigned/i)).toBeNull();
-  });
-
-  // P2: a footswitch row left at its VERIFY default (no "Make level-neutral" click)
-  // dispatches a `mode: "verify"` job with NO lev* keys, writes nothing, and the
-  // summary reports the measured ON/OFF delta — never "leveled".
-  it("a footswitch row left at its VERIFY default sends mode:verify and reports the delta, never leveled", async () => {
-    mockLevelingFixture({ footswitch: true, verifyDeltaLu: 2.3 });
-    renderView(true);
-    const user = userEvent.setup();
-    await screen.findByText("Plexi");
-    await user.click(screen.getByTitle("Show Base Preset + sounds"));
-    await user.click(await screen.findByText("Solo"));
-    await user.click(
-      await screen.findByRole("button", { name: /level 1 preset/i }),
-    );
-    await ackBackup(user);
-    expect(
-      await screen.findByText("Set instrument & target"),
-    ).toBeInTheDocument();
-    // Left untouched — no "Make level-neutral" click.
-    expect(
-      screen.getByText("measures this footswitch's ON/OFF loudness difference"),
-    ).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /level 1 sound/i }));
-    expect(
-      await screen.findByText("+2.3 LU vs off", undefined, { timeout: 3000 }),
-    ).toBeInTheDocument();
-    // Honest summary copy — a verify-only run never claims "leveled".
-    expect(screen.queryByText(/All 1 sound leveled/)).toBeNull();
-    expect(fired("level_footswitches_apply")).toBe(true);
-    const fsArgs = vi
-      .mocked(invoke)
-      .mock.calls.find(([cmd]) => cmd === "level_footswitches_apply")?.[1] as
-      { jobs: Record<string, unknown>[] } | undefined;
-    const job = fsArgs?.jobs[0];
-    expect(job?.mode).toBe("verify");
-    expect(job).not.toHaveProperty("levGroupId");
-    expect(job).not.toHaveProperty("levNodeId");
-    expect(job).not.toHaveProperty("levParameterId");
   });
 
   // ── BUG-3: a Stop pressed during the LAST item must mark the run stopped ──────

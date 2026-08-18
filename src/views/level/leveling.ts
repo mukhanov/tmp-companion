@@ -15,6 +15,7 @@
 // commit) → run (steps the chosen scenes) → summary.
 
 import type {
+  ClampKind,
   FootswitchInfo,
   LevelJob,
   LevelParamCandidate,
@@ -22,6 +23,7 @@ import type {
   Profile,
   SceneInfo,
   SilenceHint,
+  TradeSummary,
 } from "../../lib/types";
 import type { PresetRow } from "../PresetList";
 import type { PickOption } from "../overlays/Pick";
@@ -31,7 +33,7 @@ import type { PickOption } from "../overlays/Pick";
 // either module without a second, driftable copy.
 import type { SceneHandlePick } from "../../lib/invoke";
 import { shortFallback } from "../../models/blockArt";
-import { signedDb, slotLabel } from "../../lib/format";
+import { slotLabel } from "../../lib/format";
 
 export type { SceneHandlePick };
 
@@ -66,36 +68,23 @@ export function childKeys(
   ];
 }
 
-/** The leveling coordinates a footswitch row carries into `levelFootswitchesApply`:
- *  the `ftsw` switch index + (in LEVEL mode) the block param to solve. Built from
- *  `FootswitchInfo` (switch + a chosen level candidate).
- *
- *  A discriminated union on `mode`, not three independently-nullable `lev*` fields —
- *  the old shape let `{mode:"verify", levGroupId:"x"}` exist at the type level,
- *  forcing every consumer to triple-null-check instead of narrowing on `mode`. LEVEL
- *  mode's three coords are always ALL present together (mirrors the backend's
- *  `FsJobMode`, which never sends a partial handle either).
- *
- *  `switchIndex` stays populated in BOTH branches, so `it.footswitch != null` keeps
- *  meaning "this is a footswitch row" everywhere it's checked (`ceilingOf`, the run
- *  loop's dispatch) regardless of whether the row has a handle yet. */
-export type FootswitchTarget =
-  | {
-      /** "verify" — measure engaged vs disengaged, write nothing (the P2 default: a
-       *  row is only WRITTEN once the user has explicitly given it a handle in Set
-       *  up, never silently on a tone-safe auto-pick). */
-      mode: "verify";
-      /** 0-based `ftsw` array index (the wire footswitch address). */
-      switchIndex: number;
-    }
-  | {
-      /** "level" — solve + write the handle below (opt-in). */
-      mode: "level";
-      switchIndex: number;
-      levGroupId: string;
-      levNodeId: string;
-      levParameterId: string;
-    };
+/** The leveling coordinates a footswitch row carries into `levelFootswitchesApply`: the
+ *  `ftsw` switch index + the block param to solve + the scene context it is measured in
+ *  (D3). Every row levels now — the old verify-only "no handle" mode is gone backend-side
+ *  ("every row levels" — `FootswitchLevelJob`'s doc), so this is a plain shape, not a
+ *  discriminated union. */
+export interface FootswitchTarget {
+  /** 0-based `ftsw` array index (the wire footswitch address). */
+  switchIndex: number;
+  levGroupId: string;
+  levNodeId: string;
+  levParameterId: string;
+  /** THE SCENE CONTEXT this switch's sound is measured and solved in (D3): a 0-based
+   *  `scenes[]` wire slot, or `null` = the preset's BASE sound (the historical default).
+   *  `null` until `list_footswitch_scene_contexts` resolves the picker's `suggested`
+   *  scene AND the user (or the picker's own default-fill) picks it. */
+  sceneContext: number | null;
+}
 
 /** Rank a candidate's WIRE-CARRIED class for `defaultParamIndex`: a genuine level
  *  control (linear or dB) ranks above a wet/dry mix (which changes loudness but also
@@ -161,10 +150,12 @@ export function instCalState(
   return o.calibrated ? "cal" : "uncal";
 }
 
-/** Build a LEVEL-mode target from a specific candidate (the user's explicit pick). The
- *  backend classifies bake vs assign from these ids. */
+/** Build a footswitch target from a specific candidate (the user's explicit pick, or the
+ *  tone-safe default). The backend classifies bake vs assign from these ids.
+ *  `sceneContext` — see `FootswitchTarget.sceneContext` (D3); `null` = base. */
 export function targetFromCandidate(
   switchIndex: number,
+  sceneContext: number | null,
   c: LevelParamCandidate,
 ): FootswitchTarget {
   return {
@@ -172,14 +163,8 @@ export function targetFromCandidate(
     levGroupId: c.group_id,
     levNodeId: c.node_id,
     levParameterId: c.parameter_id,
-    mode: "level",
+    sceneContext,
   };
-}
-
-/** Build a VERIFY-mode target (no handle) — the row's default until the user opts in
- *  with an explicit pick. */
-export function verifyFootswitchTarget(switchIndex: number): FootswitchTarget {
-  return { switchIndex, mode: "verify" };
 }
 
 /** The display footswitch number for a switch index (human FS tag = index + 1 — the
@@ -255,16 +240,18 @@ export function footswitchName(f: FootswitchInfo): string {
   return "Footswitch";
 }
 
-/** Resolve a levelable footswitch's DEFAULT row target: VERIFY (P2 — a row is only
- *  ever written once the user has explicitly given it a handle in Set up; the old
- *  auto-pick-and-write default is gone). `null` when the footswitch has no leveling
- *  candidate at all (it should have been filtered out upstream — nothing to verify OR
- *  level). */
+/** Resolve a levelable footswitch's DEFAULT row target: the tone-safe default candidate
+ *  (D2 — every row levels against a combined block+param dropdown, best candidate
+ *  pre-selected), base scene context (D3's `suggested` scene isn't known synchronously —
+ *  the combined picker's lazy fetch fills it in once opened). `null` when the footswitch
+ *  has no leveling candidate at all (it should have been filtered out upstream). */
 function footswitchTarget(f: FootswitchInfo): FootswitchTarget | null {
   // Length-guard rather than `!candidate` — the array index type lies (no
   // noUncheckedIndexedAccess), so the truthiness check reads as "always truthy".
   if (f.level_params.length === 0) return null;
-  return verifyFootswitchTarget(f.switch);
+  const idx = defaultParamIndex(f.level_params);
+  if (idx < 0) return null;
+  return targetFromCandidate(f.switch, null, f.level_params[idx]);
 }
 
 // ── setup: one selectable row (Base or an FS scene) ─────────────────────────
@@ -303,13 +290,27 @@ export interface SetupOption {
    *  (`SetupBody.start`), or the unit ends up labelled after a block the run never touched.
    *  A LABELED switch is never renamed: that string is the player's, not ours. */
   fsUnlabeled?: boolean;
-  /** Scene rows only: this row's target-mode pick ("match" every scene solves to the
-   *  named target — the default when absent; "offset" preserves the scene's authored
-   *  loudness RELATIONSHIP). Undefined for Base/footswitch rows. */
-  sceneTargetMode?: "match" | "offset";
   /** Scene rows only: the user's chosen leveling control, INSTEAD of the active amp's
    *  `outputLevel` — undefined/null = the amp default (every existing caller). */
   sceneHandle?: SceneHandlePick | null;
+  /** Base rows only: the user's chosen leveling control, INSTEAD of the master
+   *  `presetLevel` — undefined/null = the "Preset level" pseudo-handle default (D2). */
+  baseHandle?: BaseHandlePick | null;
+  /** Footswitch rows only: this switch's preset's own scene NAMES, index-aligned with
+   *  the wire `scenes[]` slots — the scene-context picker's label source (D3). Undefined
+   *  for Base/scene rows. */
+  fsSceneNames?: string[];
+}
+
+/** A user-chosen BASE leveling control — the block param `level_preset` should drive
+ *  INSTEAD of the master `presetLevel` (mirrors `LevelJob.block_*`). Carries `value` (the
+ *  candidate's CURRENT reading at pick time) because `block_value` picks the closed-loop
+ *  search bounds without a second `list_level_blocks` read at dispatch. */
+export interface BaseHandlePick {
+  groupId: string;
+  nodeId: string;
+  parameterId: string;
+  value: number;
 }
 
 /** The e2e-hook identity for a setup row (`PresetOptionRow`'s `data-setup-row`) —
@@ -403,6 +404,7 @@ export function chosenFrom(
             footswitch: target,
             levelParams: f.level_params,
             fsUnlabeled: f.label.trim() === "",
+            fsSceneNames: scenes.map((sc) => sc.name),
           });
         }
       });
@@ -421,13 +423,8 @@ export function chosenFrom(
 // of measurement captures — running it again improves it. Backed by
 // `FootswitchLevelResult.unconverged` (footswitch rows only today). Folding it into
 // `clamped` would also feed a non-ceiling into `ceilingOf` → the derived common target.
-//
-// `verified` is a footswitch VERIFY row (no handle chosen): nothing was solved or
-// written, only measured (`FootswitchLevelResult.on_off_delta_lu` is the discriminator
-// — see `useLevelingFlow`'s `outcomeOf`). It must NEVER read as "done" (which would
-// claim a write that never happened).
 export type Outcome =
-  "done" | "clamped" | "unconverged" | "offbranch" | "skipped" | "verified";
+  "done" | "clamped" | "unconverged" | "offbranch" | "skipped";
 
 /** Dynamics-spread flag threshold (LU): short-term-max − integrated above this
  *  marks a DYNAMIC sound — the gated reading understates its peaks vs a
@@ -459,20 +456,21 @@ export interface RunItem {
    *  items only; null/undefined falls back to the row's generic "connecting…". */
   activeMessage?: string | null;
   outcome?: Outcome;
-  /** Measured loudness (verify/predicted), or null. */
+  /** Measured (predicted) loudness, or null. */
   value?: number | null;
-  /** VERIFY footswitch rows ONLY (`outcome === "verified"`): engaged − disengaged
-   *  loudness (LU). Positive = engaging makes the preset louder. Undefined/null for
-   *  every other row — distinct from `value`, which stays the plain measured LUFS. */
-  verifyDeltaLu?: number | null;
-  /** Scene rows in Offset target mode ONLY: how far the effective target was shifted
-   *  from the requested one to preserve the scene's authored loudness relationship
-   *  (LU). `null`/undefined in Match mode or on non-scene rows. */
-  targetOffsetLu?: number | null;
-  /** Scene rows only: this row's target-mode + handle pick, carried from Set up into
-   *  the dispatch (mirrors `SetupOption.sceneTargetMode`/`sceneHandle`). */
-  targetMode?: "match" | "offset";
+  /** Scene rows only: this row's handle pick, carried from Set up into the dispatch
+   *  (mirrors `SetupOption.sceneHandle`). */
   handle?: SceneHandlePick | null;
+  /** Base rows only: this row's handle pick, carried from Set up into the dispatch
+   *  (mirrors `SetupOption.baseHandle`). */
+  baseHandle?: BaseHandlePick | null;
+  /** The clamp's CAUSE from the shared taxonomy, when clamped — render
+   *  `CLAMP_MESSAGES[clampKind]` verbatim. Null/undefined on a non-clamped row. */
+  clampKind?: ClampKind | null;
+  /** THE HEADROOM TRADE this row's batch made (or, on a preview, WOULD make) — see
+   *  `TradeSummary`. Stamped on every row of a batch that traded. Null/undefined
+   *  otherwise. */
+  trade?: TradeSummary | null;
   /** Dynamics spread of the measure capture (LU); drives the "dynamic" by-ear cause. */
   spreadLu?: number | null;
   /** The preset's saved `presetLevel` before this run wrote it — enables the Summary
@@ -534,30 +532,6 @@ export function offbranchStatus(hint: SilenceHint | undefined): string {
   return "not on USB 1/2";
 }
 
-/** Verify-row result prose (footswitch rows only, `outcome === "verified"`): a compact
- *  ON-vs-OFF delta, e.g. "+2.3 LU vs off" / "−1.1 LU vs off" — honest (states direction
- *  + magnitude) without claiming a write that never happened. Rendered verbatim in
- *  RunBody + SummaryBody. */
-export function verifyDeltaText(deltaLu: number | null | undefined): string {
-  if (deltaLu == null || !Number.isFinite(deltaLu)) return "verified";
-  return `${signedDb(deltaLu)} LU vs off`;
-}
-
-/** Scene Offset-mode result suffix, e.g. " · kept +1.4 LU" — empty when there's nothing
- *  to report (Match mode, or a shift too small to matter). Rendered verbatim in RunBody
- *  + SummaryBody. */
-export function targetOffsetSuffix(
-  offsetLu: number | null | undefined,
-): string {
-  if (
-    offsetLu == null ||
-    !Number.isFinite(offsetLu) ||
-    Math.abs(offsetLu) < 0.05
-  )
-    return "";
-  return ` · kept ${signedDb(offsetLu)} LU`;
-}
-
 /** The sound's preset line — the mono sub-line under its name. Rendered verbatim in
  *  RunBody + SummaryBody, so it lives here rather than being retyped on both. */
 export const presetLine = (it: RunItem): string =>
@@ -589,8 +563,8 @@ export function optionToRunItem(
     instId,
     targetName,
     status: "queued",
-    targetMode: o.sceneTargetMode,
     handle: o.sceneHandle,
+    baseHandle: o.baseHandle,
   };
 }
 
@@ -610,8 +584,8 @@ export function runItemToOption(it: RunItem): SetupOption {
     tag: it.tag,
     hasScenes: !it.isBase || it.tag != null,
     footswitch: it.footswitch ?? null,
-    sceneTargetMode: it.targetMode,
     sceneHandle: it.handle,
+    baseHandle: it.baseHandle,
   };
 }
 
@@ -627,6 +601,9 @@ export function buildLevelJob(
   targetLufs: number,
   profile: Profile | null,
   save: boolean,
+  /** The row's user-chosen leveling control (D2), instead of the master `presetLevel`.
+   *  `null`/undefined = the "Preset level" pseudo-handle default. */
+  handle?: BaseHandlePick | null,
 ): LevelJob {
   return {
     slot,
@@ -635,9 +612,9 @@ export function buildLevelJob(
     topology_id: profile?.topology_id ?? null,
     calibration_lufs: profile?.calibration_lufs ?? null,
     profile_id: profile?.id ?? null,
-    block_group_id: null,
-    block_node_id: null,
-    block_parameter_id: null,
-    block_value: null,
+    block_group_id: handle?.groupId ?? null,
+    block_node_id: handle?.nodeId ?? null,
+    block_parameter_id: handle?.parameterId ?? null,
+    block_value: handle?.value ?? null,
   };
 }
