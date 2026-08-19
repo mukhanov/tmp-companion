@@ -227,6 +227,33 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
+        // THE LEVEL EVERY CAPTURE OF THIS BATCH MUST RENDER AT.
+        //
+        // Each capture's `recall_base` re-runs the device's own level-apply, which serves the
+        // COMMITTED `presetLevel` — and the load store commits LAZILY, so shortly after this
+        // preset's base row saved a new level the recall still applies the OLD one. This lane
+        // used to pass `None` and rely on the freshness barrier below to have already made
+        // the two equal.
+        //
+        // HW, fw 1.8.45, 2026-08-19, slot 26 "Plumes+BD2+OCD" disproved that. Base saved
+        // `presetLevel` 0.51009 and verified -23.0002 LUFS; this batch then measured switch
+        // 5's ceiling (its block pinned at max) at -24.44 LUFS, while the IDENTICAL state
+        // re-measures at -18.91 once the commit lands — and base and switch 5 agree there to
+        // four decimals, because on that preset they are the same sound. The 5.53 dB gap is
+        // exactly 20*log10(0.51009/0.2699), and 0.26999998 is the `presetLevel` the preset
+        // carried BEFORE the run. So every row was solved against a chain 5.5 dB quieter than
+        // reality and clamped at a ceiling it was nowhere near. The barrier did NOT wait: it
+        // logged neither a stale retry nor a window-elapsed exit, and its remaining exits (no
+        // registry entry, or a first-harvest match) are both silent, so which one it took is
+        // not recoverable from that run. Either way a capture must not depend on it.
+        //
+        // The field-8 read above is the fresher of the device's two stores (notes/gotchas.md's
+        // lazy-commit entry: `loadPreset` and `presetDataRequest` are independent and commit at
+        // very different latencies), so re-asserting ITS level after every recall makes a
+        // capture's rendering independent of load-commit timing rather than dependent on it.
+        // `None` (no `audioGraph.presetLevel` in the doc) keeps the old behaviour.
+        let intended_pl = crate::audiograph::preset_level(&preset).map(|v| v as f32);
+
         // Plan bake-vs-assign for the whole batch (pure) — block-off-in-base + sole-owner + no
         // scene overlay on THAT node's bypass ⇒ bake straight onto the block (no `ftsw` write, so
         // the switch keeps its single function and its label); otherwise the param assignment.
@@ -332,11 +359,8 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                         handle.clone(),
                     ),
                 };
-                // No intended `presetLevel`: this command owns no solved or unsaved level of
-                // its own (it never writes `presetLevel`), so every capture renders at the
-                // level the preset holds — which the `ensure_fresh_load` barrier above has
-                // already waited for a pending same-slot save to commit.
-                match leveller::measure_fs_ceiling(&probe, &stim, None) {
+                // Re-assert the saved `presetLevel` on every capture — see `intended_pl`.
+                match leveller::measure_fs_ceiling(&probe, &stim, intended_pl) {
                     Ok(l) => {
                         let ceiling_lufs = l.integrated_lufs;
                         let target = job.target_lufs + offset;
@@ -469,8 +493,8 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                     "baked",
                     None,
                     &lev_param,
-                    // See the prepass above: this lane holds no `presetLevel` of its own.
-                    None,
+                    // See `intended_pl`: the saved level, re-asserted per capture.
+                    intended_pl,
                 )
                 .inspect(|r| {
                     if save && r.clamp_reason.is_none() {
@@ -512,9 +536,8 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                                 "assigned",
                                 current,
                                 &lev_param,
-                                // See the prepass above: this lane holds no `presetLevel`
-                                // of its own.
-                                None,
+                                // See `intended_pl`: the saved level, per capture.
+                                intended_pl,
                             )
                             // Skip the write when the leveler left the value unchanged — its
                             // `final_value == current` is the idempotency signal (no wire field).
