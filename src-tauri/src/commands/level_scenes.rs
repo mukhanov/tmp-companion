@@ -426,10 +426,9 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                 // headroom one (offline fixture 403 "Clean"). "The level the preset currently
                 // holds" is the intent, and inside a save's lazy-commit window the device's
                 // load store does not hold it — hence asserting it rather than assuming it.
-                let saved_pl = saved
-                    .as_ref()
-                    .and_then(crate::audiograph::preset_level)
-                    .map(|v| v as f32);
+                // Through the SAME seam the solve captures use, with no trade yet (`None`),
+                // so the two renderings cannot drift apart by editing one side.
+                let saved_pl = leveller::scene_capture_level(None, saved.as_ref());
                 leveller::prepass_scene_ceilings(
                     &mut scene_jobs,
                     &stim,

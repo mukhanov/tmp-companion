@@ -4742,6 +4742,42 @@ pub fn scene_ceiling_lufs(job: &SceneJob) -> Option<f64> {
 /// it is solved by [`handle_one_scene`] (the generic param secant) instead of the amp
 /// joint-k. The amp `outputLevel` remains the ONLY control this lane touches when no handle
 /// is given; a handle is an explicit, per-row user choice.
+/// THE LEVEL EVERY CAPTURE IN A SCENE BATCH MUST RENDER AT. Each per-scene capture recalls
+/// its scene first, and the recall runs the device's own level-apply — so a capture renders
+/// at whatever level that apply serves, not at the one this run means.
+///
+/// Two ways that diverges, and BOTH need the same re-assert:
+///  · a landed headroom trade holds a RAISED `presetLevel` UNSAVED in the working copy until
+///    this batch's one save — without the re-assert every scene is solved against the
+///    pre-raise sound;
+///  · with no trade, the recall serves the COMMITTED level, and the load store commits
+///    LAZILY — so shortly after this preset's base row saved a new level, every capture still
+///    renders at the OLD one. This arm used to be `None`, i.e. exactly that bug. HW, fw
+///    1.8.45, 2026-08-19, slot 26: the footswitch lane's twin of this measured a whole batch
+///    5.53 dB quiet, that being 20·log10(0.51009/0.2699) — the just-saved level over the
+///    pre-run one (see `commands/level_footswitch.rs`'s `intended_pl`).
+///
+/// The trade's unsaved raise wins when there is one; otherwise the preset's own SAVED level,
+/// read from the complete field-8 doc the caller already holds (the fresher of the device's
+/// two stores). Rendering is then independent of commit timing.
+///
+/// COUPLED WITH THE PREPASS. `prepass_scene_ceilings` must be given the SAME level, or the
+/// as-is reading it produces and the post-apply captures compared against it render
+/// differently and the difference is read as knob response — see `commands/level_scenes.rs`.
+/// Split out as a named function so this decision is unit-gated: it is not otherwise
+/// observable offline, because SimDevice only reverts a recall's level for a slot this run
+/// has already saved.
+pub(crate) fn scene_capture_level(
+    hold: Option<&TradeHold>,
+    saved: Option<&serde_json::Value>,
+) -> Option<f32> {
+    hold.map(|h| h.preset_level).or_else(|| {
+        saved
+            .and_then(crate::audiograph::preset_level)
+            .map(|v| v as f32)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn level_scenes_oneshot(
     slot: u32,
@@ -4754,29 +4790,7 @@ pub fn level_scenes_oneshot(
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
-    // THE LEVEL EVERY CAPTURE MUST RENDER AT. Each per-scene capture recalls its scene first,
-    // and the recall runs the device's own level-apply — so a capture renders at whatever
-    // level that apply serves, not at the one this run means.
-    //
-    // Two ways that diverges, and BOTH need the same re-assert:
-    //  · a landed headroom trade holds a RAISED `presetLevel` UNSAVED in the working copy
-    //    until this batch's one save — without the re-assert every scene is solved against
-    //    the pre-raise sound;
-    //  · with no trade, the recall serves the COMMITTED level, and the load store commits
-    //    LAZILY — so shortly after this preset's base row saved a new level, every capture
-    //    still renders at the OLD one. This arm used to be `None`, i.e. exactly that bug.
-    //    HW, fw 1.8.45, 2026-08-19, slot 26: the footswitch lane's twin of this measured a
-    //    whole batch 5.53 dB quiet, that being 20*log10(0.51009/0.2699) — the just-saved
-    //    level over the pre-run one (see `commands/level_footswitch.rs`'s `intended_pl`).
-    //
-    // The trade's unsaved raise wins when there is one; otherwise fall back to the preset's
-    // own SAVED level, read from the complete field-8 doc the caller already holds (the
-    // fresher of the device's two stores). Rendering is then independent of commit timing.
-    let intended_preset_level = hold.map(|h| h.preset_level).or_else(|| {
-        saved
-            .and_then(crate::audiograph::preset_level)
-            .map(|v| v as f32)
-    });
+    let intended_preset_level = scene_capture_level(hold, saved);
     run_scene_jobs(
         slot,
         jobs,
@@ -6486,8 +6500,60 @@ fn correct_iter(
         });
     }
 
-    // Bounded secant. Seed points: base@measured0 and levels0@v0 (device at levels0).
-    let mut prev = (0.0_f64, measured0); // (applied_db, lufs)
+    // CONFIRMATION PROBE — the verdict above needs a move of at least `NO_AUTHORITY_MIN_DB`
+    // to be conclusive, but the first step is sized by the SOLVE, not by what a verdict
+    // needs: a scene sitting 4 dB from its target gets a 4 dB step. A FLAT response to that
+    // is already suspicious, and left unresolved it falls through the secant (slope ~0 →
+    // stop) and reports a REASON-LESS headroom clamp on a knob that in fact has no authority
+    // at all — the user is told "couldn't get there" instead of "this amp doesn't reach USB
+    // 1/2", which is the one thing they could act on. So resolve it: step DOWN by a full
+    // `NO_AUTHORITY_MIN_DB` and look again.
+    //
+    // Downward only, deliberately: a raise can clip, and a saturating limiter makes an upward
+    // non-response ambiguous anyway (`no_authority_reason`). Costs ONE extra capture, and only
+    // on a sound whose first real move produced nothing — a knob with authority moves ~1 LU
+    // per dB, so this never fires on a healthy solve.
+    let mut prev = (0.0_f64, measured0); // (applied_db, lufs) — the secant's first seed
+    if (v0 - measured0).abs() < KNOB_TOL_LU && applied_db0 > -NO_AUTHORITY_MIN_DB {
+        let probe_db = applied_db0 - NO_AUTHORITY_MIN_DB;
+        let probe_levels = levels_for(probe_db);
+        // Only meaningful if the floor actually lets the knobs travel that far; if it does
+        // not, the reading stays inconclusive and the ordinary clamp is the honest answer.
+        if probe_levels
+            .iter()
+            .zip(&levels0)
+            .any(|(a, b)| (a - b).abs() > 1e-3)
+        {
+            let vp = apply(&probe_levels, true)?;
+            writes += 1;
+            match vp {
+                // Conclusive: a full `NO_AUTHORITY_MIN_DB` drop moved nothing.
+                Some(vp) if (vp - measured0).abs() < KNOB_TOL_LU => {
+                    apply(base, false)?;
+                    writes += 1;
+                    return Ok(Correction {
+                        lufs: measured0,
+                        levels: base.to_vec(),
+                        clamp_reason: Some(no_authority_reason(true)),
+                        writes,
+                    });
+                }
+                // It DID move, so the knob has authority and the flat first reading was the
+                // unreliable one. The probe is a genuine second point — seed the secant with
+                // it instead of `base@measured0`, and put the device back where the loop
+                // below expects to find it.
+                Some(vp) => {
+                    prev = (probe_db, vp);
+                    apply(&levels0, false)?;
+                    writes += 1;
+                }
+                // Capture dropped — no verdict either way; fall through unchanged.
+                None => {}
+            }
+        }
+    }
+
+    // Bounded secant. Seed points: `prev` (base, or the probe above) and levels0@v0.
     let mut last = (applied_db0, v0);
     let mut best = (levels0.clone(), v0); // best MEASURED point
     let mut device = levels0; // what the device currently holds
@@ -7264,6 +7330,48 @@ mod persist_verify_tests {
             "a covered-but-empty overlay is still a lost write: {real:?}"
         );
         assert!(real.unverifiable.is_empty(), "{real:?}");
+    }
+
+    /// GATE for the scene half of the stale-`presetLevel` fix. Unlike the FS half — which the
+    /// e2e harness can drive end-to-end against SimDevice's lazy-commit model — this decision
+    /// is not observable offline: the sim only reverts a recall's level for a slot the run has
+    /// already saved, and the scene specs level slots they never saved first. So the CHOICE is
+    /// gated here directly; the mechanism it feeds is proven by the FS twin
+    /// (`a_capture_renders_at_the_saved_preset_level_not_the_stale_committed_one`).
+    ///
+    /// Reverting this to `hold.map(|h| h.preset_level)` — its shape before 2026-08-19 — leaves
+    /// the whole offline suite green, which is exactly why it needs a gate of its own.
+    #[test]
+    fn a_scene_batch_captures_at_the_saved_level_when_no_trade_holds_one() {
+        let saved = serde_json::json!({ "audioGraph": { "presetLevel": 0.51009 } });
+
+        // No trade: the preset's OWN saved level, never `None`. `None` is the bug — it lets
+        // the recall's level-apply serve the lazily-committed (stale) value instead.
+        assert_eq!(
+            scene_capture_level(None, Some(&saved)),
+            Some(0.51009),
+            "with no trade the captures must render at the preset's saved level"
+        );
+
+        // A landed trade holds a RAISED level unsaved in the working copy until the batch's
+        // one save, so it outranks the saved doc — which still shows the pre-raise value.
+        let hold = TradeHold {
+            preset_level: 0.72,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            scene_capture_level(Some(&hold), Some(&saved)),
+            Some(0.72),
+            "a trade's unsaved raise wins over the saved doc"
+        );
+
+        // Nothing to assert only when there is genuinely nothing to assert.
+        assert_eq!(scene_capture_level(None, None), None);
+        assert_eq!(
+            scene_capture_level(None, Some(&serde_json::json!({"audioGraph": {}}))),
+            None,
+            "a doc with no presetLevel asserts nothing rather than inventing a level"
+        );
     }
 
     /// The FS-lane half of the same gate. An Assign write is read out of `ftsw` and a Bake
