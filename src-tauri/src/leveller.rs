@@ -27,8 +27,8 @@ use crate::audio;
 use crate::lufs;
 use crate::session::Session;
 use crate::{
-    read_saved_preset, scene_overlay, scene_write_verdict, settle_abortable, settle_or_cancel,
-    SceneOverlay, SceneWriteVerdict,
+    read_saved_preset, read_saved_preset_complete, scene_overlay, scene_write_verdict,
+    settle_abortable, settle_or_cancel, SceneOverlay, SceneWriteVerdict,
 };
 
 // Post-load DSP settle before a capture. Was a conservative 1200; HW-bisected to 400
@@ -5533,12 +5533,24 @@ fn verify_persisted_writes(
     // `save_deferred_scene_writes` has just closed its session and `read_saved_preset` sleeps
     // only AFTER itself, so the opening gap is the caller's to provide.
     crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-    let Some(saved) = read_saved_preset(slot) else {
-        log::warn!(
-            "slot {slot}: post-save verify skipped — the saved preset could not be re-read; \
-             the reported values are unconfirmed"
-        );
-        return;
+    // COMPLETE-OR-FAIL, not the plain read: this verifier compares SCENE OVERLAYS, which sit
+    // at the tail of the document, and a field-8 stream that truncates before `scenes` makes
+    // every checked scene look unwritten. HW, 2026-08-19: "Friedman HBE" truncates at 21044 B
+    // before its scenes section, and the run duly warned that scene 3's
+    // `ACD_TwinReverb65NoFx/outputLevel` "solved 0.7814 but the saved preset holds no such
+    // value" — while that scene's own re-measure of the SAVED state read -22.99 LUFS against
+    // its -23 target, i.e. the write had persisted perfectly. A false "did not persist" is
+    // worse than no check: it teaches the user to distrust correct results, and the external
+    // judge SKIPS the row rather than passing it.
+    let saved = match read_saved_preset_complete(slot) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "slot {slot}: post-save verify skipped — the saved preset could not be re-read \
+                 completely ({e}); the reported values are unconfirmed"
+            );
+            return;
+        }
     };
     let misses = persist_mismatches(&saved, writes);
     for o in outcomes.iter_mut() {
@@ -5582,12 +5594,17 @@ pub(crate) fn verify_fs_persisted_writes(
         return;
     }
     crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-    let Some(saved) = read_saved_preset(slot) else {
-        log::warn!(
-            "slot {slot}: FS post-save verify skipped — the saved preset could not be re-read; \
-             the reported values are unconfirmed"
-        );
-        return;
+    // COMPLETE-OR-FAIL for the same reason as the scene twin above: a truncated document
+    // reports a write that landed as a write that vanished.
+    let saved = match read_saved_preset_complete(slot) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "slot {slot}: FS post-save verify skipped — the saved preset could not be \
+                 re-read completely ({e}); the reported values are unconfirmed"
+            );
+            return;
+        }
     };
     let base_reverted =
         base_expect.is_some_and(|pl| match crate::audiograph::preset_level(&saved) {
