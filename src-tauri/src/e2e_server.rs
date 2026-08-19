@@ -698,8 +698,26 @@ async fn e2e_measure_sound(
         // Doctor lanes use (`doctor_force_bypass` over the SAVED doc) — not a private copy.
         let saved = read_saved_preset(slot)
             .ok_or_else(|| format!("field-8 read failed for slot {slot}"))?;
-        let force =
-            crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, footswitch);
+        // A BASE row measures the preset AS SAVED — no isolation — because that is what
+        // `commands::level_preset` now solves for. A FOOTSWITCH row still isolates: its sound
+        // is that one switch engaged with every sibling off, which is exactly what its own
+        // leveling measured.
+        //
+        // This has to track `level_preset`'s definition of base or the validation is
+        // measuring a sound no run ever targeted. HW, 2026-08-19: while base still isolated
+        // here, "Plumes+BD2+OCD" base verified at -23.00 during its run and then re-measured
+        // at -32.54 — a 9.54 dB gap that is exactly 20*log10(0.2916/0.8744), the ratio between
+        // the presetLevel solved against the as-saved sound and the one the all-off sound
+        // would need. The preset was correct; the yardstick was not.
+        //
+        // The Doctor keeps the all-off baseline on purpose (it DIAGNOSES the clean chain
+        // rather than levelling what the player hears), so `doctor_force_bypass` is still the
+        // right shared derivation for the footswitch case — the divergence is deliberate and
+        // documented in notes/leveling.md.
+        let force = match footswitch {
+            Some(_) => crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, footswitch),
+            None => Vec::new(),
+        };
         // An ASSIGN switch's engaged sound = the leveled param at its saved `valueA`; a
         // BAKED (or assignment-less) switch needs no write. The leveled param TRIPLE comes
         // from the CALLER — the spec owns the same pinned coordinates it fed the leveling
