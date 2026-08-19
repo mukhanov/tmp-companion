@@ -1250,13 +1250,24 @@ impl SimDevice {
                 Some(wire_slot)
             };
             st.events.push(SimEvent::LoadScene(wire_slot));
+            // A recall runs the device's own level-apply — base included — silently
+            // reverting an unsaved working-copy `presetLevel` to the currently-SAVED
+            // value (HW: `probe --levelpreset 400 -24 save` solved 0.3096 and the saved
+            // doc still read the prior 0.32; `leveller::recall_reassert_save`'s doc has
+            // the full evidence). Mirrors `load_preset`'s own committed-level restore
+            // exactly — same e2e-only gate, same `ever_saved` condition — rather than
+            // inventing a parallel rule.
+            let current_slot = st.current_slot;
+            #[cfg(feature = "e2e")]
+            if st.ever_saved.contains(&current_slot) {
+                st.preset_level = st.committed_doc(current_slot).preset_level;
+            }
             // Push `currentPresetDataChanged`(3) so the un-engaged scene-leveling PRE-PASS can
             // classify each scene's routing (the real device pushes the scene graph on a scene
             // CHANGE). The sim carries one graph, and the physics model reads the written
             // `outputLevel` node-agnostically, so re-serving the same graph per scene is enough
             // for the amp pick to resolve — without it, the pre-pass harvests nothing and every
             // scene fails to classify ("read failed").
-            let current_slot = st.current_slot;
             let json = load_echo_json(&mut st, current_slot);
             return frame_multi(&current_preset_data_changed(&json));
         }
@@ -2909,6 +2920,43 @@ mod physics_tests {
         assert!(
             (sim.preset_level() - 0.32).abs() < 1e-3,
             "the stale value must be the fixture's own pre-save presetLevel, got {}",
+            sim.preset_level()
+        );
+    }
+
+    /// A `loadScene` recall — base sentinel included — runs the device's own
+    /// level-apply exactly like `load_preset` does, silently reverting an unsaved
+    /// working-copy `presetLevel` to the currently-COMMITTED value (danger.md's
+    /// `loadScene` recall entry; HW: `probe --levelpreset 400 -24 save` solved 0.3096
+    /// and the saved doc still read the prior 0.32; `leveller::recall_reassert_save`'s
+    /// doc comment has the full evidence). FAILS before the fix: the old `F_LOAD_SCENE`
+    /// handler never touched `preset_level` at all, so a live-set value would have
+    /// survived the recall unperturbed.
+    #[test]
+    fn scene_recall_reverts_an_unsaved_preset_level_to_the_committed_value() {
+        let sim = SimDevice::new(); // default 0 ms commit latency
+        let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(401).unwrap();
+        s.set_preset_level(0.81).unwrap();
+        s.save_current_preset(401).unwrap(); // commits 0.81, marks 401 `ever_saved`
+
+        // A real scene recall.
+        s.set_preset_level(0.55).unwrap(); // unsaved working-copy write, e.g. a solved level
+        s.load_scene(0).unwrap();
+        assert!(
+            (sim.preset_level() - 0.81).abs() < 1e-3,
+            "a scene recall must revert an unsaved presetLevel to the committed value, got {}",
+            sim.preset_level()
+        );
+
+        // The base sentinel recall (`BASE_SCENE_SLOT`) is the SAME mechanism, not a
+        // special case — danger.md is explicit that base is included.
+        s.set_preset_level(0.42).unwrap(); // another unsaved working-copy write
+        s.load_scene(crate::session::BASE_SCENE_SLOT).unwrap();
+        assert!(
+            (sim.preset_level() - 0.81).abs() < 1e-3,
+            "the base recall must revert an unsaved presetLevel exactly like a real \
+             scene recall, got {}",
             sim.preset_level()
         );
     }

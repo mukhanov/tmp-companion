@@ -253,6 +253,21 @@ pub struct LevelOptions {
     /// Hiwatt slot 31: pre 3 → post 8), changing which scene the preset loads into on
     /// the pedalboard. `None` = save whatever context is active (old behavior).
     pub restore_scene: Option<u32>,
+    /// The run's OWN `presetLevel` — its solved value, or the UNSAVED raise a headroom
+    /// trade is holding — re-asserted after `set_knobs` and before the verify engage.
+    ///
+    /// `set_knobs` recalls the knob's scene, and a recall runs the device's own
+    /// level-apply (`recall_reassert_save`'s doc carries the HW evidence), so without
+    /// this the VERIFY capture renders at the level the device HAS SAVED even when the
+    /// as-is capture was correctly asserted. That asymmetry is silent and it INVERTS the
+    /// correction: the verify reads quiet, so the bounded secant walks the fader the wrong
+    /// way (offline gate `a_batched_scene_run_persists_both_halves_of_a_landed_headroom_trade`:
+    /// the compensating fader rose 0.69 → 0.726 instead of falling).
+    ///
+    /// Ignored when a `PresetLevel` target is in the same batch — there `set_knobs` is
+    /// already writing the level under measurement and must win. `None` = assert nothing,
+    /// which is every caller that has no run-owned value.
+    pub intended_preset_level: Option<f32>,
 }
 
 impl Default for LevelOptions {
@@ -263,6 +278,7 @@ impl Default for LevelOptions {
             ref_level: 0.5,
             defer: false,
             restore_scene: None,
+            intended_preset_level: None,
         }
     }
 }
@@ -276,7 +292,15 @@ fn measure_at_level(
     level: f32,
     force_bypass: &[(String, String, bool)],
 ) -> Result<lufs::Loudness, String> {
-    measure_knob_at(stimulus, &LevelKnob::PresetLevel, level, force_bypass, None)
+    // No intended-level assert: `level` IS the `presetLevel` being measured here.
+    measure_knob_at(
+        stimulus,
+        &LevelKnob::PresetLevel,
+        level,
+        force_bypass,
+        None,
+        None,
+    )
 }
 
 /// Sentinel error returned when a cooperative cancel flag is observed at a leveling
@@ -1329,7 +1353,10 @@ pub fn measure_sound_asis_strict(
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
         require_live(
             || {
-                let cap = capture_fs_at((&g, &n, &p), force_bypass, stimulus, v)?;
+                // NO intended-level assert, deliberately: this seam's whole contract is
+                // "re-measure the SAVED state as-is", so it must render at the level the
+                // preset stores, not at any level a run wanted.
+                let cap = capture_fs_at((&g, &n, &p), force_bypass, stimulus, v, None)?;
                 let loud = processed_loudness_of(&cap)?;
                 if keep {
                     kept = Some(cap);
@@ -1540,6 +1567,18 @@ pub fn apply_levels(
     let mut verify_lufs = None;
     let mut s = Session::connect()?;
     set_knobs(&mut s, targets, saved)?; // set before any re-amp engage (latched)
+                                        // Re-assert the run's own `presetLevel` AFTER `set_knobs` — its scene recall runs the
+                                        // device's level-apply and would otherwise leave the verify capture rendering at the
+                                        // SAVED level (see `LevelOptions::intended_preset_level`). Skipped when a PresetLevel
+                                        // target is in this batch: that value is the one under measurement and must win.
+    if let Some(pl) = opts.intended_preset_level {
+        if !targets
+            .iter()
+            .any(|(k, _)| matches!(k, LevelKnob::PresetLevel))
+        {
+            set_knob(&mut s, &LevelKnob::PresetLevel, pl, None)?;
+        }
+    }
     crate::settle(Duration::from_millis(SETTLE_AFTER_SET_MS));
 
     if opts.verify {
@@ -2558,9 +2597,46 @@ pub(crate) fn reamp_off_guaranteed(tag: &str) {
     }
 }
 
-fn measure_scene_asis(scene_slot: u32, stimulus: &[f32]) -> Result<lufs::Loudness, String> {
+/// One as-is scene reading: fresh connection, recall, engage, measure, disengage —
+/// writing NOTHING. Every scene ceiling in the prepass and every jointk/verify as-is
+/// reading comes through here.
+///
+/// The recall→engage sequence is the NAKED shape `capture_on_session` breaks with
+/// heartbeats, and this seam does not route through that function, so it carries its
+/// own copy of the breaker. Without it the engage lands on a single 300 ms gap after
+/// `load_scene` and the capture reads the device's stationary output floor instead of
+/// the stimulus; `require_live` (this seam's only caller shape) then surfaces that as
+/// a hard "couldn't read this sound" error. Same cadence as the shared breaker —
+/// recall → 300 → hb → 300 → hb → 300 → engage — keeping every idle gap ≤300 ms and
+/// landing the engage ~900 ms post-recall. Evidence: gotchas.md "An engage after a
+/// naked scene recall latches silence".
+///
+/// `intended_preset_level` is the run's OWN `presetLevel` — the value it solved or is
+/// holding UNSAVED in the working copy — re-asserted right after the recall. The recall runs
+/// the device's own level-apply (`recall_reassert_save`'s doc carries the HW evidence), so
+/// without this the capture renders at the level the DEVICE HAS SAVED: stale while a save is
+/// still inside its lazy-commit window, and stale by the whole raise while a headroom trade
+/// holds an unsaved `presetLevel`. `None` = assert nothing (capture at the preset's own
+/// stored level) — the reading every caller that has no run-owned value still wants.
+///
+/// The assert is INSERTED into the breaker, never spliced over it: recall → 300 → set → 300 →
+/// hb → 300 → hb → 300 → engage. Every idle gap stays ≤300 ms and the cadence above survives
+/// intact; the engage simply lands ~1200 ms post-recall instead of ~900 ms.
+fn measure_scene_asis(
+    scene_slot: u32,
+    stimulus: &[f32],
+    intended_preset_level: Option<f32>,
+) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
     s.load_scene(scene_slot)?;
+    settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    if let Some(pl) = intended_preset_level {
+        set_knob(&mut s, &LevelKnob::PresetLevel, pl, None)?;
+        settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    }
+    s.heartbeat()?;
+    settle_or_cancel(SETTLE_AFTER_SET_MS)?;
+    s.heartbeat()?;
     settle_or_cancel(SETTLE_AFTER_SET_MS)?;
     engage_measure_disengage(&mut s, stimulus)
 }
@@ -2578,17 +2654,34 @@ fn measure_scene_asis(scene_slot: u32, stimulus: &[f32]) -> Result<lufs::Loudnes
 /// 2. ISOLATION LAST. `load_scene` re-asserts that scene's own bypass state
 ///    (`capture_on_session`'s rule), so forced bypasses written before the recall are
 ///    silently reverted. Every capture that recalls therefore re-sends the FULL list.
+///
+/// 1b. THE INTENDED `presetLevel`, BETWEEN 1 and 2 — never before `set_knob`. A BLOCK knob's
+///    own scene recall happens INSIDE `set_knobs` (its `has_base_block` / scene branch), and
+///    that recall runs the device's own level-apply, so a `presetLevel` written above the
+///    `set_knob` call is silently reverted by it and the capture renders at whatever level
+///    the device HAS SAVED — stale inside a save's lazy-commit window, and stale by the whole
+///    raise while a headroom trade holds an unsaved `presetLevel`
+///    (`recall_reassert_save`'s doc carries the HW evidence). Written as a plain
+///    `setPresetLevel` (no recall of its own — `set_knobs`' `PresetLevel`-only branch), so it
+///    cannot revert the knob write that precedes it, and no settle is added: the isolation
+///    writes and the single settle below already bracket it exactly as they bracket the knob
+///    write. `None` = assert nothing (today's behaviour) — and a `PresetLevel` CALLER must
+///    pass `None`, since `value` is already the level under measurement.
 fn arm_measurement(
     s: &mut Session,
     knob: &LevelKnob,
     value: f32,
     force_bypass: &[(String, String, bool)],
     saved: Option<&serde_json::Value>,
+    intended_preset_level: Option<f32>,
 ) -> Result<(), String> {
     if matches!(knob, LevelKnob::PresetLevel) {
         recall_base(s)?;
     }
     set_knob(s, knob, value, saved)?;
+    if let Some(pl) = intended_preset_level {
+        set_knob(s, &LevelKnob::PresetLevel, pl, None)?;
+    }
     for (g, n, byp) in force_bypass {
         s.change_parameter_bool(g, n, "bypass", *byp)?;
     }
@@ -2613,7 +2706,14 @@ pub(crate) fn measure_pair_at(
     match scene {
         // Base case: the shared arming seam verbatim (base recall → presetLevel →
         // settle, the ONE tested write order — see `arm_measurement`'s doc).
-        None => arm_measurement(&mut s, &LevelKnob::PresetLevel, preset_level, &[], None)?,
+        None => arm_measurement(
+            &mut s,
+            &LevelKnob::PresetLevel,
+            preset_level,
+            &[],
+            None,
+            None,
+        )?,
         // Scene case: the recall targets the scene instead of base; everything after
         // mirrors the seam (recall FIRST — it reverts earlier unsaved writes).
         Some(sc) => {
@@ -2629,17 +2729,28 @@ pub(crate) fn measure_pair_at(
     engage_measure_disengage(&mut s, stimulus)
 }
 
-/// Fresh-connect, arm the measurement (`arm_measurement`: scene context → knob → isolation),
-/// engage re-amp once, measure the processed pair on the full capture. Restores re-amp OFF.
+/// Fresh-connect, arm the measurement (`arm_measurement`: scene context → knob → intended
+/// `presetLevel` → isolation), engage re-amp once, measure the processed pair on the full
+/// capture. Restores re-amp OFF. `intended_preset_level` is `arm_measurement`'s — the run's
+/// own solved/held level, `None` to assert nothing (and always `None` when `knob` is
+/// `PresetLevel`, which IS the level under measurement).
 fn measure_knob_at(
     stimulus: &[f32],
     knob: &LevelKnob,
     value: f32,
     force_bypass: &[(String, String, bool)],
     saved: Option<&serde_json::Value>,
+    intended_preset_level: Option<f32>,
 ) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
-    arm_measurement(&mut s, knob, value, force_bypass, saved)?;
+    arm_measurement(
+        &mut s,
+        knob,
+        value,
+        force_bypass,
+        saved,
+        intended_preset_level,
+    )?;
     engage_measure_disengage(&mut s, stimulus)
 }
 
@@ -3003,20 +3114,34 @@ fn param_fn_present(ftsw: &serde_json::Value, switch: u32, index: u32, param: &s
 /// measurement must write on the LIVE RENDERED LAYER: the persistent, overlay-aware `set_knobs`
 /// path `arm_measurement` uses would REFUSE outright on a `BypassOnly` scene, and this is a
 /// throwaway measurement, not a write the preset should keep.
+///
+/// `intended_preset_level` is the run's OWN `presetLevel`, asserted on every capture (see
+/// [`arm_measurement`] step 1b and [`measure_fs_state`]): without it the capture renders at
+/// the level the DEVICE HAS SAVED, because this path recalls a scene (base included) and
+/// then writes a BLOCK param — it never writes `presetLevel` the way the base lane
+/// incidentally does. `None` = assert nothing.
 pub(crate) fn measure_fs_at(
     scene: Option<u32>,
     lev: (&str, &str, &str),
     engaged_bypass: &[(String, String, bool)],
     stimulus: &[f32],
     v: f32,
+    intended_preset_level: Option<f32>,
 ) -> Result<lufs::Loudness, String> {
     match scene {
-        None => processed_loudness(capture_fs_at(lev, engaged_bypass, stimulus, v)),
+        None => processed_loudness(capture_fs_at(
+            lev,
+            engaged_bypass,
+            stimulus,
+            v,
+            intended_preset_level,
+        )),
         Some(_) => measure_fs_state(
             scene,
             engaged_bypass,
             &[(lev.0.to_string(), lev.1.to_string(), lev.2.to_string(), v)],
             stimulus,
+            intended_preset_level,
         ),
     }
 }
@@ -3028,6 +3153,7 @@ pub(crate) fn capture_fs_at(
     engaged_bypass: &[(String, String, bool)],
     stimulus: &[f32],
     v: f32,
+    intended_preset_level: Option<f32>,
 ) -> Result<audio::Capture, String> {
     let mut s = Session::connect_lean()?;
     let knob = LevelKnob::Block {
@@ -3036,7 +3162,14 @@ pub(crate) fn capture_fs_at(
         parameter_id: lev.2.to_string(),
         scene_slot: None,
     };
-    arm_measurement(&mut s, &knob, v, engaged_bypass, None)?;
+    arm_measurement(
+        &mut s,
+        &knob,
+        v,
+        engaged_bypass,
+        None,
+        intended_preset_level,
+    )?;
     engage_capture_disengage(&mut s, stimulus)
 }
 
@@ -3059,11 +3192,19 @@ pub(crate) fn capture_fs_at(
 /// −11 LU drop — the overlay does NOT mask the write), which is what makes a per-scene FS
 /// ceiling readable at all. These are measurement-only writes on a throwaway connection;
 /// PERSISTENT scene-scoped writes still go through the overlay-aware `set_knobs`.
+///
+/// `intended_preset_level` is the run's OWN `presetLevel`, written straight after the recall
+/// — which is what reverts it (the recall runs the device's own level-apply, see
+/// `recall_reassert_save`) — and before the param writes. `None` = assert nothing, i.e. the
+/// capture renders at the level the device has saved. No settle is added: `setPresetLevel` is
+/// one more command in the run of writes the trailing `SETTLE_AFTER_SET_MS` already covers,
+/// so no idle gap grows.
 fn measure_fs_state(
     scene: Option<u32>,
     bypass: &[(String, String, bool)],
     params: &[(String, String, String, f32)],
     stimulus: &[f32],
+    intended_preset_level: Option<f32>,
 ) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
     match scene {
@@ -3072,6 +3213,9 @@ fn measure_fs_state(
             s.load_scene(sc)?;
             crate::settle(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
         }
+    }
+    if let Some(pl) = intended_preset_level {
+        set_knob(&mut s, &LevelKnob::PresetLevel, pl, None)?;
     }
     for (g, n, p, v) in params {
         s.change_parameter(g, n, p, *v)?;
@@ -3133,13 +3277,27 @@ impl FsCeilingProbe<'_> {
 /// TRUE-PEAK CAVEAT: a ceiling read at handle-max can CLIP on a hot chain, and the
 /// true-peak caveat machinery is base-only. The returned loudness is the reading as taken;
 /// the caller decides how much to trust a hot one.
+///
+/// `intended_preset_level` is the run's OWN `presetLevel` (see [`measure_fs_state`]). A
+/// ceiling read at the device's STALE saved level is the whole reading off by the difference
+/// — HW: 10.2 dB, which made `fs_target_beyond_ceiling` fire on every row of the batch and
+/// clamp sounds that were comfortably in reach. `None` = assert nothing.
 pub fn measure_fs_ceiling(
     probe: &FsCeilingProbe<'_>,
     stimulus: &[f32],
+    intended_preset_level: Option<f32>,
 ) -> Result<lufs::Loudness, String> {
     let params = probe.ceiling_params();
     require_live(
-        || measure_fs_state(probe.scene, &probe.states.engaged_bypass, &params, stimulus),
+        || {
+            measure_fs_state(
+                probe.scene,
+                &probe.states.engaged_bypass,
+                &params,
+                stimulus,
+                intended_preset_level,
+            )
+        },
         stimulus,
     )
 }
@@ -3267,6 +3425,11 @@ fn switch_at_target(measured: f64, target: f64, clamped: bool) -> bool {
 /// the not-a-level-control refusal and the wet floor. Build it with
 /// [`FsParamTarget::from_preset`] off the batch's single field-8 read.
 #[allow(clippy::too_many_arguments)]
+///
+/// `intended_preset_level` is the run's OWN `presetLevel`, re-asserted on EVERY capture of
+/// the solve for the same reason the isolation list is re-sent on every capture: each one
+/// recalls a scene, and the recall runs the device's own level-apply. Solving against a
+/// stale level solves the wrong sound. `None` = assert nothing.
 pub fn measure_footswitch(
     switch: u32,
     scene: Option<u32>,
@@ -3277,6 +3440,7 @@ pub fn measure_footswitch(
     method: &str,
     current_value: Option<f32>,
     param: &FsParamTarget,
+    intended_preset_level: Option<f32>,
 ) -> Result<FootswitchLevelResult, String> {
     solve_footswitch(
         switch,
@@ -3286,9 +3450,10 @@ pub fn measure_footswitch(
         method,
         current_value,
         param,
-        // EVERY capture of this row recalls `scene` before engaging — the isolation list is
-        // re-sent per capture for the same reason (a recall re-asserts its own bypass state).
-        |bypass, v| measure_fs_at(scene, lev, bypass, stimulus, v),
+        // EVERY capture of this row recalls `scene` before engaging — the isolation list and
+        // the intended `presetLevel` are both re-sent per capture for the same reason (a
+        // recall re-asserts its own bypass state AND runs the device's level-apply).
+        |bypass, v| measure_fs_at(scene, lev, bypass, stimulus, v, intended_preset_level),
     )
 }
 
@@ -3731,7 +3896,9 @@ pub fn level_footswitch(
             FsWrite::Assign { .. } => "assigned",
         };
         // Single-switch probe seam: always solve fresh (no idempotency probe) — the batched
-        // command owns the re-run skip.
+        // command owns the re-run skip. No intended `presetLevel` either: this seam levels
+        // ONE switch of an already-saved preset and holds no unsaved level of its own, so the
+        // preset's own stored level is the right one to render at.
         let result = measure_footswitch(
             switch,
             None,
@@ -3742,6 +3909,7 @@ pub fn level_footswitch(
             method,
             None,
             param,
+            None,
         )?;
         if result.clamp_reason.is_some() {
             // No-signal routing clamp: nothing to write — discard the sweep pollution.
@@ -3768,10 +3936,18 @@ pub fn level_footswitch(
             result.saved = true;
             if verify {
                 crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-                result.verify_lufs =
-                    measure_fs_at(None, lev, engaged_bypass, stimulus, result.final_value)
-                        .ok()
-                        .map(|l| l.integrated_lufs);
+                // The verify runs AFTER the save, so the preset's own stored level IS the
+                // intended one — nothing to re-assert.
+                result.verify_lufs = measure_fs_at(
+                    None,
+                    lev,
+                    engaged_bypass,
+                    stimulus,
+                    result.final_value,
+                    None,
+                )
+                .ok()
+                .map(|l| l.integrated_lufs);
                 // Cleanup reload only — a failure must not fail the already-saved result.
                 match Session::connect_lean() {
                     Ok(mut s) => {
@@ -4451,9 +4627,15 @@ pub fn level_scenes_live_batched(
 ///
 /// Ends on a guaranteed fresh re-amp OFF — each capture already disengages, but an
 /// interrupted one can strand the unit input-muted (`danger.md`).
+///
+/// `intended_preset_level` is the run's OWN `presetLevel` re-asserted on every reading (see
+/// [`measure_scene_asis`]). The batched scene command passes `None`: this prepass runs BEFORE
+/// the headroom trade decides anything, so there is no run-owned level yet and the ceilings
+/// are — by definition — read at the level the preset currently holds.
 pub fn prepass_scene_ceilings(
     jobs: &mut [SceneJob],
     stimulus: &[f32],
+    intended_preset_level: Option<f32>,
     mut on_scene: impl FnMut(u32),
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<(), String> {
@@ -4467,7 +4649,10 @@ pub fn prepass_scene_ceilings(
             continue;
         }
         on_scene(job.scene_slot);
-        match require_live(|| measure_scene_asis(job.scene_slot, stimulus), stimulus) {
+        match require_live(
+            || measure_scene_asis(job.scene_slot, stimulus, intended_preset_level),
+            stimulus,
+        ) {
             Ok(l) => {
                 job.prepass = Some(ScenePrepass {
                     asis: l.integrated_lufs,
@@ -4560,6 +4745,13 @@ pub fn level_scenes_oneshot(
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
+    // A landed headroom trade is holding a RAISED `presetLevel` UNSAVED in the working copy
+    // until this batch's one save. Every per-scene capture below recalls its scene first, and
+    // the recall runs the device's own level-apply (`recall_reassert_save`) — so without
+    // re-asserting the hold's level each capture would render at the device's SAVED (pre-raise)
+    // level and every scene would be solved against the wrong sound. No hold ⇒ nothing unsaved
+    // to re-assert.
+    let intended_preset_level = hold.map(|h| h.preset_level);
     run_scene_jobs(
         slot,
         jobs,
@@ -4569,9 +4761,16 @@ pub fn level_scenes_oneshot(
         on_scene,
         cancelled,
         move |job: &SceneJob| match &job.handle {
-            Some(handle) => {
-                handle_one_scene(slot, job, handle, stimulus, job.target_lufs, save, saved)
-            }
+            Some(handle) => handle_one_scene(
+                slot,
+                job,
+                handle,
+                stimulus,
+                job.target_lufs,
+                save,
+                saved,
+                intended_preset_level,
+            ),
             None => jointk_one_scene(
                 slot,
                 job,
@@ -4583,6 +4782,7 @@ pub fn level_scenes_oneshot(
                 // A scene amp may legitimately be solved all the way to silence; only
                 // the trade's BASE hold carries the fader floor.
                 LEVEL_MIN,
+                intended_preset_level,
             ),
         },
     )
@@ -4747,6 +4947,10 @@ pub fn apply_headroom_trade(
         // solve that pays for the raise stops at `BASE_FADER_FLOOR`, reported as `TradeFloor`
         // below.
         crate::headroom_trade::BASE_FADER_FLOOR,
+        // The raise above is UNSAVED, and every capture the hold takes recalls base first —
+        // which runs the device's own level-apply and would revert it. Re-assert it on each
+        // one, or the hold solves the base fader against the PRE-raise sound.
+        Some(raised),
     ) {
         Ok(s) => s,
         // A CANCEL backs the pair out exactly like a failure does. The raise is already in
@@ -4913,6 +5117,9 @@ pub fn redistribute_clamped_headroom(
             true,
             saved,
             LEVEL_MIN,
+            // The raise above is UNSAVED until this run's one save; each scene's capture
+            // recalls its scene and the recall reverts it, so re-assert it per capture.
+            Some(new_preset_level),
         );
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
         let o = match result {
@@ -4969,7 +5176,14 @@ pub fn redistribute_clamped_headroom(
         .find(|o| o.writes > 0 && o.final_lufs.is_some())
     {
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-        match require_live(|| measure_scene_asis(check.scene_slot, stimulus), stimulus) {
+        // The save above persisted `new_preset_level`, so re-asserting it here is a
+        // belt-and-braces no-op on a committed save and the CORRECT value while the
+        // firmware's lazy commit is still in flight — either way the spot-verify reads the
+        // level this run intended, never a stale one.
+        match require_live(
+            || measure_scene_asis(check.scene_slot, stimulus, Some(new_preset_level)),
+            stimulus,
+        ) {
             Ok(l) => {
                 let err = (l.integrated_lufs - check.target_lufs).abs();
                 if err > REDIST_POST_VERIFY_TOL_LU {
@@ -5602,7 +5816,16 @@ struct Prologue {
 /// taken — the batch already paid this capture up front so it could plan the headroom trade
 /// against every ceiling at once. A job with no prepass measures here exactly as before, so
 /// the rebalance/redistribution/bench callers are untouched.
-fn scene_prologue(job: &SceneJob, stimulus: &[f32]) -> Result<Prologue, String> {
+///
+/// `intended_preset_level` rides through to [`measure_scene_asis`] — the run's own solved or
+/// UNSAVED-held `presetLevel`, re-asserted after the scene recall so the reading describes
+/// the level the run is actually working at rather than the one the device has saved. It has
+/// no effect on a CONSUMED prepass reading (that capture was already taken).
+fn scene_prologue(
+    job: &SceneJob,
+    stimulus: &[f32],
+    intended_preset_level: Option<f32>,
+) -> Result<Prologue, String> {
     // Hard-error on a persistent flat read (after the retry). Trade-off, made
     // consciously: a real scene crushed by a limiter (the UA1176 case) with spread ≤ the
     // trip gate would false-error — but the library's Base minimum is 0.12 and without the
@@ -5611,7 +5834,10 @@ fn scene_prologue(job: &SceneJob, stimulus: &[f32]) -> Result<Prologue, String> 
     let (asis, spread) = match job.prepass {
         Some(p) => (p.asis, p.spread),
         None => {
-            let loudness = require_live(|| measure_scene_asis(job.scene_slot, stimulus), stimulus)?;
+            let loudness = require_live(
+                || measure_scene_asis(job.scene_slot, stimulus, intended_preset_level),
+                stimulus,
+            )?;
             (loudness.integrated_lufs, loudness.spread_lu())
         }
     };
@@ -5657,8 +5883,14 @@ fn jointk_one_scene(
     // [`crate::headroom_trade::BASE_FADER_FLOOR`] for the headroom trade's base hold, which
     // may not solve the base amp into digital silence.
     floor: f32,
+    // The run's own `presetLevel` — its solved value, or the UNSAVED raise a headroom trade is
+    // holding — re-asserted on the as-is capture below (`measure_scene_asis`). `None` = assert
+    // nothing. NOT threaded into `apply_first_verified`/`correct_iter`: those capture through
+    // the shared `capture_on_session` seam, whose `ref_level: None` contract ("capture at the
+    // preset's OWN stored level") is Doctor's too and is deliberately left alone.
+    intended_preset_level: Option<f32>,
 ) -> Result<SceneSolve, String> {
-    let prologue = scene_prologue(job, stimulus)?;
+    let prologue = scene_prologue(job, stimulus, intended_preset_level)?;
     let (measured, spread) = (prologue.asis, prologue.spread);
     let JointK {
         levels,
@@ -5679,6 +5911,7 @@ fn jointk_one_scene(
     let opts = LevelOptions {
         verify,
         defer,
+        intended_preset_level,
         ..Default::default()
     };
     let base: Vec<f32> = job.knobs.iter().map(|kt| kt.current).collect();
@@ -5708,6 +5941,7 @@ fn jointk_one_scene(
                 defer,
                 saved,
                 floor,
+                intended_preset_level,
             )?;
             (
                 c.lufs,
@@ -5871,6 +6105,10 @@ fn handle_one_scene(
     target_lufs: f64,
     defer: bool,
     saved: Option<&serde_json::Value>,
+    // The run's own `presetLevel` (see `jointk_one_scene`'s parameter of the same name),
+    // asserted on the as-is capture AND on every solve capture — each `measure_knob_at` here
+    // recalls the knob's scene, which reverts the level exactly like the as-is recall does.
+    intended_preset_level: Option<f32>,
 ) -> Result<SceneSolve, String> {
     // CLASS GATE, before any device work — the same refusal wording every lane shares.
     if let Some(refusal) = handle.refuse_if_not_a_level_control() {
@@ -5885,7 +6123,7 @@ fn handle_one_scene(
             ))
         }
     };
-    let prologue = scene_prologue(job, stimulus)?;
+    let prologue = scene_prologue(job, stimulus, intended_preset_level)?;
     let (asis, spread) = (prologue.asis, prologue.spread);
     // Already there → leave the handle untouched (the scene lane's `scene_at_target` rule,
     // on its own acceptance band). No closed-form solve runs here, so there is no clamp flag
@@ -5900,7 +6138,7 @@ fn handle_one_scene(
         None,
         handle,
         SCENE_HANDLE_CORRECT_MAX,
-        |v| measure_knob_at(stimulus, knob, v, &[], saved),
+        |v| measure_knob_at(stimulus, knob, v, &[], saved, intended_preset_level),
     )?;
     // The sweep left the LAST probed value in the working copy, not necessarily the best
     // one — write the solved value explicitly (unsaved under `defer`; the batch-end save
@@ -6039,6 +6277,11 @@ fn correct_iter(
     // must not walk the quietest lane past the floor that solve refused to cross. `LEVEL_MIN`
     // for every caller but the headroom trade's base hold.
     floor: f32,
+    // The run's own `presetLevel`, re-asserted on every corrective capture — see
+    // [`LevelOptions::intended_preset_level`]. Each iterate re-applies through
+    // `apply_levels`, whose `set_knobs` recalls the scene and reverts an unsaved level, so
+    // omitting it here reverts the whole loop to measuring the SAVED level.
+    intended_preset_level: Option<f32>,
 ) -> Result<Correction, String> {
     let max_base = base
         .iter()
@@ -6056,6 +6299,7 @@ fn correct_iter(
         let opts = LevelOptions {
             verify,
             defer,
+            intended_preset_level,
             ..Default::default()
         };
         let targets = zip_targets(knobs, levels);
@@ -6311,6 +6555,9 @@ pub fn level_scenes_rebalance(
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
+    // Same rule as `level_scenes_oneshot`: a landed trade's raise is UNSAVED, and every
+    // per-scene capture recalls its scene (which reverts it), so it is re-asserted per capture.
+    let intended_preset_level = hold.map(|h| h.preset_level);
     let result = run_scene_jobs(
         slot,
         jobs,
@@ -6331,11 +6578,21 @@ pub fn level_scenes_rebalance(
                     true,
                     saved,
                     LEVEL_MIN,
+                    intended_preset_level,
                 )
             } else {
                 // Rebalanceable: 2-lane equalize → joint-k. (Only the first two knobs are the
                 // rebalance pair; the classifier never produces >2 for a single split.)
-                rebalance_one_scene(slot, job, stimulus, job.target_lufs, save, true, saved)
+                rebalance_one_scene(
+                    slot,
+                    job,
+                    stimulus,
+                    job.target_lufs,
+                    save,
+                    true,
+                    saved,
+                    intended_preset_level,
+                )
             }
         },
     );
@@ -6354,6 +6611,11 @@ fn rebalance_one_scene(
     defer: bool,
     verify: bool,
     saved: Option<&serde_json::Value>,
+    // The run's own `presetLevel`, re-asserted on the corrective captures — see
+    // [`LevelOptions::intended_preset_level`]. The solo/combined captures above route
+    // through `measure_knobs_at`, which arms its own context; this covers the
+    // `correct_iter` tail, which re-applies through `apply_levels`.
+    intended_preset_level: Option<f32>,
 ) -> Result<SceneSolve, String> {
     let a = &job.knobs[0];
     let b = &job.knobs[1];
@@ -6461,6 +6723,7 @@ fn rebalance_one_scene(
                 defer,
                 saved,
                 LEVEL_MIN,
+                intended_preset_level,
             )?;
             (c.lufs, c.levels, c.clamp_reason, c.writes)
         }
@@ -6625,7 +6888,8 @@ pub fn level_preset_block(
         // iteration, and a persistent mid-loop floor lands on the secant's
         // flat-response / no-authority backstops instead of a wrong write.
         let first = require_live(
-            || measure_knob_at(stimulus, knob, from_c(ca), &[], overlays),
+            // Standalone block-knob seam: no run-owned `presetLevel` to assert.
+            || measure_knob_at(stimulus, knob, from_c(ca), &[], overlays, None),
             stimulus,
         )?;
         let dynamic_spread_lu = first.spread_lu();
@@ -6634,7 +6898,8 @@ pub fn level_preset_block(
             return Err(CANCELLED.to_string());
         }
         crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-        let mut yb = measure_knob_at(stimulus, knob, from_c(cb), &[], overlays)?.integrated_lufs;
+        let mut yb =
+            measure_knob_at(stimulus, knob, from_c(cb), &[], overlays, None)?.integrated_lufs;
         let mut iterations = 2u32;
 
         // Track the best (closest-to-target) measured point as the result.
@@ -6658,8 +6923,8 @@ pub fn level_preset_block(
                 return Err(CANCELLED.to_string());
             }
             crate::settle(Duration::from_millis(RECONNECT_GAP_MS));
-            let ynext =
-                measure_knob_at(stimulus, knob, from_c(cnext), &[], overlays)?.integrated_lufs;
+            let ynext = measure_knob_at(stimulus, knob, from_c(cnext), &[], overlays, None)?
+                .integrated_lufs;
             iterations += 1;
             if (ynext - target_lufs).abs() < (best.1 - target_lufs).abs() {
                 best = (cnext, ynext);
@@ -9263,7 +9528,7 @@ mod tests {
         let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
         let mut s = Session::from_transport(Box::new(sim.clone()));
         s.load_preset(30).expect("load_preset"); // activates saved scene 3, not base
-        arm_measurement(&mut s, &LevelKnob::PresetLevel, 0.5, &[], None).expect("arm");
+        arm_measurement(&mut s, &LevelKnob::PresetLevel, 0.5, &[], None, None).expect("arm");
         let ev = sim.events();
         let recall = ev.iter().position(|e| {
             matches!(e, crate::sim_device::SimEvent::LoadScene(sc) if *sc == crate::session::BASE_SCENE_SLOT)
@@ -9297,6 +9562,7 @@ mod tests {
             0.6,
             &[("G1".to_string(), "fx".to_string(), true)],
             None,
+            None,
         )
         .expect("arm");
         let ev = sim.events();
@@ -9309,6 +9575,69 @@ mod tests {
         assert!(
             bypass.is_some() && recall < bypass,
             "the isolation bypass must be written AFTER the last scene recall: {ev:?}"
+        );
+    }
+
+    // The intended `presetLevel` must land AFTER the knob write (whose own recall — base or
+    // scene, inside `set_knobs` — runs the device's level-apply and would revert an earlier
+    // one) and BEFORE the engage. Written above the `set_knob` call it is silently reverted
+    // and the capture renders at the level the DEVICE HAS SAVED: the footswitch/scene lanes'
+    // measured 10.2 dB error. `None` must stay byte-identical to the old behaviour.
+    #[test]
+    fn arm_measurement_asserts_the_intended_preset_level_after_the_knobs_recall() {
+        let knob = LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: None,
+        };
+        let arm = |intended: Option<f32>| {
+            let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+            let mut s = Session::from_transport(Box::new(sim.clone()));
+            s.load_preset(30).expect("load_preset");
+            arm_measurement(
+                &mut s,
+                &knob,
+                0.6,
+                &[("G1".to_string(), "fx".to_string(), true)],
+                None,
+                intended,
+            )
+            .expect("arm");
+            sim.events()
+        };
+
+        let ev = arm(Some(0.42));
+        let recall = ev
+            .iter()
+            .rposition(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(_)));
+        let level = ev
+            .iter()
+            .position(|e| matches!(e, crate::sim_device::SimEvent::PresetLevel(_)));
+        let bypass = ev.iter().position(
+            |e| matches!(e, crate::sim_device::SimEvent::Bypass { node, on } if node == "fx" && *on),
+        );
+        assert!(
+            level.is_some() && recall < level && level < bypass,
+            "the intended presetLevel must be written after the knob's recall and before the \
+             isolation bypasses: {ev:?}"
+        );
+        assert!(
+            matches!(
+                ev.iter().find_map(|e| match e {
+                    crate::sim_device::SimEvent::PresetLevel(v) => Some(*v),
+                    _ => None,
+                }),
+                Some(v) if (v - 0.42).abs() < 1e-6
+            ),
+            "the asserted level must be the intended one: {ev:?}"
+        );
+
+        assert!(
+            !arm(None)
+                .iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::PresetLevel(_))),
+            "`None` must write no presetLevel at all"
         );
     }
 
@@ -9382,7 +9711,7 @@ mod reordered_run_tests {
     #[test]
     fn a_job_carrying_a_prepass_reading_resolves_without_measuring() {
         let j = measured(job(2, -18.0, vec![knob("amp", Some(2), 0.5)]), -21.25, 4.5);
-        let p = scene_prologue(&j, &[]).expect("no device work");
+        let p = scene_prologue(&j, &[], None).expect("no device work");
         assert!((p.asis - -21.25).abs() < 1e-9, "{}", p.asis);
         assert!((p.spread - 4.5).abs() < 1e-9);
     }

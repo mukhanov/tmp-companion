@@ -284,24 +284,28 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                         cancelled,
                     );
                 }
-                // Best-effort: isolation is a quality improvement, not a precondition for
-                // leveling at all. A read hiccup (or, offline, a preset-read the fake device
-                // doesn't model) must not fail the whole Base run — degrade to no isolation
-                // (pre-this-feature behavior) instead of propagating the error.
-                // SOFT check on `ftsw`: the isolation list is derived from it, but the
-                // pre-run `presetLevel` and `lastLoadedScene` come out of the SAME body
-                // and survive a cut that takes `ftsw` — refusing the whole read would
-                // throw away the revert anchor and the save's restore scene to protect a
-                // best-effort quality improvement.
-                let force_bypass: Vec<(String, String, bool)> = match read_slot_preset_sections(
-                    slot,
-                    &["ftsw"],
-                ) {
-                    Ok((preset, _, _, tail)) => {
-                        // The same read carries the pre-run presetLevel — the revert anchor —
-                        // and the original `lastLoadedScene`, which the save must re-stamp
-                        // (the base-context measurement leaves base active; saving there
-                        // rewrites the preset's on-load scene to base — HW, Hiwatt slot 31).
+                // BASE IS MEASURED AS PLAYED — every footswitch-owned on-off block keeps its
+                // SAVED bypass, so this passes an EMPTY force list.
+                //
+                // Base used to force every such block off ("the clean base sound"). But the
+                // sound a player hears on load is the preset's SAVED state, so on a preset
+                // whose base has an always-on pedal the measurement ran quieter than reality
+                // and the solved `presetLevel` left the real base that much LOUDER than its
+                // target. HW, 2026-08-19, "Plumes+BD2+OCD": base measured against a −23.0
+                // target came back at −18.3 LUFS by external ffmpeg — 4.7 LU hot — and two
+                // presets in the same run corroborate by dose (a mild always-on block: −0.5
+                // off; no always-on block at all: exact). See notes/leveling.md.
+                //
+                // The read stays: it is the ONLY source of the revert anchor (`presetLevel`)
+                // and of the save's `restore_scene`. Both are early keys that survive a
+                // truncated tail, and neither depends on `ftsw` — so this no longer cares
+                // whether the tail was cut, and a read failure still degrades to leveling
+                // without the anchors rather than failing the run.
+                match read_slot_preset_sections(slot, &[]) {
+                    Ok((preset, _, _, _)) => {
+                        // The original `lastLoadedScene` must be re-stamped by the save: the
+                        // base-context measurement leaves base active, and saving there would
+                        // rewrite the preset's on-load scene to base (HW, Hiwatt slot 31).
                         previous_level = audiograph::preset_level(&preset).map(|v| v as f32);
                         opts.restore_scene = crate::last_loaded_scene(&preset);
                         crate::warn_missing_restore_scene(
@@ -310,43 +314,24 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                             &preset,
                             opts.restore_scene,
                         );
-                        if !tail.truncated.is_empty() {
-                            // A PARTIAL `ftsw` yields a partial isolation list — some
-                            // footswitch blocks left on while base is measured, which
-                            // reads as a louder base and writes the wrong presetLevel.
-                            // No isolation is the honest degrade; partial is not.
-                            log::warn!(
-                                "level_preset slot={slot}: field-8 read cut before the ftsw \
-                                 section — leveling without base isolation rather than with \
-                                 a partial one"
-                            );
-                            Vec::new()
-                        } else {
-                            footswitch::all_onoff_blocks(
-                                preset.get("ftsw").unwrap_or(&serde_json::Value::Null),
-                            )
-                            .into_iter()
-                            .map(|(g, n)| (g, n, true))
-                            .collect()
-                        }
                     }
                     Err(e) => {
                         log::warn!(
-                            "level_preset slot={slot}: base-isolation preset read failed ({e}), leveling without isolation"
+                            "level_preset slot={slot}: pre-run preset read failed ({e}), \
+                             leveling without a revert anchor or a restore scene"
                         );
-                        Vec::new()
                     }
-                };
-                // The isolation read opened (or tried to open) its own session either way —
-                // gap before level_preset reconnects, else the quick reopen risks the HID
-                // open-lockout (0xe00002c5).
+                }
+                // That read opened (or tried to open) its own session either way — gap before
+                // level_preset reconnects, else the quick reopen risks the HID open-lockout
+                // (0xe00002c5).
                 crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
                 leveller::level_preset(
                     slot,
                     &stim,
                     target_lufs,
                     opts,
-                    &force_bypass,
+                    &[],
                     previous_level,
                     cancelled,
                 )

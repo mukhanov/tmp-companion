@@ -352,7 +352,11 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                         handle.clone(),
                     ),
                 };
-                match leveller::measure_fs_ceiling(&probe, &stim) {
+                // No intended `presetLevel`: this command owns no solved or unsaved level of
+                // its own (it never writes `presetLevel`), so every capture renders at the
+                // level the preset holds — which the `ensure_fresh_load` barrier above has
+                // already waited for a pending same-slot save to commit.
+                match leveller::measure_fs_ceiling(&probe, &stim, None) {
                     Ok(l) => {
                         let ceiling_lufs = l.integrated_lufs;
                         let target = job.target_lufs + offset;
@@ -485,6 +489,8 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                     "baked",
                     None,
                     &lev_param,
+                    // See the prepass above: this lane holds no `presetLevel` of its own.
+                    None,
                 )
                 .inspect(|r| {
                     if save && r.clamp_reason.is_none() {
@@ -526,6 +532,9 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                                 "assigned",
                                 current,
                                 &lev_param,
+                                // See the prepass above: this lane holds no `presetLevel`
+                                // of its own.
+                                None,
                             )
                             // Skip the write when the leveler left the value unchanged — its
                             // `final_value == current` is the idempotency signal (no wire field).

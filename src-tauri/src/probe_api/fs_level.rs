@@ -317,7 +317,8 @@ pub fn probe_fs_sweep(
     for v in values {
         // A silent point is DATA here (the knob's bottom end), not a failure — record it
         // and keep sweeping instead of aborting the whole curve like the solver does.
-        match leveller::measure_fs_at(None, (group, node, param), &engaged, &stim, *v) {
+        // Probe sweep of a saved preset: no run-owned `presetLevel` to assert.
+        match leveller::measure_fs_at(None, (group, node, param), &engaged, &stim, *v, None) {
             Ok(l) => {
                 out += &format!(
                     "  {param}={v:.3} → integrated {:.3} LUFS  short-term-max {:.3}  spread {:.2} LU\n",

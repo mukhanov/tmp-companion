@@ -462,7 +462,7 @@ fn the_fs_prepass_reads_the_ceiling_at_the_handles_top_bound() {
     // pinned without a device by `leveller::reordered_run_tests::
     // the_ceiling_probe_pins_the_handle_at_its_top_bound_and_writes_it_last`.)
     let (_, hi) = handle.bounds();
-    let ceiling = crate::leveller::measure_fs_ceiling(&probe, &stim).expect("ceiling read");
+    let ceiling = crate::leveller::measure_fs_ceiling(&probe, &stim, None).expect("ceiling read");
     let expected = crate::sim_device::saturated_pedal_lufs(hi).unwrap();
     assert!(
         (ceiling.integrated_lufs - expected).abs() < 0.3,
@@ -1688,6 +1688,114 @@ fn hiwatt_base_leveling_measures_base_not_the_saved_scene() {
     );
 }
 
+/// BUG→GATE (2026-08-19 HW report, "Plumes+BD2+OCD"): BASE means the preset AS SAVED. The
+/// command used to force EVERY footswitch-owned on-off block OFF before the base capture, so a
+/// preset whose pedal is saved ON was measured without it — on the reported preset `ACD_Plumes`
+/// is `bypass: false` in base, the forced-off capture read 4.7 dB quiet, and the solved
+/// `presetLevel` left the real base 4.7 LU ABOVE its target (external ffmpeg read: -18.3 LUFS
+/// against a -23.0 target). Two sibling presets in the same run corroborate the mechanism: one
+/// with a mild always-on block was -0.5 off, one with NO footswitch block on in base was exact.
+///
+/// Slot 400 ("E2E Rig") is the offline fixture of that shape: three of its four block-acting
+/// switches own a block that is `bypass: false` in the saved base graph (`ACD_TubeScreamer`,
+/// `ACD_Boost`, `ACD_TMSpring63`) and one owns a block saved OFF (`ACD_CryBabyQ535`). A base run
+/// must leave every one of them at its SAVED state — which offline means the run sends no
+/// `bypass` write for them at all, since `SimState::bypass_writes` (the sole input `model_lufs`
+/// consults for a block's engaged state) is empty until something writes it.
+///
+/// SCOPE HONESTY: this pins the device-visible CAUSE — the same standard
+/// `hiwatt_scene_leveling_never_reseeds_an_existing_overlay` documents — not the LU delta. No
+/// shipped fixture declares a base-ENGAGED block in the sidecar's `leveledParams`, so the
+/// loudness the forced-off state costs is not expressible against this fixture set; that half is
+/// the hardware measurement quoted above. The finite-C assertion below is a non-vacuity guard
+/// (the capture really went through the physics model), not the discriminator.
+#[test]
+fn base_leveling_measures_the_preset_as_saved_not_with_the_footswitches_forced_off() {
+    let _serial = serial();
+    let sim = hiwatt_sim(); // scenario + sidecar + backup + stimulus env, sim installed
+    const RIG: u32 = 400;
+
+    // Premise (fixture-drift guard): the fixture really does save footswitch-owned blocks ON,
+    // else this gate would pass with the forcing fully restored.
+    let spec = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec
+        .iter()
+        .find(|p| p.list_index == RIG)
+        .expect("400 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
+    let onoff = crate::footswitch::all_onoff_blocks(&preset["ftsw"]);
+    assert!(
+        onoff.len() >= 4,
+        "400 must own several on-off blocks: {onoff:?}"
+    );
+    let engaged_in_base: Vec<&String> = onoff
+        .iter()
+        .filter(|(g, n)| {
+            preset
+                .pointer(&format!("/audioGraph/guitarNodes/{g}"))
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|node| node.get("nodeId").and_then(|v| v.as_str()) == Some(n))
+                })
+                .and_then(|node| node.pointer("/dspUnitParameters/bypass"))
+                == Some(&serde_json::Value::Bool(false))
+        })
+        .map(|(_, n)| n)
+        .collect();
+    assert!(
+        engaged_in_base.len() >= 3,
+        "the fixture must save footswitch-owned blocks ENGAGED — that is the incident shape: \
+         {engaged_in_base:?}"
+    );
+
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![level_preset])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    let job = serde_json::json!({
+        "slot": RIG, "target_lufs": -23.0, "save": false,
+        "topology_id": null, "calibration_lufs": null, "stimulus_path": null, "profile_id": null,
+        "block_group_id": null, "block_node_id": null, "block_parameter_id": null,
+        "block_value": null
+    });
+    let r = invoke(&webview, "level_preset", serde_json::json!({ "job": job }))
+        .expect("level_preset 400");
+
+    let events = sim.events();
+    // Non-vacuity: the run actually engaged re-amp and measured through the physics model
+    // (400's base C = -15), so "no bypass write" isn't just "the run died early".
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, crate::sim_device::SimEvent::ReAmp(true))),
+        "the base run engaged re-amp: {events:?}"
+    );
+    let c = r["constant_c"].as_f64().expect("constant_c");
+    assert!(
+        (c - (-15.0)).abs() < 0.5,
+        "the base capture went through the model (400's base C = -15): {r}"
+    );
+
+    // THE GATE: not one footswitch-owned block was written — base is the preset as saved.
+    let forced: Vec<&crate::sim_device::SimEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(e, crate::sim_device::SimEvent::Bypass { node, .. }
+                if onoff.iter().any(|(_, n)| n == node))
+        })
+        .collect();
+    assert!(
+        forced.is_empty(),
+        "base leveling must measure the preset AS SAVED — every footswitch-owned block keeps \
+         its saved bypass, so the run may write none of them. Forced: {forced:?}"
+    );
+}
+
 /// BUG→GATE (2026-07-27 report, the FOOTSWITCH "MULTI" class): pin the bake-vs-assign PLAN the
 /// reported preset produces, so a change to the discriminator has to face this fixture.
 ///
@@ -2738,7 +2846,7 @@ fn an_fs_scene_context_recalls_its_scene_before_the_engage_and_base_without_one(
             states: &states,
             handle: ("G1".to_string(), NODE.to_string(), handle.clone()),
         };
-        let l = crate::leveller::measure_fs_ceiling(&probe, &stim).expect("ceiling read");
+        let l = crate::leveller::measure_fs_ceiling(&probe, &stim, None).expect("ceiling read");
         (sim.events()[from..].to_vec(), l.integrated_lufs)
     };
     let position = |events: &[crate::sim_device::SimEvent],

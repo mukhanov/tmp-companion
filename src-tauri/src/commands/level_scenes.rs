@@ -317,7 +317,12 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
         // scene_overlay`, the Scene Edit enable + bake gates) AND `build_scene_jobs`'
         // routing-structure fallback — which still only fills in for a live doc set that
         // lacks `audioGraph.template`, so an unconditional `Some` changes no classification.
-        let saved = crate::read_saved_preset(slot);
+        //
+        // COMPLETE-OR-FAIL, not the tolerant read: a truncated `scenes` tail makes the
+        // planner blind to the scenes it cuts, and the run then levels the visible ones and
+        // leaves the rest silently untouched (`read_saved_preset_complete`'s doc carries the
+        // HW evidence). Refusing with a readable error beats half-leveling a preset.
+        let saved = Some(crate::read_saved_preset_complete(slot)?);
         type BatchOutcome = (
             Vec<leveller::BatchedSceneOutcome>,
             Option<crate::headroom_trade::TradeSummary>,
@@ -411,7 +416,16 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                 let mut started = |scene| {
                     let _ = on_result.send(scene_progress_item(slot, save_run, scene, None));
                 };
-                leveller::prepass_scene_ceilings(&mut scene_jobs, &stim, &mut started, cancelled)?;
+                // No intended `presetLevel` to assert yet: the prepass runs BEFORE the trade
+                // decides whether to move it, so these ceilings are — by definition — read at
+                // the level the preset currently holds.
+                leveller::prepass_scene_ceilings(
+                    &mut scene_jobs,
+                    &stim,
+                    None,
+                    &mut started,
+                    cancelled,
+                )?;
             }
             // PHASE 2 — plan and (only on a SAVE run, and only if a BENEFITING sound clamps)
             // execute the trade. A no-save run plans it and reports it as ADVISORY.
@@ -1305,7 +1319,9 @@ pub(crate) async fn redistribute_headroom<R: tauri::Runtime>(
 
         // THE field-8 read for this preset (see `level_scenes_apply_batched`): raw scene
         // overlays + the routing-structure fallback, once, ahead of the prepass session.
-        let saved = crate::read_saved_preset(slot);
+        // COMPLETE-OR-FAIL for the same reason as that seam — a cut `scenes` tail would
+        // hide whole scenes from the planner.
+        let saved = Some(crate::read_saved_preset_complete(slot)?);
         // Prepass: ONE rich session loads the preset + harvests each sound's live doc (the
         // pre-raise presetLevel + per-sound current outputLevel). No re-amp yet.
         let (docs, restore_scene) = prepass_scene_docs_via(slot, &scene_slots, false)?;

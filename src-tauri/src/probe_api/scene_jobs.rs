@@ -607,6 +607,27 @@ pub(crate) fn read_saved_preset(list_index: u32) -> Option<serde_json::Value> {
     result
 }
 
+/// [`read_saved_preset`]'s COMPLETE-OR-FAIL sibling, for the scene LEVELING planners.
+///
+/// The tolerant read above is right for consumers that degrade gracefully when a section
+/// is missing. A scene-leveling run is not one of them: a large preset's field-8 read is
+/// tail-truncated (per-slot deterministic — re-reading never lengthens it), and the tail
+/// that gets cut is `scenes`. The planner then simply does not see the last scene, so the
+/// run levels the scenes it can see and silently leaves the others untouched — the user
+/// reads that as "the Clean scene failed". HW-verified on the Friedman HBE (device slot
+/// 28): the field-8 read returns 3 of 4 scenes, the third cut mid-record with no
+/// `sceneName` and 9 of 15 nodes, and "Clean" is absent entirely.
+///
+/// So this routes through [`crate::read_slot_preset_complete`], which falls back to a
+/// name-guarded device backup — the only transport carrying the whole document — and
+/// refuses rather than returning a partial one. Same GAP CONTRACT as its sibling: no sleep
+/// before the read, one `RECONNECT_GAP_MS` after it.
+pub(crate) fn read_saved_preset_complete(list_index: u32) -> Result<serde_json::Value, String> {
+    let result = crate::read_slot_preset_complete(list_index, &["scenes"]).map(|(p, _, _)| p);
+    crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    result
+}
+
 /// Un-engaged pre-pass for the app's batched scene leveling: ONE rich session
 /// loads the preset and harvests each requested scene's live field-3 doc (the
 /// knob-pick input). Base (`session::BASE_SCENE_SLOT`) is served from the

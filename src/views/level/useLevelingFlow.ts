@@ -357,6 +357,22 @@ export function useLevelingFlow({
       setStage("run");
       publish(0, false, false);
 
+      // INVARIANT (BUG 2): at most ONE row is ever "active". The reported bug — several
+      // rows all rendering "leveling · <the same LUFS>" at once — traced to nothing ever
+      // clearing a row OUT of "active" when the channel (or the optimistic
+      // `markGroupActive` pre-flip) named a NEW one active; `RunBody` renders the one
+      // shared `liveLufs` on every row whose `status === "active"`, so a stale active row
+      // kept showing the new row's live number too. Every site that flips a row active
+      // must go through this so a future call site can't reintroduce the bug — it demotes
+      // any OTHER currently-active row back to "queued" (never touching an already-
+      // resolved "result" row) before promoting the target.
+      const setSoleActive = (target: RunItem) => {
+        for (const w of work) {
+          if (w !== target && w.status === "active") w.status = "queued";
+        }
+        target.status = "active";
+      };
+
       // Envelope-follower presets get the "envelope" cause over any result-derived
       // one: the effect tracks the stimulus envelope, so the measurement itself is
       // suspect no matter how clean the numbers look.
@@ -402,7 +418,7 @@ export function useLevelingFlow({
           const entry = entries.get(key);
           if (!entry) return;
           if (status === "active") {
-            entry.item.status = "active";
+            setSoleActive(entry.item);
             // e.g. the freshness barrier's "waiting for the device to commit the previous
             // save…" — shown verbatim while no capture is streaming yet (see RunBody's
             // rowStatus). Cleared once the row resolves so a later re-run's default
@@ -437,7 +453,7 @@ export function useLevelingFlow({
       const markGroupActive = <K>(entries: Map<K, BatchEntry>, idx: number) => {
         const rows = [...entries.values()];
         if (rows.length === 0) return;
-        rows[0].item.status = "active";
+        setSoleActive(rows[0].item);
         publish(idx, false, false);
       };
       const sweepUnresolved = <K>(entries: Map<K, BatchEntry>) => {
@@ -481,7 +497,7 @@ export function useLevelingFlow({
         const causeOf = causeFor(it.slot);
 
         if (it.isBase || (it.footswitch == null && it.sceneSlot == null)) {
-          it.status = "active";
+          setSoleActive(it);
           publish(i, false, false);
           try {
             if (it.isBase) {

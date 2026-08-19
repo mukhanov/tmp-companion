@@ -87,13 +87,24 @@ test.describe("Level Setup — Other-class filtering, unlabeled naming (list-lev
   });
 
   // COVERAGE rows 22, 19 — unlabeled switch rendering, plus the UI manifestation of the
-  // Other-class case: `footswitchesPerIndex` (src/views/level/libraryScan.ts) filters to
-  // LEVELABLE switches only, so 400's WAH (sw8, every param classifies Other — no level
-  // candidate) never reaches the Level tab's selection tree at all — never a row at all
-  // (row 15, whose own verify-only-row use case PR #144 removed outright — see its own
-  // COVERAGE.md entry). This is a matrix correction, not a bug: it's the danger.md Pick
-  // trap's absence-side proof (never options[0]) plus the filter's own contract.
-  test("400: WAH (Other-class) is absent from the tree; the unlabeled Boost switch names itself from its block", async ({
+  // Other-class case.
+  //
+  // BUG→GATE (user-reported, 2026-08-19, "Friedman HBE"): a footswitch with no level-class
+  // parameter used to be filtered out of the Level tab ENTIRELY — the user's "Phaser" switch
+  // simply was not there, with nothing saying why. Hiding a control the player can see on the
+  // unit is the bug, not the fix: the roster must show every block-acting switch, and a switch
+  // that cannot be leveled must SAY SO instead of vanishing.
+  //
+  // So the tree now renders the FULL roster (`usePresetData`'s `footswitchRoster: "all"`,
+  // which `LevelView` opts into) while SELECTABILITY still comes from the one shared
+  // `footswitchLevelable` predicate — a non-levelable row is present, labelled "no level
+  // control", and its checkbox is disabled. That keeps the danger.md Pick trap closed from the
+  // other side: the row can never be picked, so it can never fall back to `options[0]`.
+  // The Doctor's own list is deliberately NOT changed (it stays levelable-only — a
+  // non-levelable switch has no sound of its own to diagnose); the separation is pinned by
+  // `src/__tests__/footswitch-roster-separation.test.tsx`, and the count-vs-buildable
+  // agreement by `src/__tests__/footswitch-no-level-control.test.ts`.
+  test("400: WAH (Other-class) is SHOWN but not levelable; the unlabeled Boost switch names itself from its block", async ({
     page,
   }) => {
     test.skip(
@@ -110,19 +121,26 @@ test.describe("Level Setup — Other-class filtering, unlabeled naming (list-lev
       .first()
       .click();
 
-    // The collapsed breakdown counts the LEVELABLE subset only: DRIVE, the unlabeled Boost,
-    // SPRING, and VERB KILL (a param-func switch on TMSpring63.mix, also wet_mix-classified)
-    // — 4, not the 6 raw block-acting switches (WAH and WAH SWEEP both act on the
-    // all-Other-class ACD_CryBabyQ535 and carry zero level candidates).
-    await expect(page.getByText("4 scenes · 4 footswitches")).toBeVisible({
+    // The collapsed breakdown counts the WHOLE roster — all 6 block-acting switches, not the
+    // 4 levelable ones (DRIVE, the unlabeled Boost, SPRING, VERB KILL). WAH and WAH SWEEP both
+    // act on the all-Other-class ACD_CryBabyQ535 and carry zero level candidates, and they are
+    // counted here precisely because the user must see that they exist.
+    await expect(page.getByText("4 scenes · 6 footswitches")).toBeVisible({
       timeout: 60_000,
     });
 
     // The unlabeled switch (customLabel: "") falls back to its block's own short name
     // ("Boost", from ACD_Boost) — never a blank row, never an arbitrary options[0].
     await expect(page.getByText("Boost", { exact: true })).toBeVisible();
-    // WAH itself never appears as a row anywhere in the (now expanded) tree.
-    await expect(page.getByText("WAH", { exact: true })).toHaveCount(0);
+
+    // WAH IS present — the user-reported bug was that it was not.
+    await expect(page.getByText("WAH", { exact: true })).toBeVisible();
+    // Both Other-class switches (WAH sw8, WAH SWEEP) say WHY they cannot be leveled rather
+    // than disappearing. Counted, so a regression that drops one row is caught too.
+    await expect(page.getByText("no level control")).toHaveCount(2);
+    // …and neither can be selected: no pick, so no `options[0]` fallback is reachable
+    // (danger.md's Pick trap, closed from the absence side as before).
+    await expect(page.getByRole("checkbox", { disabled: true })).toHaveCount(2);
   });
 });
 

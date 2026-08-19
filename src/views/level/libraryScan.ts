@@ -35,17 +35,24 @@ export interface LibraryScan {
   ampCandidates: Map<number, AmpCandidate[]>;
   /** Per-preset LEVELABLE block-acting footswitches (those with ≥1 level candidate)
    *  keyed by 0-based LIST INDEX — read from the SAME backup, so the list shows the
-   *  footswitch count + the Level flow levels them with no extra device read. Feeds
-   *  Level's selection tree ONLY — a switch with no level candidate has nothing to
-   *  solve there. Doctor's damage detector needs the FULL roster instead; see
-   *  `allFootswitchesByIndex` below (never filter the feed twice for two different
-   *  reasons under one name). */
+   *  footswitch count + the Level flow levels them with no extra device read.
+   *  Doctor's own SELECT list is built off this filtered map too (a non-levelable FS
+   *  row has nothing to diagnose as its own sound — see `DoctorView.tsx`'s
+   *  `handleCheck`). The Level list itself now needs the FULL roster instead (BUG 1 —
+   *  a switch with no level candidate must still show up, disabled with a reason, not
+   *  vanish): `usePresetData`'s `footswitchRoster: "all"` option (Level opts in;
+   *  Doctor does not) swaps its OWN `footswitchInfo` for `allFootswitchesByIndex`
+   *  below rather than this field being widened — widening THIS field silently
+   *  changed what Doctor offers for diagnosis once (caught in review), so don't
+   *  repeat that: this stays the levelable-only source of truth. */
   footswitchesPerIndex: Map<number, FootswitchInfo[]>;
   /** Every per-preset block-acting footswitch — INCLUDING one with zero level
    *  candidates (e.g. an Other-class-only param, or a plain on/off toggle) — keyed by
    *  0-based LIST INDEX, from the SAME backup. Doctor's offline force-bypass isolation
    *  derivation needs every switch that can toggle a block, not just the levelable
-   *  subset; `footswitchesPerIndex` hid an Other-class-only switch from it entirely. */
+   *  subset; `footswitchesPerIndex` hid an Other-class-only switch from it entirely.
+   *  Also the source `usePresetData`'s `footswitchRoster: "all"` option threads to
+   *  Level, so the Level list can show a non-levelable switch disabled (BUG 1). */
   allFootswitchesByIndex: Map<number, FootswitchInfo[]>;
   /** Per-preset block roster (exact node FenderIds) keyed by 0-based LIST INDEX —
    *  read from the same backup. Drives the per-preset CPU total. */
@@ -152,10 +159,10 @@ export async function ensureLibraryScan(): Promise<void> {
     res.presets.forEach((p) => {
       m.set(p.slot - 1, p.scenes);
       amps.set(p.slot - 1, p.amp_candidates);
-      // Level's selection tree: only LEVELABLE footswitches (≥1 level candidate)
-      // become rows — one without a candidate has nothing to solve and would always
-      // skip. Doctor needs the FULL roster (see `allFootswitchesByIndex`'s doc) — keep
-      // both maps rather than re-filtering the same feed for two different reasons.
+      // Doctor's SELECT list is built off `footswitchesPerIndex` too (see its own
+      // doc) — keep it levelable-only here; `allFootswitchesByIndex` carries the full
+      // roster for Doctor's damage detector AND (via `usePresetData`'s
+      // `footswitchRoster: "all"` option) for Level's own list (BUG 1).
       if (p.footswitches.length > 0) allFsw.set(p.slot - 1, p.footswitches);
       const levelable = p.footswitches.filter((f) => f.level_params.length > 0);
       if (levelable.length > 0) fsw.set(p.slot - 1, levelable);

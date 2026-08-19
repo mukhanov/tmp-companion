@@ -49,13 +49,31 @@ export const baseKey = (slot: number): string => `p${String(slot)}`;
 /** The key for the i-th (0-based) footswitch scene of a preset slot. */
 export const sceneKeyOf = (slot: number, i: number): string =>
   `s${String(slot)}:${String(i)}`;
-/** The key for the i-th (0-based) levelable FOOTSWITCH of a preset slot. `i` indexes
- *  the SAME levelable footswitch list everywhere (the backup-cached, level-params-
- *  filtered one), so the key is stable across the list, selection, and the flow. */
+/** The key for the i-th (0-based) FOOTSWITCH of a preset slot — `i` is that switch's
+ *  ORIGINAL POSITION in the backup-cached per-preset footswitch array (the full
+ *  roster, levelable or not, since BUG 1: a switch with no level control still gets a
+ *  row, disabled), so the key stays stable across the list, selection, and the flow
+ *  regardless of which siblings are levelable. */
 export const fswKey = (slot: number, i: number): string =>
   `f${String(slot)}:${String(i)}`;
+/** THE ONE shared definition of "this footswitch can be leveled" — a real level-class
+ *  candidate to solve. Every consumer that decides whether a footswitch row is
+ *  selectable/counted (`childKeys`, `footswitchTarget`) or disabled-with-a-reason
+ *  (`PresetRow`'s row builder) must call this, not re-derive `level_params.length`
+ *  itself — that duplication is exactly how BUG 1 (a "PHASER" switch with no level
+ *  control silently vanishing between the list and the wizard) happened: `childKeys`
+ *  counted the row as selectable while the row builder dropped it. */
+export function footswitchLevelable(f: FootswitchInfo): boolean {
+  return f.level_params.length > 0;
+}
+
 /** Every selectable child key for a preset: Base, then one per FS scene, then one per
- *  levelable footswitch. Scenes and footswitches share the key space (distinct prefix). */
+ *  levelable footswitch. Scenes and footswitches share the key space (distinct
+ *  prefix). A footswitch with no level control (`!footswitchLevelable`) is NOT
+ *  selectable — it is shown in the list disabled instead (`PresetRow`) — but its
+ *  SIBLINGS keep their true array position: this flatMaps over the full array rather
+ *  than filtering first, so a later levelable switch's `fswKey` index can't shift
+ *  when an earlier one is skipped. */
 export function childKeys(
   slot: number,
   scenes: SceneInfo[],
@@ -64,7 +82,9 @@ export function childKeys(
   return [
     baseKey(slot),
     ...scenes.map((_, i) => sceneKeyOf(slot, i)),
-    ...footswitches.map((_, i) => fswKey(slot, i)),
+    ...footswitches.flatMap((f, i) =>
+      footswitchLevelable(f) ? [fswKey(slot, i)] : [],
+    ),
   ];
 }
 
@@ -244,11 +264,11 @@ export function footswitchName(f: FootswitchInfo): string {
  *  (D2 — every row levels against a combined block+param dropdown, best candidate
  *  pre-selected), base scene context (D3's `suggested` scene isn't known synchronously —
  *  the combined picker's lazy fetch fills it in once opened). `null` when the footswitch
- *  has no leveling candidate at all (it should have been filtered out upstream). */
+ *  is not `footswitchLevelable` (no leveling candidate at all) — callers must NOT rely
+ *  on this being pre-filtered upstream: the list shows such a switch too, disabled with
+ *  a reason (BUG 1), so `chosenFrom` still has to cope with one reaching it. */
 function footswitchTarget(f: FootswitchInfo): FootswitchTarget | null {
-  // Length-guard rather than `!candidate` — the array index type lies (no
-  // noUncheckedIndexedAccess), so the truthiness check reads as "always truthy".
-  if (f.level_params.length === 0) return null;
+  if (!footswitchLevelable(f)) return null;
   const idx = defaultParamIndex(f.level_params);
   if (idx < 0) return null;
   return targetFromCandidate(f.switch, null, f.level_params[idx]);
