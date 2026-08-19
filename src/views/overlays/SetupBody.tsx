@@ -580,14 +580,15 @@ export function SetupBody({
         option = {
           ...o,
           footswitch: target,
-          // LABEL PROVENANCE. `sceneName` is not display-only for a footswitch row: it
-          // becomes `displayLabel`, which the backend writes as the switch's on-device
-          // `customLabel` when an assign appends a function to an UNLABELED switch. The
-          // name was chosen back in `chosenFrom`, which only knew the tone-safe DEFAULT
-          // candidate — so a user who overrode that pick here would have had the unit
-          // renamed after a block the run never touched. Re-derive it from the candidate
-          // actually being leveled. A LABELED switch keeps its own name: that string is
-          // the player's, and nothing about picking a different knob makes it wrong.
+          // LABEL PROVENANCE. `sceneName` is the Level list's row name for a footswitch
+          // (never sent to the backend — the assign gate only ever edits an EXISTING
+          // `param` fn or refuses, so there is no on-device `customLabel` write to keep
+          // in sync any more). It was chosen back in `chosenFrom`, which only knew the
+          // tone-safe DEFAULT candidate — so a user who overrode that pick here would
+          // otherwise see the row still named after a block the run never touched.
+          // Re-derive it from the candidate actually being leveled. A LABELED switch
+          // keeps its own name: that string is the player's, and nothing about picking
+          // a different knob makes it wrong.
           ...(o.fsUnlabeled === true && candidate
             ? { sceneName: footswitchNameForCandidate(candidate) }
             : {}),

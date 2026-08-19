@@ -129,7 +129,6 @@ test.describe("Level Setup — footswitch scene-context override rides the wire 
     ).toBeVisible({ timeout: 240_000 });
 
     const events = (await simEvents(page)).slice(from);
-    const loadScenes = events.filter(isLoadScene).map((e) => e.LoadScene);
     const reAmpIdx = events.findIndex(isReAmpOn);
     const scratchIdx = events.findIndex(
       (e) => isLoadScene(e) && e.LoadScene === 0,
@@ -147,10 +146,32 @@ test.describe("Level Setup — footswitch scene-context override rides the wire 
       "SCRATCH must be recalled BEFORE the engage (re-amp latches the active scene at " +
         "engage — danger.md)",
     ).toBeLessThan(reAmpIdx);
+
+    // BOOST's block (`ACD_KingOfTone`) is bypassed in base and LEAD is the one scene that
+    // enables it, so under the assign gate (user directive, 2026-08-19) BOOST — a bare
+    // on-off with no `param` fn of its own — plans `Bake`, not `Assign`. A Bake's own save
+    // mirrors the solved value into every scene whose overlay RESTATES base
+    // (`footswitch.rs`'s `mirror_scenes`), and LEAD does exactly that here — so a LATE
+    // `LoadScene(2)`, once every measurement capture is already complete, is the Bake
+    // persisting correctly, not a leak. What the override actually promises is narrower and
+    // UNCHANGED: LEAD must never be the scene ACTIVE AT AN ENGAGE (danger.md: re-amp
+    // latches the active scene at engage) — the override, not the suggestion, must be what
+    // every CAPTURE hears. Scoping the check to everything up to and including the LAST
+    // engage (there is one per measurement probe, all at SCRATCH) keeps that promise exactly
+    // as strong as it was, without failing on the Bake's own after-the-fact mirror write.
+    const engageIndices = events
+      .map((e, i) => (isReAmpOn(e) ? i : -1))
+      .filter((i) => i >= 0);
+    const lastEngageIdx = engageIndices[engageIndices.length - 1] ?? -1;
+    const scenesThroughLastEngage = events
+      .slice(0, lastEngageIdx + 1)
+      .filter(isLoadScene)
+      .map((e) => e.LoadScene);
     expect(
-      loadScenes,
-      "the SUGGESTED scene (LEAD, scenes[2]) must never be touched — the override, not " +
-        "the suggestion, rode the wire",
+      scenesThroughLastEngage,
+      "the SUGGESTED scene (LEAD, scenes[2]) must never be ACTIVE AT AN ENGAGE — the " +
+        "override, not the suggestion, must be what every capture hears: " +
+        JSON.stringify(events),
     ).not.toContain(2);
 
     await expectReampBalanced(page, reampBase);

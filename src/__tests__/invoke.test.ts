@@ -457,14 +457,13 @@ describe("camelCase top-level arg keys (Tauri auto-converts to snake_case)", () 
       levParameterId: "outputLevel",
       sceneContext: null,
     };
-    const wire = toFootswitchJobWire(target, -23, "Boost");
+    const wire = toFootswitchJobWire(target, -23);
     expect(wire).toEqual({
       switch: 5,
       levGroupId: "G1",
       levNodeId: "amp",
       levParameterId: "outputLevel",
       targetLufs: -23,
-      displayLabel: "Boost",
       sceneContext: null,
     });
   });
@@ -477,14 +476,13 @@ describe("camelCase top-level arg keys (Tauri auto-converts to snake_case)", () 
       levParameterId: "gain",
       sceneContext: 3,
     };
-    const wire = toFootswitchJobWire(target, -20, "Drive");
+    const wire = toFootswitchJobWire(target, -20);
     expect(wire).toEqual({
       switch: 2,
       levGroupId: "G1",
       levNodeId: "pedal",
       levParameterId: "gain",
       targetLufs: -20,
-      displayLabel: "Drive",
       sceneContext: 3,
     });
   });

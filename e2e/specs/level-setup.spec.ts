@@ -60,6 +60,23 @@ function isSetFootswitchAssignment(
   return typeof e === "object" && e !== null && "SetFootswitchAssignment" in e;
 }
 
+/** `changeParameter`(12) — a Bake's own wire shape (`sim_device::SimEvent::ChangeParameter`,
+ *  no `rename_all` on the enum, so the JSON keys are the Rust field names verbatim). This is
+ *  where a Bake's write lands: straight on the block, never through `ftsw` — the twin of
+ *  `SetFootswitchAssignmentEvent` above for the OTHER plan branch. */
+interface ChangeParameterEvent {
+  ChangeParameter: {
+    scene: number;
+    group: string;
+    node: string;
+    param: string;
+    value: number;
+  };
+}
+function isChangeParameter(e: unknown): e is ChangeParameterEvent {
+  return typeof e === "object" && e !== null && "ChangeParameter" in e;
+}
+
 // openLevel now lives in ../fixtures/scenario.ts (shared with level-defaults.spec.ts).
 
 /** Dismiss any currently-open Pick/FsParamPick/SceneLevelPick dropdown by clicking its
@@ -337,34 +354,35 @@ test.describe("Level — footswitch opted-in write path (raw invoke, command-lev
   // entry declares `leveledParams` for `ACD_TMSpring63.mix` and NOTHING ELSE, so the
   // offline model is FLAT in `ACD_Boost.gain` — `model_lufs` returns the same C at every
   // probe of it. What that makes provable here is the plumbing: the solve terminates, a
-  // resolved `valueA`/`valueB` reaches the wire through the Assign path, the fake confirms
-  // by read-back, and the save persists. What it does NOT prove is that the solved gain
-  // TRACKS loudness — any target converges against a flat response, so the dry run's
-  // `predicted_lufs` is a constant this test then feeds back to itself. Row 3's
-  // solve-tracking half is online-only. Do not read a green here as "the block-knob solve
-  // is correct"; read it as "the block-knob WRITE lands and persists".
+  // resolved value reaches the wire through the Bake path, and the save persists it onto
+  // the block. What it does NOT prove is that the solved gain TRACKS loudness — any target
+  // converges against a flat response, so the dry run's `predicted_lufs` is a constant this
+  // test then feeds back to itself. Row 3's solve-tracking half is online-only. Do not read
+  // a green here as "the block-knob solve is correct"; read it as "the block-knob WRITE
+  // lands and persists".
   //
-  // 400/switch 2 (Boost) routes through
-  // `FsLevelPlan::Assign` (`footswitch.rs`): `ACD_Boost.bypass = false` in base — it's
-  // part of the base sound, so a bare block-value bake would change the ALWAYS-ON signal,
-  // not just an engaged-only state. SimDevice implements `setFootswitchAssignment`(54) /
-  // `clearFootswitchAssignment`(55) / `currentPresetDataRequest`(2) and confirms the
-  // assign by READ-BACK (a `currentPresetDataRequest` re-prompt renders the working-copy
-  // `ftsw` with the new `param` function — there is no dedicated field-54 echo, matching
-  // the wire schema), so the save completes and persists. Mirrors
-  // `e2e_server_tests.rs::assign_path_footswitch_confirms_by_readback_and_persists_its_value_a`
+  // 400/switch 2 (Boost) routes through `FsLevelPlan::Bake` (`footswitch.rs`): the assign
+  // gate (user directive, 2026-08-19) plans `Assign` ONLY when the switch already carries a
+  // `param` fn on the user-selected control, and Boost's switch is a bare on-off — so
+  // leveling `ACD_Boost.gain` writes the block directly rather than adding a function to the
+  // switch (a two-entry row is HW-proven to make the firmware silently discard the whole
+  // imported preset, `danger.md`). SimDevice implements `changeParameter`(12) as a
+  // fire-and-forget setter (no reply, no echo) that lands straight on the block's own
+  // `dspUnitParameters` — there is nothing to "confirm by read-back" the way an Assign's
+  // `ftsw` write is, so the save simply persists the block value the write already set.
+  // Mirrors `e2e_server_tests.rs::bake_path_footswitch_writes_the_block_directly_and_persists_its_value`
   // at the Playwright layer: the dry run learns Boost's reachable engaged loudness (400
   // declares no `leveledParams` for `gain`, so the offline model is flat in it — any signal
-  // level converges), the save:true run must complete and persist, and the wire carries
-  // the resolved `valueA`/`valueB` at the appended function index. Per this file's header,
-  // the RENDERED Summary still can't show this per-row offline — the wire proof is
-  // `/sim/events`.
-  test("Boost's opted-in gain write reaches the fake via the Assign path, confirms by read-back, and is saved", async ({
+  // level converges), the save:true run must complete and persist, and the wire carries the
+  // solved value via `changeParameter` — never a `setFootswitchAssignment`(54), which would
+  // mean the switch grew a second function. Per this file's header, the RENDERED Summary
+  // still can't show this per-row offline — the wire proof is `/sim/events`.
+  test("Boost's opted-in gain write reaches the fake via the Bake path and persists on the block", async ({
     page,
   }) => {
     test.skip(
       await isOnline(page),
-      "offline: pins the sim's Assign-confirm behavior",
+      "offline: pins the sim's Bake write behavior",
     );
     await ensureScenario(page);
     const reampBase = await reampCounters(page);
@@ -401,38 +419,39 @@ test.describe("Level — footswitch opted-in write path (raw invoke, command-lev
     expect(dry[0].saved, "a dry run must write nothing").toBe(false);
 
     const r = (await apply(dry[0].predicted_lufs, true))[0];
-    expect(r.method).toBe("assigned");
+    expect(r.method).toBe("baked");
     expect(r.clamp_reason, "ACD_Boost is on the trunk — no routing clamp").toBe(
       null,
     );
-    expect(r.saved, "the Assign save must now complete and persist").toBe(true);
+    expect(r.saved, "the Bake save must now complete and persist").toBe(true);
     // A raw-dB gain solve must reach the wire unclamped (the `[0,12]` range's own seed).
     expect(r.final_value).toBeGreaterThan(1);
 
     const events = await simEvents(page);
+    // A Bake must never touch the switch's own `ftsw` row — that shape (a second entry on
+    // a row that already has an on-off) is the exact one `danger.md` forbids.
     const assigns = events
       .filter(isSetFootswitchAssignment)
       .map((e) => e.SetFootswitchAssignment);
-    const boost = assigns.find((a) => a.addr === 2);
+    expect(
+      assigns.some((a) => a.addr === 2),
+      `a Bake must never write ftsw: ${JSON.stringify(assigns)}`,
+    ).toBe(false);
+
+    const bakes = events
+      .filter(isChangeParameter)
+      .map((e) => e.ChangeParameter);
+    const boost = bakes.find(
+      (b) =>
+        b.node === "ACD_Boost" &&
+        b.param === "gain" &&
+        Math.abs(b.value - r.final_value) < 1e-3,
+    );
     if (!boost)
       throw new Error(
-        `no field-54 write for switch 2: ${JSON.stringify(assigns)}`,
+        `no ChangeParameter write landing the solved gain for ACD_Boost: ${JSON.stringify(bakes)}`,
       );
-    const func = JSON.parse(boost.function_json) as {
-      func: string;
-      nodeId: string;
-      parameterId: string;
-      valueA: number;
-      valueB: number;
-    };
-    expect(func.func).toBe("param");
-    expect(func.nodeId).toBe("ACD_Boost");
-    expect(func.parameterId).toBe("gain");
-    expect(Math.abs(func.valueA - r.final_value)).toBeLessThan(1e-3);
-    expect(
-      Math.abs(func.valueB - 2.5),
-      "valueB must be the switch-OFF authored base gain",
-    ).toBeLessThan(1e-3);
+    expect(boost.group).toBe("G1");
 
     await expectReampBalanced(page, reampBase);
   });
@@ -452,11 +471,15 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
   // landed together: `scenario-loudness.json`'s `leveledParams` entry for
   // `400/G1/ACD_TMSpring63/mix` on the `wetMix` curve (so the sim's capture model gives the
   // param real authority instead of reading flat), and `model_lufs`'s widened activation
-  // predicate (an Assign's isolation leaves the LEVELED block's own bypass untouched, so
-  // the old `bypass_writes[node] == Some(false)` predicate never fired for it). Mirrors
-  // `e2e_server_tests.rs::wet_mix_footswitch_pins_at_the_wet_floor_on_an_unreachable_target`
-  // + `..._converges_and_stays_off_the_floor_on_a_reachable_target` at the Playwright layer.
-  test("an unreachable target pins at the wet floor honestly; a reachable one (learned, not hard-coded) converges and saves", async ({
+  // predicate (a Bake's isolation leaves the LEVELED block's own bypass untouched, so the
+  // old `bypass_writes[node] == Some(false)` predicate never fired for it). 400's SPRING
+  // switch (3) is a bare on-off with no `param` fn of its own, so under the assign gate
+  // (user directive, 2026-08-19) it plans `Bake`, not `Assign` — `method` below reads
+  // "baked". Mirrors
+  // `e2e_server_tests.rs::wet_mix_footswitch_bakes_and_pins_at_the_wet_floor_on_an_unreachable_target`
+  // + `..._bakes_and_converges_and_stays_off_the_floor_on_a_reachable_target` at the
+  // Playwright layer.
+  test("an unreachable target bakes and pins at the wet floor honestly; a reachable one (learned, not hard-coded) bakes, converges, and saves", async ({
     page,
   }) => {
     test.skip(await isOnline(page), "offline: pins the sim's wetMix curve");
@@ -493,7 +516,7 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
     // stays null; that field's contract is "no signal on USB 1/2", which this capture has).
     // save:false — nothing worth persisting at a floor the target itself never asked for.
     const unreachable = (await apply(-70, false))[0];
-    expect(unreachable.method).toBe("assigned");
+    expect(unreachable.method).toBe("baked");
     expect(unreachable.clamped, "an unreachable target must clamp").toBe(true);
     expect(
       unreachable.wet_floor,
@@ -523,7 +546,7 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
     const probe = (await apply(-16, false))[0];
     const target = probe.clamped ? probe.predicted_lufs : -16;
     const reachable = (await apply(target, true))[0];
-    expect(reachable.method).toBe("assigned");
+    expect(reachable.method).toBe("baked");
     expect(
       reachable.clamped,
       `must actually solve, not clamp: ${JSON.stringify(reachable)}`,
@@ -540,25 +563,30 @@ test.describe("Level — wet-mix footswitch outcome (SPRING, raw invoke)", () =>
     expect(reachable.saved, "an in-range target must persist").toBe(true);
 
     const events = await simEvents(page);
+    // A Bake must never touch the switch's own `ftsw` row — the shape `danger.md` forbids.
     const assigns = events
       .filter(isSetFootswitchAssignment)
       .map((e) => e.SetFootswitchAssignment);
-    const spring = assigns.find((a) => a.addr === 3);
+    expect(
+      assigns.some((a) => a.addr === 3),
+      `a Bake must never write ftsw: ${JSON.stringify(assigns)}`,
+    ).toBe(false);
+
+    const bakes = events
+      .filter(isChangeParameter)
+      .map((e) => e.ChangeParameter);
+    const spring = bakes.find(
+      (b) =>
+        b.node === "ACD_TMSpring63" &&
+        b.param === "mix" &&
+        Math.abs(b.value - reachable.final_value) < 1e-3,
+    );
     if (!spring) {
       throw new Error(
-        `SPRING's opted-in mix write must reach the fake: ${JSON.stringify(assigns)}`,
+        `SPRING's opted-in mix write must reach the fake: ${JSON.stringify(bakes)}`,
       );
     }
-    const func = JSON.parse(spring.function_json) as {
-      func: string;
-      nodeId: string;
-      parameterId: string;
-      valueA: number;
-    };
-    expect(func.func).toBe("param");
-    expect(func.nodeId).toBe("ACD_TMSpring63");
-    expect(func.parameterId).toBe("mix");
-    expect(Math.abs(func.valueA - reachable.final_value)).toBeLessThan(1e-3);
+    expect(spring.group).toBe("G1");
 
     await expectReampBalanced(page, reampBase);
   });

@@ -812,6 +812,37 @@ pub enum FsLevelPlan {
     Clamp(String),
 }
 
+/// Push one [`FsLevelPlan::Bake`] — or a [`FsLevelPlan::BakeShared`] pointing at the job that
+/// already bakes the same `(node, param, target)`, so co-owners produce ONE device write.
+///
+/// `clear_stale` is always `None` here BY CONSTRUCTION and that is load-bearing, not an
+/// oversight: a switch that already carries a param function for this `(node, param)` took the
+/// `Assign` branch before reaching this helper (see the assign gate in
+/// [`plan_footswitch_jobs`]), so there is never a stale function left to remove. Leveling only
+/// ever EDITS an existing function or writes the block — it neither creates nor deletes one.
+#[allow(clippy::too_many_arguments)]
+fn push_bake<'j>(
+    plans: &mut Vec<FsLevelPlan>,
+    bake_rep: &mut std::collections::HashMap<(&'j str, &'j str, u64), usize>,
+    idx: usize,
+    job: &'j FsJobKey,
+    _ftsw: &Value,
+    preset: &Value,
+    engaged: Vec<(String, String, bool)>,
+) {
+    let key = (job.lev_node, job.lev_param, job.target_bits);
+    if let Some(&rep) = bake_rep.get(&key) {
+        plans.push(FsLevelPlan::BakeShared { rep });
+        return;
+    }
+    bake_rep.insert(key, idx);
+    plans.push(FsLevelPlan::Bake {
+        engaged,
+        clear_stale: None,
+        mirror_scenes: crate::scenes_restating_base(preset, job.lev_node, job.lev_param),
+    });
+}
+
 /// Decide bake-vs-assign for every job in a batch (PURE — no device I/O). `preset` is the SAVED
 /// (field-8) document — the scene gate reads its per-node overlays, so pass the read straight
 /// through, never a live field-3 graph. Returns one plan per job, aligned to `jobs`.
@@ -820,15 +851,40 @@ pub fn plan_footswitch_jobs(ftsw: &Value, preset: &Value, jobs: &[FsJobKey]) -> 
     let mut bake_rep: std::collections::HashMap<(&str, &str, u64), usize> =
         std::collections::HashMap::new();
     for (idx, job) in jobs.iter().enumerate() {
+        // THE ASSIGN GATE (user directive, 2026-08-19) — the ONE thing that decides Assign vs
+        // Bake, checked before every other consideration:
+        //
+        //   · the switch ALREADY changes the user-selected control → edit THAT function's
+        //     active value (`Assign`);
+        //   · it does not → NEVER add a new function to the switch. Write the user-selected
+        //     control's value directly (`Bake`).
+        //
+        // Leveling therefore never CREATES a footswitch function. It used to, whenever baking
+        // looked unsafe, and that appended a second entry to a row that already carried an
+        // on-off — the shape `danger.md` forbids outright: HW bisect (fw 1.8.45, 2026-08-18)
+        // proved a two-entry row makes the firmware silently replace an IMPORTED preset with
+        // an EMPTY body, under the imported display name, so the list looks right indefinitely.
+        // It also relabels the switch "MULTI" on the unit. Observed in the wild on the reported
+        // run: switch 5 of "Plumes+BD2+OCD" gained a `param` entry (valueA 0.25) it never had.
+        //
+        // The gate is `existing_param_fn_index`, i.e. exactly "is there already a param function
+        // on this switch for this (node, param)" — the same lookup `resolve_footswitch_job` then
+        // uses to pick the function to edit, so the two cannot disagree.
+        let edits_selected_control =
+            existing_param_fn_index(ftsw, job.switch, job.lev_node, job.lev_param).is_some();
+
         if !block_bypassed_in_base(preset, job.lev_node) {
-            // Block ON in base → part of the base sound → assignment, its own block measured
-            // as-saved; only force every OTHER footswitch's block off (isolation).
+            // Block ON in base → part of the base sound → measured as-saved; only force every
+            // OTHER footswitch's block off (isolation).
             // ponytail: accepted edge case — an always-on `param`-target block that some OTHER
             // switch's on-off also toggles gets forced off here while being the leveled block.
             // Exotic layout, not the reported bug; acknowledged not handled.
-            plans.push(FsLevelPlan::Assign {
-                engaged: siblings_off_excluding(ftsw, job.switch),
-            });
+            let engaged = siblings_off_excluding(ftsw, job.switch);
+            if edits_selected_control {
+                plans.push(FsLevelPlan::Assign { engaged });
+            } else {
+                push_bake(&mut plans, &mut bake_rep, idx, job, ftsw, preset, engaged);
+            }
             continue;
         }
         let activators = onoff_switches_for(ftsw, job.lev_node);
@@ -842,43 +898,26 @@ pub fn plan_footswitch_jobs(ftsw: &Value, preset: &Value, jobs: &[FsJobKey]) -> 
         // this switch's own flip. Disjoint by construction (siblings excludes own nodes).
         let mut engaged = siblings_off_excluding(ftsw, job.switch);
         engaged.extend(engaged_bypass_for_switch(ftsw, preset, job.switch));
-        // Sole-/group-owner: every active on-off activator of N must be in this (N,P,T) group.
-        let group: std::collections::HashSet<u32> = jobs
-            .iter()
-            .filter(|j| {
-                j.lev_node == job.lev_node
-                    && j.lev_param == job.lev_param
-                    && j.target_bits == job.target_bits
-            })
-            .map(|j| j.switch)
-            .collect();
-        let sole_owner = activators.iter().all(|sw| group.contains(sw));
-        // PER-NODE scene gate, by VALUE (a device-authored overlay carries every param of every
-        // node, so key presence proves nothing): a scene that FLIPS this node's bypass renders
-        // the baked value in a state the leveler never measured → Assign. A scene that overlays
-        // the LEVELED param does NOT force Assign: the overlay MASKS base (HW, Hiwatt slot 31),
-        // so a bake never leaks into it — a restating overlay gets the solved value MIRRORED
-        // (`mirror_scenes`), and a diverging one keeps its authored value (an Assign's single
-        // `valueA` would trample exactly those per-scene mixes). (A whole-preset "has any
-        // scenes" gate sent every switch of every scened preset down the Assign path, which
-        // adds a second function to the switch → the unit relabels it "MULTI".) Conservative by
-        // construction: a truncated/absent `scenes` answers true.
-        if !sole_owner || crate::scene_overlays_change_param(preset, job.lev_node, "bypass") {
-            // Can't bake safely → engaged-measured param assignment (best-effort fallback).
+        if edits_selected_control {
             plans.push(FsLevelPlan::Assign { engaged });
             continue;
         }
-        let key = (job.lev_node, job.lev_param, job.target_bits);
-        if let Some(&rep) = bake_rep.get(&key) {
-            plans.push(FsLevelPlan::BakeShared { rep });
-        } else {
-            bake_rep.insert(key, idx);
-            plans.push(FsLevelPlan::Bake {
-                engaged,
-                clear_stale: existing_param_fn_index(ftsw, job.switch, job.lev_node, job.lev_param),
-                mirror_scenes: crate::scenes_restating_base(preset, job.lev_node, job.lev_param),
-            });
-        }
+        // Everything else BAKES — writes the user-selected control directly.
+        //
+        // This lane used to consult two extra gates and fall back to `Assign` when either
+        // tripped: sole-ownership (another switch also activates this node) and a scene that
+        // FLIPS the node's bypass (which renders the baked value in a state the leveler never
+        // measured). Both are real caveats about the RESULT, but neither justifies the cure —
+        // that fallback is precisely what created the forbidden second function, and it fired
+        // broadly (it once sent every switch of every scened preset down the Assign path).
+        // Per the directive above the value now goes to the control itself in these cases too.
+        //
+        // What still protects the result: `BakeShared` collapses jobs that share
+        // `(node, param, target)` so co-owners resolve to ONE write rather than fighting, and
+        // `mirror_scenes` carries the solved value into the scenes whose overlay RESTATES base
+        // — a scene that overlays the leveled param MASKS base (HW, Hiwatt slot 31), so a bake
+        // never leaks into an authored per-scene divergence.
+        push_bake(&mut plans, &mut bake_rep, idx, job, ftsw, preset, engaged);
     }
     plans
 }
@@ -1701,9 +1740,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_assigns_when_block_on_in_base() {
-        // N ON in base → assignment; N's own block stays as-saved, but a SIBLING switch's block
-        // M is forced off (isolation) so N is measured against the clean base, not base + M.
+    fn plan_bakes_when_block_on_in_base() {
+        // N ON in base, switch 0 has only an on-off for N (no `param` fn on it) → under the
+        // assign gate (2026-08-19) this BAKES: the switch doesn't already change (N, gain), so
+        // leveling never adds a function to it — it writes the block directly instead. A
+        // SIBLING switch's block M is still forced off (isolation) so N is measured against the
+        // clean base, not base + M. This used to Assign under an "always-assign a base-on
+        // block" rule; that rule is gone, the gate is the sole decider now.
         let p = preset_with(
             false,
             None,
@@ -1711,10 +1754,16 @@ mod tests {
         );
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
         match &plans[0] {
-            FsLevelPlan::Assign { engaged } => {
+            FsLevelPlan::Bake {
+                engaged,
+                clear_stale,
+                mirror_scenes,
+            } => {
                 assert_eq!(engaged, &vec![("G1".into(), "M".into(), true)]);
+                assert_eq!(*clear_stale, None);
+                assert!(mirror_scenes.is_empty(), "no scenes → nothing to mirror");
             }
-            other => panic!("expected Assign, got {other:?}"),
+            other => panic!("expected Bake, got {other:?}"),
         }
     }
 
@@ -1737,10 +1786,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_assigns_when_second_footswitch_also_enables_n() {
-        // Switch 0 levels N, but switch 1 ALSO has an on-off for N → not sole owner →
-        // engaged-measured Assign (baking would change N for switch 1 too). N off in
-        // base ⇒ both switches saved inactive (the HW correlation).
+    fn plan_bakes_when_second_footswitch_also_enables_n() {
+        // Switch 0 levels N; switch 1 ALSO has an on-off for N, but neither switch already
+        // carries a `param` fn on (N, gain) → the assign gate says Bake for both, sharing no
+        // longer forces Assign. The old "not sole owner → Assign" fallback is gone — it was
+        // exactly the mechanism that appended a second function to a switch's row (the shape
+        // `danger.md` forbids), so co-ownership is no longer treated as an assign trigger.
+        // N off in base ⇒ both switches saved inactive (the HW correlation).
         let p = preset_with(
             true,
             None,
@@ -1748,14 +1800,19 @@ mod tests {
         );
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
         match &plans[0] {
-            FsLevelPlan::Assign { engaged } => {
+            FsLevelPlan::Bake {
+                engaged,
+                clear_stale,
+                ..
+            } => {
                 assert!(!engaged.is_empty());
                 // switch 1 targets the SAME node N → excluded from switch 0's siblings, so N is
                 // NOT force-bypassed; it's engaged (flipped on) by switch 0's own flip.
                 assert!(engaged.contains(&("G1".into(), "N".into(), false)));
                 assert!(!engaged.contains(&("G1".into(), "N".into(), true)));
+                assert_eq!(*clear_stale, None);
             }
-            other => panic!("expected engaged Assign, got {other:?}"),
+            other => panic!("expected Bake, got {other:?}"),
         }
     }
 
@@ -1840,27 +1897,29 @@ mod tests {
     }
 
     #[test]
-    fn plan_assigns_when_a_scene_overlay_touches_the_node_bypass() {
-        // The real hazard the gate exists for: a scene can flip this block ON, and it would
-        // then render the baked value in a state the leveler never measured → Assign.
+    fn plan_bakes_even_when_a_scene_overlay_touches_the_node_bypass() {
+        // The old hazard this fixture pinned: a scene flips this block ON, so a bake would
+        // render the solved value in a state the leveler never measured — that used to force
+        // Assign. Under the assign gate that consideration is GONE: the switch has no `param`
+        // fn on (N, gain), so it BAKES regardless of what any scene overlay does to the node's
+        // bypass. The old fallback (consulting `scene_overlays_change_param`) was exactly the
+        // mechanism that appended a second function to the row — danger.md's forbidden shape —
+        // so it no longer has a say in bake-vs-assign at all.
         let p = with_scene_overlay_on_n(
             preset_with(true, None, serde_json::json!([[onoff(&["N"], false)]])),
             serde_json::json!({ "bypass": false, "gain": 0.7 }),
         );
-        assert!(
-            crate::scene_overlays_change_param(&p, "N", "bypass"),
-            "fixture precondition: the scene overlay carries N's bypass"
-        );
         match &plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)])[0] {
-            FsLevelPlan::Assign { engaged } => assert!(!engaged.is_empty()),
-            other => panic!("expected engaged Assign, got {other:?}"),
+            FsLevelPlan::Bake { engaged, .. } => assert!(!engaged.is_empty()),
+            other => panic!("expected Bake, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_assigns_a_shared_block_even_when_scenes_are_clean() {
-        // Sole-ownership is unchanged by the per-node narrowing: switch 1 also enables N, so
-        // baking would move switch 1's sound too — Assign regardless of the scene overlays.
+    fn plan_bakes_a_shared_block_even_when_scenes_are_clean() {
+        // Sharing no longer matters either: switch 1 also enables N, but since NEITHER switch
+        // already carries a `param` fn on (N, gain), both bake — the old sole-ownership
+        // fallback to Assign is gone along with the scene-overlay one.
         let p = with_scene_overlay_on_n(
             preset_with(
                 true,
@@ -1869,20 +1928,22 @@ mod tests {
             ),
             serde_json::json!({ "gain": 0.7 }),
         );
-        assert!(!crate::scene_overlays_change_param(&p, "N", "bypass"));
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
-        assert!(matches!(plans[0], FsLevelPlan::Assign { .. }));
+        assert!(matches!(plans[0], FsLevelPlan::Bake { .. }));
     }
 
     #[test]
-    fn plan_assigns_when_the_saved_scene_data_is_unreadable() {
+    fn plan_bakes_even_when_the_saved_scene_data_is_unreadable() {
         // No `scenes` key = a truncated field-8 read (`scenes` sits at the document tail), NOT
-        // a scene-less preset (which reads `"scenes":[]`). Unknown must never authorise a bake.
+        // a scene-less preset (which reads `"scenes":[]`). This used to be treated as "unknown,
+        // so never bake" and forced Assign; the bake gate no longer reads scene data at all
+        // (that consultation is gone with the old fallback), so an unreadable `scenes` no
+        // longer changes the answer — the switch still has no `param` fn on (N, gain), so it
+        // still bakes.
         let mut p = preset_with(true, None, serde_json::json!([[onoff(&["N"], false)]]));
         p.as_object_mut().expect("preset object").remove("scenes");
-        assert!(crate::scene_overlays_change_param(&p, "N", "bypass"));
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
-        assert!(matches!(plans[0], FsLevelPlan::Assign { .. }));
+        assert!(matches!(plans[0], FsLevelPlan::Bake { .. }));
     }
 
     #[test]
@@ -1901,9 +1962,18 @@ mod tests {
     }
 
     #[test]
-    fn plan_case2_different_targets_do_not_share() {
-        // Same block, DIFFERENT targets → a single block value can't satisfy both → both Assign
-        // (neither is the sole owner of N for its own target group).
+    fn plan_case2_different_targets_bake_independently_not_shared() {
+        // NOT in the original failing-test list, but broken by the same rule change — the old
+        // comment's reasoning ("a single block value can't satisfy both → both Assign") no
+        // longer applies: the assign gate doesn't look at target sharing at all, only at
+        // whether the switch already carries a `param` fn on (N, gain). Neither does here, so
+        // BOTH bake. They are NOT `BakeShared` (that requires an identical `target_bits`, and
+        // these differ), so this plans two independent writes to the SAME block N with two
+        // DIFFERENT target values — whichever job's write lands last on the device wins, and
+        // there is no assign-side differentiation left to keep them apart. This is a real
+        // consequence of removing the sole-ownership fallback, flagged here rather than
+        // "fixed": the task instructions were to pin new *observed* behaviour in
+        // `plan_footswitch_jobs`, not to change it.
         let p = preset_with(
             true,
             None,
@@ -1911,24 +1981,42 @@ mod tests {
         );
         let jobs = [key(0, -23.0), key(1, -18.0)];
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &jobs);
-        assert!(matches!(plans[0], FsLevelPlan::Assign { .. }));
-        assert!(matches!(plans[1], FsLevelPlan::Assign { .. }));
+        assert!(matches!(plans[0], FsLevelPlan::Bake { .. }));
+        assert!(
+            matches!(plans[1], FsLevelPlan::Bake { .. }),
+            "different targets on a shared block: independently baked, not `BakeShared` — {:?}",
+            plans[1]
+        );
     }
 
+    // NOT in the original failing-test list, but broken by the same rule change, and it is
+    // exactly the POSITIVE half of the new rule (item 3): a switch that ALREADY carries a
+    // `param` fn on the selected (node, param) must plan `Assign`, editing that function in
+    // place — never bake-and-clear. This used to pin the opposite: a stale param fn got
+    // cleared and the value baked onto the block instead ("consolidate to one write"). That
+    // consolidation is gone — per the directive, an existing function on the selected control
+    // is the ONE thing that routes a job to `Assign` at all, and it is edited, not removed.
     #[test]
-    fn plan_clears_a_stale_param_fn_on_bake() {
-        // Switch 0 already carries a redundant param fn on (N, gain) → bake clears it.
+    fn plan_assigns_when_the_switch_already_carries_a_param_fn_for_the_node() {
+        // Switch 0 carries BOTH an on-off on N and a `param` fn on (N, gain) — the existing
+        // function is exactly what the assign gate looks for.
         let ftsw = serde_json::json!([[
             onoff(&["N"], true),
             { "func": "param", "groupId": "G1", "nodeId": "N", "parameterId": "gain",
               "valueA": 0.9, "valueB": 0.4 }
         ]]);
         let p = preset_with(true, None, ftsw);
+        assert_eq!(
+            existing_param_fn_index(&p["ftsw"], 0, "N", "gain"),
+            Some(1),
+            "fixture precondition: the switch already changes (N, gain) at index 1"
+        );
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
-        match &plans[0] {
-            FsLevelPlan::Bake { clear_stale, .. } => assert_eq!(*clear_stale, Some(1)),
-            other => panic!("expected Bake with clear_stale, got {other:?}"),
-        }
+        assert!(
+            matches!(plans[0], FsLevelPlan::Assign { .. }),
+            "expected Assign (edit the existing fn), got {:?}",
+            plans[0]
+        );
     }
 
     #[test]

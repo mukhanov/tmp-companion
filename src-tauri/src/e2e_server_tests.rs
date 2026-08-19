@@ -472,24 +472,26 @@ fn the_fs_prepass_reads_the_ceiling_at_the_handles_top_bound() {
     );
 }
 
-/// The ASSIGN write path end-to-end offline — the DOMINANT footswitch shape (any block
-/// engaged in base plans as `Assign`; `footswitch::plan_footswitch_jobs`), and the one the
-/// offline suite could not prove at all until `SimDevice` learned
-/// `setFootswitchAssignment`(54). Slot 400's Boost switch (2) is the fixture: `ACD_Boost` is
-/// `bypass: false` in base, so its plan is `Assign`, and its `gain` is the raw-dB `[0, 12]`
-/// param the write must carry unclamped.
+/// The BAKE write path end-to-end offline — the DOMINANT footswitch shape under the assign
+/// gate (user directive, 2026-08-19): a switch only plans `Assign` when it ALREADY carries a
+/// `param` function for the user-selected control, and slot 400's Boost switch (2) does not —
+/// it ships a bare on-off, so leveling `ACD_Boost.gain` writes the block directly
+/// (`FsLevelPlan::Bake`) rather than adding a function to the switch (the shape `danger.md`
+/// forbids: a two-entry row is HW-proven to make the firmware silently discard the whole
+/// imported preset). `gain` is the raw-dB `[0, 12]` param the write must carry unclamped.
 ///
 /// Four things are pinned, each of which was silently unprovable offline before:
-/// 1. the run COMPLETES (it used to die at "footswitch assignment not confirmed" — the fake
-///    swallowed field 54 and answered no `currentPresetDataRequest`),
-/// 2. the wire op sequence carries the field-54 write with the solved `valueA` and the
-///    resolved `valueB` at the appended function index,
-/// 3. the CONFIRM came from the read-back, not from an echo: the working-copy `ftsw` a
-///    `Session::live_ftsw` reads renders the new `param` function (the fake deliberately
-///    answers field 54 with nothing, exactly as the schema's no-dedicated-echo model says),
-/// 4. the assign SURVIVES the save — `leveller::verify_fs_persisted_writes` re-reads field 8
-///    and finds the solved value as `ftsw`'s `valueA`, so an offline Assign row can report an
-///    honest `persist_mismatch: Some(false)`.
+/// 1. the run COMPLETES with the write routed through `FsWrite::Bake`, not the now-refused
+///    append (`resolve_footswitch_job` would `Err` on this exact switch — see
+///    `resolve_footswitch_job_refuses_rather_than_append_a_new_function`),
+/// 2. the wire op sequence carries a `ChangeParameter` fire-and-forget setter for
+///    `ACD_Boost.gain` — and NO `setFootswitchAssignment`(54) at all, because a Bake never
+///    touches the switch's own row,
+/// 3. the switch keeps its bare single on-off entry: the working-copy `ftsw` a
+///    `Session::live_ftsw` reads is byte-identical before and after,
+/// 4. the baked value SURVIVES the save — `leveller::verify_fs_persisted_writes` re-reads
+///    field 8 and finds the solved value in `ACD_Boost.gain`'s own `dspUnitParameters`, so an
+///    offline Bake row can report an honest `persist_mismatch: Some(false)`.
 ///
 /// NOT pinned here (and deliberately): the loudness RESPONSE. Slot 400 declares no
 /// `leveledParams`, so the sim's capture model is flat in `gain` — the target below is the
@@ -497,7 +499,7 @@ fn the_fs_prepass_reads_the_ceiling_at_the_handles_top_bound() {
 /// that the offline model doesn't have. See this test's sibling note in the report on the
 /// wet-floor gap.
 #[test]
-fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
+fn bake_path_footswitch_writes_the_block_directly_and_persists_its_value() {
     let _serial = serial();
     let _reset = RegistryReset;
     set_e2e_env(&[
@@ -525,15 +527,249 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
     let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
     let ftsw = preset["ftsw"].clone();
 
-    const SWITCH: u32 = 2; // the Boost switch
+    const SWITCH: u32 = 2; // the Boost switch — a bare on-off, no `param` fn on it
     const NODE: &str = "ACD_Boost";
     const PARAM: &str = "gain";
     // Base C for slot 400 (`scenario-loudness.json`) at the fixture's own presetLevel — see
     // the note above on why the target sits exactly there.
     const TARGET: f64 = -15.0;
 
-    // The plan really is Assign — if the fixture ever bypasses ACD_Boost in base this test
-    // would quietly become a second Bake gate.
+    // The plan really is Bake — switch 2 carries no `param` fn on (ACD_Boost, gain), which is
+    // exactly the assign gate's discriminator. If the fixture ever GAINS such a fn this test
+    // would quietly become a second Assign gate.
+    assert!(
+        crate::footswitch::existing_param_fn_index(&ftsw, SWITCH, NODE, PARAM).is_none(),
+        "this fixture's premise is a switch with NO existing param fn for the control"
+    );
+    let plans = crate::footswitch::plan_footswitch_jobs(
+        &ftsw,
+        &preset,
+        &[crate::footswitch::FsJobKey {
+            switch: SWITCH,
+            lev_node: NODE,
+            lev_param: PARAM,
+            target_bits: TARGET.to_bits(),
+        }],
+    );
+    let (engaged, clear_stale, mirror_scenes) = match &plans[0] {
+        crate::footswitch::FsLevelPlan::Bake {
+            engaged,
+            clear_stale,
+            mirror_scenes,
+        } => (engaged.clone(), *clear_stale, mirror_scenes.clone()),
+        other => panic!("400 switch {SWITCH} must plan as Bake, got {other:?}"),
+    };
+    assert!(
+        clear_stale.is_none(),
+        "nothing stale to clear — this switch never had a param fn to begin with: \
+         {clear_stale:?}"
+    );
+
+    // The authored base gain — the `FsWrite::Bake` command path never calls
+    // `resolve_footswitch_job` (that seam is Assign-only); it reads the block directly.
+    let value_b = crate::commands::level_footswitch::node_param_f64(&preset, NODE, PARAM)
+        .expect("ACD_Boost.gain must be a numeric dspUnitParameter");
+    assert!(
+        (value_b - 2.5).abs() < 1e-6,
+        "valueB is ACD_Boost's authored base gain: {value_b}"
+    );
+
+    let r = crate::leveller::level_footswitch(
+        400,
+        SWITCH,
+        ("G1", NODE, PARAM),
+        &engaged,
+        &crate::leveller::FsWrite::Bake {
+            clear_stale,
+            mirror_scenes: mirror_scenes.clone(),
+        },
+        &stim,
+        TARGET,
+        true,  // save
+        false, // no re-measure verify
+        crate::last_loaded_scene(&preset),
+        &crate::leveller::FsParamTarget::new(NODE, PARAM, value_b as f32),
+    )
+    .expect("the Bake run must COMPLETE");
+    assert_eq!(r.method, "baked");
+    assert!(r.saved, "save: true must persist the bake: {r:?}");
+    assert!(
+        r.clamp_reason.is_none(),
+        "ACD_Boost is on the trunk — no routing clamp: {r:?}"
+    );
+
+    // A raw-dB param must reach the wire unclamped (the `[0, 12]` range's own 2.5 seed).
+    assert!(
+        r.final_value > 1.0,
+        "a raw-dB gain solve must not be pinned inside [0,1]: {r:?}"
+    );
+
+    // (2) the wire op: a `ChangeParameter` fire-and-forget setter for ACD_Boost.gain with the
+    // SOLVED value, and NO `setFootswitchAssignment`(54) at all — a Bake never touches the
+    // switch's own row.
+    let events = sim.events();
+    let baked = events
+        .iter()
+        .find_map(|e| match e {
+            crate::sim_device::SimEvent::ChangeParameter {
+                group,
+                node,
+                param,
+                value,
+                ..
+            } if node == NODE && param == PARAM => Some((group.clone(), *value)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no ChangeParameter write for {NODE}.{PARAM}: {events:?}"));
+    assert_eq!(baked.0, "G1");
+    assert!(
+        (baked.1 - r.final_value).abs() < 1e-6,
+        "the wire value must be the SOLVED value {}: {baked:?}",
+        r.final_value
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            crate::sim_device::SimEvent::SetFootswitchAssignment { .. }
+        )),
+        "a Bake must never touch the switch's own ftsw row: {events:?}"
+    );
+
+    // (3) the CONFIRM channel: `Session::change_parameter` is a fire-and-forget setter with
+    // no reply (its own doc comment) — unlike an Assign there is no read-back to check here.
+    // The switch's own `ftsw` row is untouched: confirm that directly, so a future Bake that
+    // accidentally starts writing `ftsw` (re-introducing the forbidden two-entry shape) fails
+    // this test rather than sailing through silently.
+    {
+        let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(400).expect("load 400");
+        let live = s.live_ftsw().expect("the field-2 re-prompt must answer");
+        assert!(
+            crate::footswitch::existing_param_fn_index(&live, SWITCH, NODE, PARAM).is_none(),
+            "a Bake must never add a param fn to the switch: {live}"
+        );
+        let sw = live
+            .as_array()
+            .and_then(|a| a.get(SWITCH as usize))
+            .and_then(|s| s.as_array())
+            .expect("switch 2's row");
+        assert_eq!(
+            sw.len(),
+            1,
+            "switch 2 must keep its single bare on-off entry, never gain a second: {sw:?}"
+        );
+    }
+
+    // (4) the save round trip, through the production persist verify (field-8 → the block's
+    // own dspUnitParameters). `is_assign: false` reads the block, not `ftsw.valueA`.
+    let mut results = vec![Some(r.clone())];
+    crate::leveller::verify_fs_persisted_writes(
+        400,
+        &[(0, NODE.to_string(), PARAM.to_string(), r.final_value, false)],
+        None,
+        &mut results,
+    );
+    assert_eq!(
+        results[0].as_ref().and_then(|x| x.persist_mismatch),
+        Some(false),
+        "the saved preset must hold the bake's value on the block: {:?}",
+        results[0]
+    );
+
+    // (5) the STALE-LOAD barrier can see it. The write session registered a
+    // `SaveWitness::Param` carrying the solved value, and for a Bake
+    // `leveller::witness_value_in_doc` matches it against the block's own `dspUnitParameters`
+    // (the `ftsw` row never changed and never could witness this write). A bake that doesn't
+    // survive the save would leave the witness unharvestable, and the barrier would silently
+    // fall out through its ~2-minute time gate on every offline Bake — so the elapsed bound,
+    // not just the `Ok`, is the assertion.
+    assert!(
+        crate::leveller::slot_save_pending_commit(400),
+        "the write session must have REGISTERED a witness — without an entry the barrier \
+         below is a no-op and asserts nothing"
+    );
+    let start = std::time::Instant::now();
+    assert!(
+        crate::leveller::ensure_fresh_load(400, &mut || false).is_ok(),
+        "the barrier must clear on the bake's own witness"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the witness must harvest on the FIRST load, not via the time gate: {:?}",
+        start.elapsed()
+    );
+}
+
+/// The ASSIGN write path end-to-end offline — the shape a switch takes ONLY when it already
+/// carries a `param` function for the user-selected control (the assign gate, user directive
+/// 2026-08-19). Slot 400's param-only switches (VERB KILL, WAH SWEEP) don't fit this test: both
+/// target a node some OTHER switch also toggles on-off, so `siblings_off_excluding`'s isolation
+/// — which only ever excludes THIS switch's OWN on-off nodes, and a param-only switch has none —
+/// force-bypasses the very block being leveled (the "ponytail" edge case `plan_footswitch_jobs`
+/// already flags as acknowledged-not-handled). That's a real, separate gap, not this gate's
+/// subject, so it stays unexercised here rather than being smuggled in as if it were clean.
+///
+/// Slot 407 (the Doctor-oracle fixture) has a clean case instead: switch 13's WASHED is a
+/// `param` fn on `plate1.wetdrymix` (a `wet_mix`-classified control, unlike Slot 400's
+/// raw-dB `ACD_Boost.gain`), and NO other switch in 407 references that node at all — so the
+/// isolation list can never touch it. `wetdrymix` is `bypass: false` in base, so the switch
+/// plans `Assign`.
+///
+/// Four things are pinned, each of which was silently unprovable offline before:
+/// 1. the run COMPLETES via `FsWrite::Assign`,
+/// 2. the wire op sequence carries the field-54 write with the solved `valueA` and the
+///    resolved `valueB` at the function's OWN index (0) — never appended at `sw.len()`,
+///    matching `resolve_footswitch_job`'s edit-in-place resolution,
+/// 3. the CONFIRM came from the read-back, not from an echo: the working-copy `ftsw` a
+///    `Session::live_ftsw` reads renders the EDITED function at the same index, with every
+///    switch-level field (`colorA`/`colorB`/`customLabel`/`linkGroup`/`switchType`) preserved
+///    exactly as the switch already had them,
+/// 4. the assign SURVIVES the save — `leveller::verify_fs_persisted_writes` re-reads field 8
+///    and finds the solved value as `ftsw`'s `valueA`.
+///
+/// `TARGET` sits at 407's own base C (`scenario-loudness.json`: "Base C=-14 solves at every
+/// default"), so the solve converges on its first seed rather than chasing a curve the offline
+/// model doesn't have — same reasoning as the Bake gate's own target pick.
+#[test]
+fn assign_path_footswitch_edits_its_existing_function_at_its_own_index_and_persists_its_value_a() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    crate::leveller::clear_slot_save_registry();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let stim = test_stim();
+
+    let spec_json = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec_json
+        .iter()
+        .find(|p| p.list_index == 407)
+        .expect("407 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("407 json");
+    let ftsw = preset["ftsw"].clone();
+
+    const SWITCH: u32 = 13; // WASHED — an existing `param` fn, no ponytail conflict
+    const NODE: &str = "plate1";
+    const PARAM: &str = "wetdrymix";
+    const TARGET: f64 = -14.0; // 407's own base C
+
+    // The plan really is Assign — switch 7 ALREADY changes (NODE, PARAM), at its own index 0.
+    assert_eq!(
+        crate::footswitch::existing_param_fn_index(&ftsw, SWITCH, NODE, PARAM),
+        Some(0),
+        "this fixture's premise is a switch whose ONLY entry already edits this control"
+    );
     let plans = crate::footswitch::plan_footswitch_jobs(
         &ftsw,
         &preset,
@@ -546,35 +782,69 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
     );
     let engaged = match &plans[0] {
         crate::footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
-        other => panic!("400 switch {SWITCH} must plan as Assign, got {other:?}"),
+        other => panic!("407 switch {SWITCH} must plan as Assign, got {other:?}"),
     };
+    assert!(
+        !engaged.iter().any(|(_, n, _)| n == NODE),
+        "no OTHER switch in 407 toggles this node, so the isolation list must never force it: \
+         {engaged:?}"
+    );
 
-    // The production resolution (`valueB` = the param's base value, spec = APPEND at the next
-    // free index, inheriting the switch's own display fields).
+    // The production resolution: edit the EXISTING function at ITS OWN index, inheriting the
+    // switch's own display fields — never append.
     let job = crate::commands::level_footswitch::FootswitchLevelJob {
         switch: SWITCH,
         lev_group_id: "G1".into(),
         lev_node_id: NODE.into(),
         lev_parameter_id: PARAM.into(),
         target_lufs: TARGET,
-        display_label: None,
         scene_context: None,
     };
     let (value_b, write_spec) =
         crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
-            .expect("resolve the Boost job");
+            .expect("resolve the WASHED job");
     assert!(
-        (value_b - 2.5).abs() < 1e-6,
-        "valueB is ACD_Boost's authored base gain: {value_b}"
+        value_b.abs() < 1e-6,
+        "valueB is plate1's authored base wetdrymix (fully dry): {value_b}"
     );
     let function_index = write_spec.function_index;
     assert_eq!(
-        function_index, 1,
-        "the leveling param fn APPENDS after the switch's existing on-off"
+        function_index, 0,
+        "the leveling param fn EDITS the switch's own existing function — never appends"
+    );
+    assert_eq!(
+        write_spec.color_a, 5,
+        "switch-level fields must be preserved: {write_spec:?}"
+    );
+    assert_eq!(
+        write_spec.color_b, 0,
+        "switch-level fields must be preserved: {write_spec:?}"
+    );
+    assert_eq!(
+        write_spec.custom_label, "WASHED",
+        "switch-level fields must be preserved: {write_spec:?}"
+    );
+    assert_eq!(
+        write_spec.link_group, 0,
+        "switch-level fields must be preserved: {write_spec:?}"
+    );
+    assert_eq!(
+        write_spec.switch_type, 0,
+        "switch-level fields must be preserved: {write_spec:?}"
+    );
+    assert!(
+        !write_spec.is_active,
+        "the fixture's own function is authored disengaged: {write_spec:?}"
     );
 
+    let param = crate::leveller::FsParamTarget::new(NODE, PARAM, value_b);
+    assert_eq!(
+        param.info.class,
+        crate::param_class::ParamClass::WetMix,
+        "plate1.wetdrymix must classify wet_mix"
+    );
     let r = crate::leveller::level_footswitch(
-        400,
+        407,
         SWITCH,
         ("G1", NODE, PARAM),
         &engaged,
@@ -587,17 +857,18 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
         true,  // save
         false, // no re-measure verify
         crate::last_loaded_scene(&preset),
-        &crate::leveller::FsParamTarget::new(NODE, PARAM, value_b),
+        &param,
     )
     .expect("the Assign run must COMPLETE — it used to fail its confirm gate offline");
     assert_eq!(r.method, "assigned");
     assert!(r.saved, "save: true must persist the assign: {r:?}");
     assert!(
         r.clamp_reason.is_none(),
-        "ACD_Boost is on the trunk — no routing clamp: {r:?}"
+        "plate1 is on the trunk — no routing clamp: {r:?}"
     );
 
-    // (2) the field-54 write, with the solved valueA and the resolved valueB.
+    // (2) the field-54 write, at the resolved (OWN, never appended) index, with the solved
+    // valueA and the resolved valueB.
     let events = sim.events();
     let assign = events
         .iter()
@@ -611,12 +882,19 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("no field-54 write for switch {SWITCH}: {events:?}"));
-    assert_eq!(assign.0, function_index, "written at the resolved index");
+    assert_eq!(
+        assign.0, function_index,
+        "written at the resolved (own) index"
+    );
     assert!(!assign.2, "production never sets the swap flag");
     let func: serde_json::Value = serde_json::from_str(&assign.1).expect("functionJson parses");
     assert_eq!(func["func"], "param");
     assert_eq!(func["nodeId"], NODE);
     assert_eq!(func["parameterId"], PARAM);
+    assert_eq!(
+        func["customLabel"], "WASHED",
+        "the switch's own label survives the edit"
+    );
     assert!(
         (func["valueA"].as_f64().expect("valueA") - f64::from(r.final_value)).abs() < 1e-6,
         "valueA must be the SOLVED value {}: {func}",
@@ -626,32 +904,40 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
         (func["valueB"].as_f64().expect("valueB") - f64::from(value_b)).abs() < 1e-6,
         "valueB must be the switch-OFF base value: {func}"
     );
-    // A raw-dB param must reach the wire unclamped (the `[0, 12]` range's own 0.25 seed).
-    assert!(
-        r.final_value > 1.0,
-        "a raw-dB gain solve must not be pinned inside [0,1]: {r:?}"
-    );
 
-    // (3) the CONFIRM channel: the working copy a `live_ftsw` read renders carries the new
-    // function. Asserted through the same session call the leveler's read-back branch uses,
-    // so a future field-54 echo can't silently retire this coverage.
+    // (3) the CONFIRM channel: the working copy a `live_ftsw` read renders carries the EDITED
+    // function at the SAME index — the switch still carries exactly one entry.
     {
         let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
-        s.load_preset(400).expect("load 400");
+        s.load_preset(407).expect("load 407");
         let live = s.live_ftsw().expect("the field-2 re-prompt must answer");
+        assert_eq!(
+            crate::footswitch::existing_param_fn_index(&live, SWITCH, NODE, PARAM),
+            Some(0),
+            "the edited function must still be at its own index: {live}"
+        );
         let value_a = crate::footswitch::existing_param_fn_value_a(&live, SWITCH, NODE, PARAM)
             .unwrap_or_else(|| panic!("no param fn on switch {SWITCH} in the live ftsw: {live}"));
         assert!(
             (value_a - f64::from(r.final_value)).abs() < 1e-6,
             "the live ftsw must render the solved valueA, got {value_a}"
         );
+        let sw = live
+            .as_array()
+            .and_then(|a| a.get(SWITCH as usize))
+            .and_then(|s| s.as_array())
+            .expect("switch 7's row");
+        assert_eq!(
+            sw.len(),
+            1,
+            "an edit-in-place must never grow the row to two entries: {sw:?}"
+        );
     }
 
     // (4) the save round trip, through the production persist verify (field-8 → ftsw valueA).
-    // `base_expect: None` keeps `base_reverted` out of it, so this isolates the ftsw path.
     let mut results = vec![Some(r.clone())];
     crate::leveller::verify_fs_persisted_writes(
-        400,
+        407,
         &[(0, NODE.to_string(), PARAM.to_string(), r.final_value, true)],
         None,
         &mut results,
@@ -663,21 +949,15 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
         results[0]
     );
 
-    // (5) the STALE-LOAD barrier can see it. The write session registered a
-    // `SaveWitness::Param` carrying the solved value, and for an Assign
-    // `leveller::witness_value_in_doc` can only match it against `ftsw`'s `valueA` (the
-    // block's own `dspUnitParameters` still holds the switch-OFF value and never can). An
-    // `ftsw` that doesn't survive the save would leave the witness unharvestable, and the
-    // barrier would silently fall out through its ~2-minute time gate on every offline
-    // Assign — so the elapsed bound, not just the `Ok`, is the assertion.
+    // (5) the STALE-LOAD barrier can see it, same contract as the Bake gate above.
     assert!(
-        crate::leveller::slot_save_pending_commit(400),
+        crate::leveller::slot_save_pending_commit(407),
         "the write session must have REGISTERED a witness — without an entry the barrier \
          below is a no-op and asserts nothing"
     );
     let start = std::time::Instant::now();
     assert!(
-        crate::leveller::ensure_fresh_load(400, &mut || false).is_ok(),
+        crate::leveller::ensure_fresh_load(407, &mut || false).is_ok(),
         "the barrier must clear on the assign's own witness"
     );
     assert!(
@@ -687,11 +967,12 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
     );
 }
 
-/// COVERAGE row 18 — the WET-FLOOR outcome, end to end offline. 400's SPRING switch (3)
-/// toggles `ACD_TMSpring63`, which is `bypass: false` in base, so its plan is `Assign` and
-/// its `mix` (authored 0.42) classifies `wet_mix`: `FsParamTarget::bounds` raises the solve's
-/// LOW bound to `WET_FLOOR_FRACTION` (0.25) x 0.42 = 0.105, because driving a reverb's mix
-/// toward 0 to hit a loudness target doesn't make the effect quieter, it DELETES it.
+/// COVERAGE row 18 — the WET-FLOOR outcome, end to end offline. 400's SPRING switch (3) is a
+/// bare on-off with no `param` fn on `ACD_TMSpring63`, so its plan is `Bake` (the assign gate,
+/// user directive 2026-08-19) and its `mix` (authored 0.42) classifies `wet_mix`:
+/// `FsParamTarget::bounds` raises the solve's LOW bound to `WET_FLOOR_FRACTION` (0.25) x 0.42
+/// = 0.105, because driving a reverb's mix toward 0 to hit a loudness target doesn't make the
+/// effect quieter, it DELETES it.
 ///
 /// Two runs, one gate:
 /// * an UNREACHABLE target pins at that floor and reports `wet_floor: true` — the honest
@@ -703,25 +984,25 @@ fn assign_path_footswitch_confirms_by_readback_and_persists_its_value_a() {
 ///
 /// This was unprovable offline until two things landed together (either alone leaves it
 /// red): the sidecar's `leveledParams` entry for `400 / G1 / ACD_TMSpring63 / mix` on the
-/// `wetMix` curve, and `model_lufs`'s widened activation predicate — an Assign's isolation
+/// `wetMix` curve, and `model_lufs`'s widened activation predicate — a Bake's isolation
 /// (`siblings_off_excluding`) forces only the OTHER switches' blocks off, so the LEVELED
 /// block gets no bypass write and the old `bypass_writes[node] == Some(false)` predicate
 /// never fired. With a flat capture model both seeds read the same C, `solve_param_secant`
 /// took its no-authority `flat_response` exit at the low SEED (`at_fraction(0.25)` = 0.32875)
 /// and never reached the floor at all — which is what row 18 previously mis-attributed to
-/// the Assign path skipping the floor.
+/// the Bake path skipping the floor.
 ///
 /// `save: false` on BOTH runs, deliberately: the sim's `preset_level` starts at 1.0 and a
 /// load only restores the fixture's own 0.32 once the slot has been saved this run, so a
 /// saving first run would shift every later capture by -9.9 LU and the second assertion
-/// would fail for a reason that looks nothing like its cause. The Assign save round trip is
-/// `assign_path_footswitch_confirms_by_readback_and_persists_its_value_a`'s job.
+/// would fail for a reason that looks nothing like its cause. The Bake save round trip is
+/// `bake_path_footswitch_writes_the_block_directly_and_persists_its_value`'s job.
 #[test]
-fn wet_mix_footswitch_pins_at_the_wet_floor_on_an_unreachable_target() {
+fn wet_mix_footswitch_bakes_and_pins_at_the_wet_floor_on_an_unreachable_target() {
     let _serial = serial();
     let _reset = RegistryReset;
     let (r, param) = solve_400_spring(-70.0);
-    assert_eq!(r.method, "assigned");
+    assert_eq!(r.method, "baked");
     assert!(r.clamped, "an unreachable target must clamp: {r:?}");
     assert!(
         r.wet_floor,
@@ -755,12 +1036,12 @@ fn wet_mix_footswitch_pins_at_the_wet_floor_on_an_unreachable_target() {
 /// so an epsilon in the model can't flip this row into a floor clamp and quietly retire the
 /// discrimination this pair exists to prove.
 #[test]
-fn wet_mix_footswitch_converges_and_stays_off_the_floor_on_a_reachable_target() {
+fn wet_mix_footswitch_bakes_and_converges_and_stays_off_the_floor_on_a_reachable_target() {
     let _serial = serial();
     let _reset = RegistryReset;
     const TARGET: f64 = -16.0;
     let (r, param) = solve_400_spring(TARGET);
-    assert_eq!(r.method, "assigned");
+    assert_eq!(r.method, "baked");
     assert!(
         !r.clamped && !r.unconverged,
         "a reachable target must SOLVE: {r:?}"
@@ -781,10 +1062,12 @@ fn wet_mix_footswitch_converges_and_stays_off_the_floor_on_a_reachable_target() 
 }
 
 /// Shared body of the two wet-floor gates: install a fresh sim, prove 400's SPRING switch
-/// really plans as `Assign` (a fixture edit that bypasses `ACD_TMSpring63` in base would
-/// otherwise silently turn both gates into Bake tests), resolve the production `valueB` /
-/// write spec, and run the single-switch seam DRY. Returns the result plus the classified
-/// target, so each caller can assert against the same `bounds()` the solve used.
+/// (the on-off, switch 3) really plans as `Bake` — it carries no `param` fn on
+/// `(ACD_TMSpring63, mix)`, only the plain on-off (a fixture edit that added such a fn, or
+/// that bypassed `ACD_TMSpring63` in base, would otherwise silently turn both gates into a
+/// different path) — read the authored base mix off the block, and run the single-switch
+/// seam DRY. Returns the result plus the classified target, so each caller can assert against
+/// the same `bounds()` the solve used.
 fn solve_400_spring(
     target_lufs: f64,
 ) -> (
@@ -808,7 +1091,7 @@ fn solve_400_spring(
     crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
     let stim = test_stim();
 
-    const SWITCH: u32 = 3; // SPRING
+    const SWITCH: u32 = 3; // SPRING — a bare on-off, no `param` fn on it
     const NODE: &str = "ACD_TMSpring63";
     const PARAM: &str = "mix";
 
@@ -820,6 +1103,10 @@ fn solve_400_spring(
     let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
     let ftsw = preset["ftsw"].clone();
 
+    assert!(
+        crate::footswitch::existing_param_fn_index(&ftsw, SWITCH, NODE, PARAM).is_none(),
+        "this fixture's premise is a switch with NO existing param fn for the control"
+    );
     let plans = crate::footswitch::plan_footswitch_jobs(
         &ftsw,
         &preset,
@@ -830,34 +1117,35 @@ fn solve_400_spring(
             target_bits: target_lufs.to_bits(),
         }],
     );
-    let engaged = match &plans[0] {
-        crate::footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
-        other => panic!("400 switch {SWITCH} must plan as Assign, got {other:?}"),
+    let (engaged, clear_stale, mirror_scenes) = match &plans[0] {
+        crate::footswitch::FsLevelPlan::Bake {
+            engaged,
+            clear_stale,
+            mirror_scenes,
+        } => (engaged.clone(), *clear_stale, mirror_scenes.clone()),
+        other => panic!("400 switch {SWITCH} must plan as Bake, got {other:?}"),
     };
     assert!(
         !engaged.iter().any(|(_, n, _)| n == NODE),
-        "an Assign isolates only the SIBLINGS — the leveled block must get no bypass write, \
+        "a Bake isolates only the SIBLINGS — the leveled block must get no bypass write, \
          which is exactly what the widened `model_lufs` predicate exists to handle: {engaged:?}"
     );
+    assert!(
+        clear_stale.is_none(),
+        "nothing stale to clear — this switch never had a param fn to begin with: \
+         {clear_stale:?}"
+    );
 
-    let job = crate::commands::level_footswitch::FootswitchLevelJob {
-        switch: SWITCH,
-        lev_group_id: "G1".into(),
-        lev_node_id: NODE.into(),
-        lev_parameter_id: PARAM.into(),
-        target_lufs,
-        display_label: None,
-        scene_context: None,
-    };
-    let (value_b, write_spec) =
-        crate::commands::level_footswitch::resolve_footswitch_job(&ftsw, &preset, &job)
-            .expect("resolve the SPRING job");
+    // The `FsWrite::Bake` command path never calls `resolve_footswitch_job` (Assign-only); it
+    // reads the block directly.
+    let value_b = crate::commands::level_footswitch::node_param_f64(&preset, NODE, PARAM)
+        .expect("ACD_TMSpring63.mix must be a numeric dspUnitParameter");
     assert!(
         (value_b - 0.42).abs() < 1e-6,
         "valueB is ACD_TMSpring63's authored base mix: {value_b}"
     );
 
-    let param = crate::leveller::FsParamTarget::new(NODE, PARAM, value_b);
+    let param = crate::leveller::FsParamTarget::new(NODE, PARAM, value_b as f32);
     assert_eq!(
         param.info.class,
         crate::param_class::ParamClass::WetMix,
@@ -868,9 +1156,9 @@ fn solve_400_spring(
         SWITCH,
         ("G1", NODE, PARAM),
         &engaged,
-        &crate::leveller::FsWrite::Assign {
-            value_b,
-            spec: write_spec,
+        &crate::leveller::FsWrite::Bake {
+            clear_stale,
+            mirror_scenes,
         },
         &stim,
         target_lufs,
@@ -1810,12 +2098,14 @@ fn base_leveling_measures_the_preset_as_saved_not_with_the_footswitches_forced_o
 /// anything sends these switches down Assign (the MULTI regression) or mirrors a diverging
 /// scene.
 ///
-/// The shipped discriminator is `scene_jobs::scene_overlays_change_param`, asked once for
-/// `bypass` and once for the LEVELED param, by VALUE. Key presence was not enough: this
-/// fixture's device-authored overlays carry the full param set for every node in every scene, so
-/// a "does the `bypass` KEY appear" gate is true of every switch of every preset the unit itself
-/// wrote — it collapsed to the whole-preset gate and the added-function / "MULTI" symptom
-/// survived. Pure planner test (no device): `plan_footswitch_jobs` is the whole decision.
+/// The shipped discriminator (2026-08-19) is simpler than either scene-reading gate this test
+/// used to pin: `plan_footswitch_jobs`'s assign gate decides bake-vs-assign purely off whether
+/// the switch ALREADY carries a `param` fn for the selected (node, param) — none of this
+/// fixture's four switches do, so all four bake regardless of what any scene overlay does.
+/// Mirroring is still VALUE-based (`scenes_restating_base`): this fixture's device-authored
+/// overlays carry the full param set for every node in every scene, so a bare "does the key
+/// appear" check would mirror into every scene including the ones that authored their own
+/// value. Pure planner test (no device): `plan_footswitch_jobs` is the whole decision.
 #[test]
 fn hiwatt_footswitch_plan_bakes_and_mirrors_only_the_scenes_restating_base() {
     let _serial = serial(); // pure, but it writes the shared scenario-path env

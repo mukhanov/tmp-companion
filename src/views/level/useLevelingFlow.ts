@@ -565,12 +565,10 @@ export function useLevelingFlow({
                 slot: it.slot,
                 jobs: group.flatMap((g) => {
                   if (g.footswitch == null) return [];
-                  // The row name IS the switch's current display label
-                  // (`footswitchName`) — sent so the backend can keep it when an
-                  // assign adds a second function to an unlabelled switch.
-                  return [
-                    toFootswitchJobWire(g.footswitch, targetOf(g), g.sceneName),
-                  ];
+                  // The backend never creates a footswitch function any more (assign
+                  // only edits an EXISTING `param` fn or refuses), so there is nothing
+                  // for a row's display name to travel over the wire for.
+                  return [toFootswitchJobWire(g.footswitch, targetOf(g))];
                 }),
                 save: true,
                 topologyId: profile?.topology_id ?? null,

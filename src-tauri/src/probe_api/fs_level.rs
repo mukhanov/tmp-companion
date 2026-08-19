@@ -658,8 +658,6 @@ pub fn probe_level_footswitch(
         lev_parameter_id: lev_param.to_string(),
         target_lufs,
         // probe: solve-and-write, never the verify-only row.
-        // probe: no UI row label to preserve.
-        display_label: None,
         scene_context: None,
     };
     let plan = footswitch::plan_footswitch_jobs(
@@ -788,7 +786,6 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
                 lev_node_id: p.node_id.clone(),
                 lev_parameter_id: p.parameter_id.clone(),
                 target_lufs: -24.0,
-                display_label: None,
                 scene_context: None,
             })
         })

@@ -280,11 +280,6 @@ export interface FootswitchLevelJobWire {
   levNodeId: string;
   levParameterId: string;
   targetLufs: number;
-  /** The switch's CURRENT display label (the Level list's row name). The backend
-   * writes it as the switch's `customLabel` when it adds a second function to an
-   * UNLABELLED switch — the unit displays "MULTI" for a multi-function switch with
-   * no label, so this keeps the pedalboard display unchanged. */
-  displayLabel?: string;
   /** THE SCENE CONTEXT this switch's sound is measured and solved in (D3): a 0-based
    *  `scenes[]` wire slot, or omitted/null = the preset's BASE sound. Mirrors
    *  `FootswitchLevelJob::scene_context`. */
@@ -292,11 +287,13 @@ export interface FootswitchLevelJobWire {
 }
 
 /** Build one `levelFootswitchesApply` job from a `FootswitchTarget` — the ONE place
- * that turns the frontend's row shape into the wire's field names. */
+ * that turns the frontend's row shape into the wire's field names. The backend never
+ * creates a footswitch function any more (the assign gate only ever edits an EXISTING
+ * `param` fn or refuses), so there is no more "MULTI"-avoidance write to carry a row's
+ * display name over — `displayLabel` is gone from the wire shape. */
 export function toFootswitchJobWire(
   target: FootswitchTarget,
   targetLufs: number,
-  displayLabel: string,
 ): FootswitchLevelJobWire {
   return {
     switch: target.switchIndex,
@@ -304,7 +301,6 @@ export function toFootswitchJobWire(
     levNodeId: target.levNodeId,
     levParameterId: target.levParameterId,
     targetLufs,
-    displayLabel,
     sceneContext: target.sceneContext,
   };
 }

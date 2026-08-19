@@ -224,22 +224,21 @@ export function instrumentName(
  *  toggled block's friendly name (many presets leave the label blank — a nameless row
  *  is useless, so fall back to e.g. "Tube Screamer" from the leveled block's id).
  *
- *  NOT display-only: this string flows into `displayLabel`, which the backend writes
- *  as the switch's on-device `customLabel` on save — a wrong pick here is a WIRE WRITE,
- *  not cosmetic. So the fallback never reaches for an arbitrary candidate: it names the
- *  row after the tone-safe DEFAULT level param (the same one Set up recommends), and
- *  only falls further back to the switch's own toggled/adjusted block (its first
- *  function's `fender_id`) when there is no classifiable level param at all. */
+ *  Never sent to the backend (the assign gate only ever edits an EXISTING `param` fn or
+ *  refuses — it never writes a switch's on-device `customLabel`), but still not an
+ *  arbitrary pick: it names the row after the tone-safe DEFAULT level param (the same
+ *  one Set up recommends), and only falls further back to the switch's own
+ *  toggled/adjusted block (its first function's `fender_id`) when there is no
+ *  classifiable level param at all — so the displayed name stays a meaningful guess. */
 /** The fallback row name for an UNLABELED switch, given the candidate that will actually
  *  be leveled — the block that candidate lives on.
  *
  *  Split out of [`footswitchName`] because the name is chosen TWICE at different moments:
  *  once at list-build time (`chosenFrom`, which only knows the tone-safe DEFAULT candidate)
- *  and again at run-start, if the user overrode that default in Set up. The second call is
- *  not cosmetic — the string reaches `displayLabel`, which the backend writes as the
- *  switch's on-device `customLabel` when an assign appends a function to an unlabeled
- *  switch. Naming it after the default while leveling something else is a WIRE WRITE that
- *  mislabels the player's pedalboard. */
+ *  and again at run-start, if the user overrode that default in Set up. The second call
+ *  keeps the DISPLAYED row name honest about what is actually being leveled — never sent
+ *  to the backend, but naming it after the default while leveling something else would
+ *  still mislead the player reading their own Level list. */
 export function footswitchNameForCandidate(c: LevelParamCandidate): string {
   return shortFallback(c.fender_id);
 }
@@ -304,11 +303,11 @@ export interface SetupOption {
    *  `sceneName` above is a derived fallback naming the DEFAULT candidate's block — not
    *  the player's own name for the switch.
    *
-   *  Load-bearing at run-start, not display: `sceneName` becomes `displayLabel`, which the
-   *  backend writes as the switch's on-device `customLabel`. If the user picks a different
-   *  candidate in Set up, the row must be RE-NAMED after the block actually being leveled
-   *  (`SetupBody.start`), or the unit ends up labelled after a block the run never touched.
-   *  A LABELED switch is never renamed: that string is the player's, not ours. */
+   *  Re-checked at run-start, not just at list-build: `sceneName` is the Level list's row
+   *  name (never sent to the backend). If the user picks a different candidate in Set up,
+   *  the row must be RE-NAMED after the block actually being leveled (`SetupBody.start`),
+   *  or the DISPLAYED row keeps naming a block the run never touched. A LABELED switch is
+   *  never renamed: that string is the player's, not ours. */
   fsUnlabeled?: boolean;
   /** Scene rows only: the user's chosen leveling control, INSTEAD of the active amp's
    *  `outputLevel` — undefined/null = the amp default (every existing caller). */

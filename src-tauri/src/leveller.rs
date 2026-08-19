@@ -2601,15 +2601,22 @@ pub(crate) fn reamp_off_guaranteed(tag: &str) {
 /// writing NOTHING. Every scene ceiling in the prepass and every jointk/verify as-is
 /// reading comes through here.
 ///
-/// The recall→engage sequence is the NAKED shape `capture_on_session` breaks with
-/// heartbeats, and this seam does not route through that function, so it carries its
-/// own copy of the breaker. Without it the engage lands on a single 300 ms gap after
-/// `load_scene` and the capture reads the device's stationary output floor instead of
-/// the stimulus; `require_live` (this seam's only caller shape) then surfaces that as
-/// a hard "couldn't read this sound" error. Same cadence as the shared breaker —
-/// recall → 300 → hb → 300 → hb → 300 → engage — keeping every idle gap ≤300 ms and
-/// landing the engage ~900 ms post-recall. Evidence: gotchas.md "An engage after a
-/// naked scene recall latches silence".
+/// The recall→engage sequence is shaped like the NAKED shape `capture_on_session` breaks
+/// with heartbeats, and this seam does NOT route through that function — so it carries its
+/// own copy of the breaker: recall → 300 → hb → 300 → hb → 300 → engage, every idle gap
+/// ≤300 ms and the engage ~900 ms post-recall.
+///
+/// HARDENING, NOT A FIX FOR AN OBSERVED FAILURE — be precise about this, because the
+/// evidence cuts the other way. gotchas.md "An engage after a naked scene recall latches
+/// silence" records THIS seam's old `load_scene → 300 → engage` shape measuring the same
+/// heavy amp-flip scenes LOUD, and cites that as the wrinkle favouring the idle-gap
+/// mechanism over the DSP-mute one; the shapes that died were `probe --measure-scene`,
+/// which reaches the engage through `capture_on_session`. So this is defence in depth:
+/// the seam sat one un-analysed 300 ms gap away from the failing shape while the
+/// mechanism is only partly understood, and `require_live` turns a floor read here into a
+/// hard "couldn't read this sound" error. It costs 600 ms per as-is reading and moves the
+/// timing onto the HW-proven-green cadence. Do NOT cite it as the cause of a scene-read
+/// failure without new evidence.
 ///
 /// `intended_preset_level` is the run's OWN `presetLevel` — the value it solved or is
 /// holding UNSAVED in the working copy — re-asserted right after the recall. The recall runs

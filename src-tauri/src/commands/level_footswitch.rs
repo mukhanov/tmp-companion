@@ -21,13 +21,6 @@ pub(crate) struct FootswitchLevelJob {
     /// This row's OWN loudness target. Per-row (not one batch target) so a preset with a
     /// mix of targets levels in ONE batch — one prepass, one runner, one deferred save.
     pub(crate) target_lufs: f64,
-    /// The switch's CURRENT display label as the UI shows it (the Level list's footswitch row
-    /// name: the player's `customLabel`, else the toggled block's friendly name). Used ONLY
-    /// when the assign path appends a second function to a switch whose `customLabel` is empty
-    /// — the unit displays "MULTI" for a multi-function switch with no label, so writing the
-    /// prior display name keeps the pedalboard reading the same. Absent → today's behavior.
-    #[serde(default)]
-    pub(crate) display_label: Option<String>,
     /// THE SCENE CONTEXT this switch's sound is measured and solved in (D3): a 0-based
     /// `scenes[]` wire slot, or `None` = the preset's BASE sound (the historical behaviour and
     /// the serde default, so an existing payload with no `sceneContext` key is unchanged).
@@ -146,38 +139,25 @@ pub(crate) fn resolve_footswitch_job(
             switch_type: field_u64(Some(a), "switchType", 0),
         },
         None => {
-            if sw.len() >= 5 {
-                return Err(format!(
-                    "footswitch {} is full (5 functions) — no room to add a leveling param",
-                    job.switch
-                ));
-            }
-            // A new assignment must INHERIT the switch-level fields from an existing
-            // sibling function (`sw.first()`), not hardcode defaults: a linked
-            // on-off's linkGroup would otherwise drop the switch out of its Switch
-            // Link, and colour/label would silently diverge from the switch's other
-            // assignments (Fender's own CloudPresets multi-function switches keep
-            // all five fields identical across every assignment). Falls back to the
-            // historical constants only when the switch has no existing function.
-            let sibling = sw.first();
-            // A second function on an UNLABELLED switch makes the unit display "MULTI" instead
-            // of the single function's implied name. Nothing else changes the label: an already
-            // labelled switch keeps the player's own text (inherited), and the first function on
-            // an empty switch shows its own name, so there is nothing to preserve there.
-            let inherited = field_str(sibling, "customLabel");
-            let custom_label = match (inherited.is_empty(), sibling, &job.display_label) {
-                (true, Some(_), Some(shown)) => shown.clone(),
-                _ => inherited,
-            };
-            leveller::FootswitchWriteSpec {
-                function_index: sw.len() as u32,
-                color_a: field_u64(sibling, "colorA", 3),
-                color_b: field_u64(sibling, "colorB", 0),
-                custom_label,
-                link_group: field_u64(sibling, "linkGroup", 0),
-                is_active: false,
-                switch_type: field_u64(sibling, "switchType", 0),
-            }
+            // UNREACHABLE BY DESIGN, and a hard refusal rather than an append.
+            //
+            // `footswitch::plan_footswitch_jobs` only answers `Assign` when the switch ALREADY
+            // carries a param function for this `(node, param)` — the same
+            // `existing_param_fn_index` lookup as above — and every other job BAKES. So a
+            // `None` here means the plan and this resolver disagreed, and the old behaviour
+            // (append at `function_index: sw.len()`) would then create a SECOND entry on a row
+            // that already has an on-off: the shape `danger.md` forbids, HW-proven (fw 1.8.45)
+            // to make the firmware silently replace an IMPORTED preset with an EMPTY body under
+            // its own display name. Refusing loses one row; appending can lose the preset.
+            //
+            // Keep this as a guard, not an `unreachable!()`: it is the last thing standing
+            // between a future planner change and a silently gutted preset.
+            return Err(format!(
+                "footswitch {} does not already change {} on {} — leveling never adds a \
+                 function to a footswitch (it would make the row carry two entries, which the \
+                 firmware discards the whole preset over); this row must be baked instead",
+                job.switch, job.lev_parameter_id, job.lev_node_id
+            ));
         }
     };
     Ok((value_b, spec))
@@ -689,7 +669,6 @@ mod tests {
             lev_node_id: "amp".into(),
             lev_parameter_id: "drive".into(),
             target_lufs: -20.0,
-            display_label: None,
             scene_context: None,
         }
     }
@@ -726,120 +705,59 @@ mod tests {
         assert!(job.lev_parameter_id.is_empty());
     }
 
-    // (A4) A NEW assignment on a switch that already has a function must inherit
-    // that sibling's switch-level fields (colour/label/link/switchType) rather
-    // than hardcode defaults — a linked on-off's linkGroup would otherwise drop
-    // the switch out of its Switch Link, and colour/label would silently diverge.
+    // The assign gate (2026-08-19 directive) means `resolve_footswitch_job` NEVER creates a
+    // footswitch function any more — it edits an existing `param` fn on the selected
+    // (node, param), or refuses. The whole append path this group used to pin (appending at
+    // `sw.len()`, inheriting a sibling's colour/label/link/switchType, the "MULTI"-avoidance
+    // display-label fallback) is GONE along with the code that did it: appending a second
+    // entry to a row that already carries an on-off is the exact shape `danger.md` forbids —
+    // HW-proven (fw 1.8.45, 2026-08-18) to make the firmware silently replace an IMPORTED
+    // preset with an EMPTY body under its own display name. A refused row costs one row; an
+    // appended one could cost the whole preset. `plan_footswitch_jobs`'s assign gate uses the
+    // SAME `existing_param_fn_index` lookup, so the two can never disagree about which jobs
+    // reach this branch.
     #[test]
-    fn new_assignment_inherits_sibling_switch_level_fields() {
-        let ftsw = serde_json::json!([
-            [
-                {
-                    "func": "on-off",
-                    "colorA": 1, "colorB": 2,
-                    "customLabel": "BOOST",
-                    "linkGroup": 1,
-                    "isActive": true,
-                    "switchType": 1
-                }
-            ]
-        ]);
-        let preset = preset_with_lev_param(0.5);
-        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job()).expect("resolve");
-        assert_eq!(
-            spec.function_index, 1,
-            "appended after the existing on-off fn"
-        );
-        assert_eq!(spec.color_a, 1, "colorA inherited from the sibling");
-        assert_eq!(spec.color_b, 2, "colorB inherited from the sibling");
-        assert_eq!(
-            spec.custom_label, "BOOST",
-            "customLabel inherited from the sibling"
-        );
-        assert_eq!(
-            spec.link_group, 1,
-            "linkGroup inherited — else the switch drops out of its Switch Link"
-        );
-        assert_eq!(spec.switch_type, 1, "switchType inherited from the sibling");
-        assert!(
-            !spec.is_active,
-            "isActive is per-function engaged state, NOT inherited — a fresh assignment starts disengaged"
-        );
+    fn resolve_footswitch_job_refuses_rather_than_append_a_new_function() {
+        for (label, ftsw) in [
+            ("empty switch, nothing to edit", serde_json::json!([[]])),
+            (
+                "on-off only — no `param` fn for this (node, param)",
+                serde_json::json!([[
+                    { "func": "on-off", "customLabel": "BOOST",
+                      "nodes": [{ "groupId": "G1", "nodeId": "amp" }] }
+                ]]),
+            ),
+            (
+                "a `param` fn exists on this node, but for a DIFFERENT parameter",
+                serde_json::json!([[
+                    { "func": "param", "groupId": "G1", "nodeId": "amp",
+                      "parameterId": "tone", "valueA": 0.9, "valueB": 0.4 }
+                ]]),
+            ),
+        ] {
+            let preset = preset_with_lev_param(0.5);
+            let err = resolve_footswitch_job(&ftsw, &preset, &job())
+                .expect_err(&format!("{label}: expected a refusal, not an appended fn"));
+            assert!(
+                err.contains("does not already change") && err.contains("never adds a"),
+                "{label}: error should explain the refusal, got {err:?}"
+            );
+        }
     }
 
-    // An empty switch (no existing function to inherit from) falls back to the
-    // historical constants — there is nothing to inherit.
+    // The POSITIVE half of the same rule: a switch that ALREADY carries a `param` fn for the
+    // selected (node, param) resolves to THAT function's OWN index — never `sw.len()`, which
+    // would append — and its switch-level fields (colour/label/link/switchType) ride along
+    // verbatim from the SAME function about to be edited, not defaults and not a sibling's.
+    // isActive is the one PER-FUNCTION field (not switch-level): an absent one reads
+    // disengaged, never inherited or defaulted to engaged.
     #[test]
-    fn new_assignment_on_empty_switch_falls_back_to_defaults() {
-        let ftsw = serde_json::json!([[]]);
-        let preset = preset_with_lev_param(0.5);
-        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job()).expect("resolve");
-        assert_eq!(spec.function_index, 0);
-        assert_eq!(spec.color_a, 3);
-        assert_eq!(spec.color_b, 0);
-        assert_eq!(spec.custom_label, "");
-        assert_eq!(spec.link_group, 0);
-        assert_eq!(spec.switch_type, 0);
-        assert!(!spec.is_active);
-    }
-
-    // BUG→GATE (the "MULTI" class): adding a SECOND function to a switch whose `customLabel`
-    // is empty makes the unit stop showing the single function's implied name and display
-    // "MULTI" instead. The UI's own row label rides along on the job, so write it as the
-    // switch's `customLabel` and the pedalboard display doesn't change.
-    #[test]
-    fn new_assignment_labels_an_unlabelled_switch_with_the_ui_display_label() {
-        let ftsw = serde_json::json!([[{ "func": "on-off", "customLabel": "" }]]);
-        let preset = preset_with_lev_param(0.5);
-        let job = FootswitchLevelJob {
-            display_label: Some("Mythic Drive".into()),
-            ..job()
-        };
-        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
-        assert_eq!(spec.function_index, 1, "a SECOND function is being added");
-        assert_eq!(
-            spec.custom_label, "Mythic Drive",
-            "the switch's prior display label is preserved as its customLabel"
-        );
-    }
-
-    // The player's own label is never touched — inheritance still wins.
-    #[test]
-    fn new_assignment_keeps_a_non_empty_sibling_label() {
-        let ftsw = serde_json::json!([[{ "func": "on-off", "customLabel": "BOOST" }]]);
-        let preset = preset_with_lev_param(0.5);
-        let job = FootswitchLevelJob {
-            display_label: Some("Mythic Drive".into()),
-            ..job()
-        };
-        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
-        assert_eq!(spec.custom_label, "BOOST");
-    }
-
-    // A switch with NO existing function gets a single function — the unit shows that
-    // function's own name, never "MULTI", so there is nothing to preserve.
-    #[test]
-    fn first_assignment_on_an_empty_switch_is_left_unlabelled() {
-        let ftsw = serde_json::json!([[]]);
-        let preset = preset_with_lev_param(0.5);
-        let job = FootswitchLevelJob {
-            display_label: Some("Mythic Drive".into()),
-            ..job()
-        };
-        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
-        assert_eq!(spec.function_index, 0);
-        assert_eq!(spec.custom_label, "");
-    }
-
-    // An EXISTING param assignment's isActive reads its own field verbatim — an
-    // absent field means disengaged (false), not the old unwrap_or(true) default.
-    #[test]
-    fn existing_assignment_missing_is_active_defaults_to_disengaged() {
+    fn existing_assignment_resolves_to_its_own_index_and_keeps_its_own_fields() {
         let ftsw = serde_json::json!([
             [
                 {
                     "func": "param", "groupId": "G1", "nodeId": "amp", "parameterId": "drive",
-                    "colorA": 5, "colorB": 9, "customLabel": "X", "linkGroup": 2
+                    "colorA": 5, "colorB": 9, "customLabel": "X", "linkGroup": 2, "switchType": 1
                 }
             ]
         ]);
@@ -847,8 +765,16 @@ mod tests {
         let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job()).expect("resolve");
         assert_eq!(
             spec.function_index, 0,
-            "edits the existing param fn, not a new one"
+            "edits the existing param fn at its own index, never sw.len()"
         );
+        assert_eq!(spec.color_a, 5, "colorA read off the SAME function");
+        assert_eq!(spec.color_b, 9, "colorB read off the SAME function");
+        assert_eq!(
+            spec.custom_label, "X",
+            "customLabel read off the SAME function"
+        );
+        assert_eq!(spec.link_group, 2, "linkGroup read off the SAME function");
+        assert_eq!(spec.switch_type, 1, "switchType read off the SAME function");
         assert!(
             !spec.is_active,
             "an absent isActive must default to disengaged, not engaged"

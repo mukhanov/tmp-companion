@@ -1,10 +1,10 @@
 // src/__tests__/SetupBodyUnlabeledSwitchLabel.test.tsx — label provenance for an
 // UNLABELED footswitch.
 //
-// BUG→GATE, and a WIRE WRITE rather than a cosmetic one. A footswitch row's `sceneName`
-// becomes `displayLabel` on the job (`useLevelingFlow` → `toFootswitchJobWire`), which the
-// backend writes as the switch's on-device `customLabel` when an assign appends a function
-// to a switch that has none — so the string ends up printed on the player's pedalboard.
+// BUG→GATE. A footswitch row's `sceneName` is the Level list's displayed row name (never
+// sent to the backend — the assign gate only ever edits an EXISTING `param` fn or refuses,
+// so there is no on-device `customLabel` write to keep in sync any more). Even so, a wrong
+// name here misleads the player reading their own Level list about what is being leveled.
 //
 // `chosenFrom` picks that name when the LIST is built, and at that moment the only
 // candidate it knows about is the tone-safe DEFAULT (`defaultParamIndex`). A user who then
@@ -119,7 +119,7 @@ describe("SetupBody — label provenance for an unlabeled footswitch", () => {
       levParameterId: "level",
       sceneContext: null,
     });
-    // …and the name that becomes `displayLabel` names THAT block, not the default Boost.
+    // …and the DISPLAYED row name follows THAT block, not the default Boost.
     expect(choice.option.sceneName).toBe("Tube Screamer");
     expect(choice.option.sceneName).not.toBe("Boost");
   });

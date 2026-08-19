@@ -584,8 +584,8 @@ fn handle_scene_job(
 }
 
 /// The ONE field-8 saved-preset read a leveling run gets, THE source for everything the
-/// saved document answers: the raw per-node scene overlays ([`scene_overlay`],
-/// [`scene_overlays_change_param`]) and [`build_scene_jobs`]'s routing-structure fallback.
+/// saved document answers: the raw per-node scene overlays ([`scene_overlay`]) and
+/// [`build_scene_jobs`]'s routing-structure fallback.
 /// Read it once per preset and thread the document — never add a second read.
 ///
 /// GAP CONTRACT (the HID open-lockout is real: every failed exclusive open resets it, so
@@ -830,8 +830,11 @@ const BYPASS_ONLY_KEYS: [&str; 5] = [
     "muteOutput",
 ];
 
-/// Consumed by `leveller::set_knobs`' Scene Edit enable decision and by the footswitch bake
-/// gate (`footswitch::plan_footswitch_jobs`, via [`scene_overlays_change_param`]).
+/// Consumed by `leveller::set_knobs`' Scene Edit enable decision. (The footswitch bake gate
+/// in `footswitch::plan_footswitch_jobs` no longer reads scene overlays at all — the assign
+/// gate (2026-08-19) decides bake-vs-assign purely off whether the switch already carries a
+/// `param` fn for the selected control, so this type's other former consumer,
+/// `scene_overlays_change_param`, is gone.)
 pub(crate) enum SceneOverlay<'a> {
     /// The scene carries KNOB params for this node (its Scene Edit flag is ENABLED) — write
     /// WITHOUT the Scene Edit enable; the write lands on the overlay (HW). The Scene-Edit
@@ -1019,63 +1022,6 @@ fn base_node_matches(
     hits
 }
 
-/// Does ANY scene overlay CHANGE `param` on `node` relative to base? The per-node footswitch
-/// bake gate (`footswitch::plan_footswitch_jobs`), asked for `bypass`: a scene that flips the
-/// block on renders a baked value in a state the leveler never measured → Assign. The LEVELED
-/// param takes the separate [`scenes_restating_base`] path instead — a restating overlay gets
-/// the solved value MIRRORED, a diverging one keeps its authored value.
-///
-/// VALUE semantics, not key presence: a DEVICE-AUTHORED preset carries the full param set for
-/// every node in every scene overlay, so "the key is there" is true of every node of every
-/// real scened preset and would collapse this back to the whole-preset gate it replaced
-/// (every switch → Assign → a second function on the switch → the unit displays "MULTI").
-///
-/// Conservative — anything unreadable answers `true`, because "unknown" must never authorise a
-/// bake: the `scenes` key absent, a truncated entry, an array cut SHORT of the scenes the
-/// document still references ([`max_referenced_scene`]), an AMBIGUOUS node identity, or a base
-/// value we can't resolve. A `false` derived from state we can't see is exactly what this gate
-/// exists to prevent.
-pub(crate) fn scene_overlays_change_param(
-    preset: &serde_json::Value,
-    node: &str,
-    param: &str,
-) -> bool {
-    let Some(scenes) = preset.get("scenes").and_then(|s| s.as_array()) else {
-        return true;
-    };
-    if max_referenced_scene(preset).is_some_and(|m| m as usize >= scenes.len()) {
-        return true;
-    }
-    // AMBIGUOUS identity is refused BEFORE any scene is read, not per overlay: [`scene_overlay`]
-    // resolves the node off the roster's FIRST match and keys the lookup by THAT instance's
-    // group, so with two instances an overlay living under the other one reads `Absent` — a
-    // bake authorised off a scene we never looked at, not merely a mismatched value.
-    let mut base = base_node_matches(preset, node);
-    if base.len() > 1 {
-        return true;
-    }
-    // No hit = the node isn't in the base graph at all, which `scene_overlay` reports as
-    // `Absent` for every scene (its own roster lookup misses too) — so this `None` is never
-    // consulted, and a node no scene mentions stays bakeable.
-    let base = base.pop().flatten();
-    // CALL-SITE DECISION (three-state split): `Full` and `BypassOnly` share ONE body. This
-    // gate is asked for `bypass`, and a bypass-only overlay is PRECISELY the overlay that
-    // exists to flip a node's bypass per scene — routing it to `false` would stop the bake
-    // gate firing on exactly the scenes it was written to catch, letting a baked value
-    // render in a state the leveler never measured.
-    (0..scenes.len() as u32).any(|scene| match scene_overlay(preset, scene, node) {
-        SceneOverlay::Full(params) | SceneOverlay::BypassOnly(params) => {
-            params.get(param).is_some_and(|overlay| {
-                base.as_ref()
-                    .and_then(|b| b.get(param))
-                    .is_none_or(|base| values_differ(base, overlay))
-            })
-        }
-        SceneOverlay::Unknown => true,
-        SceneOverlay::Absent => false,
-    })
-}
-
 /// The saved document's `lastLoadedScene` (0-based scene index, or the base wire slot) —
 /// the value every save path must re-stamp via a pre-save recall (`LevelOptions::
 /// restore_scene` / the footswitch writer's restore param). One helper because the
@@ -1117,8 +1063,10 @@ pub(crate) fn warn_missing_restore_scene(
 /// because the overlay held exactly the base value. A scene that authored its OWN value is
 /// NEVER mirrored (the divergence is intent — e.g. the Hiwatt's "Base Scene" mutes its trem
 /// with `level: 0.0`), and a scene whose overlay omits the param inherits base, so there is
-/// nothing to write. Guards mirror [`scene_overlays_change_param`]: anything unreadable ⇒
-/// empty (a mirror is an optimization, never worth a blind write).
+/// nothing to write. Guards are conservative the same way: `scenes` absent, a truncated
+/// entry, an array cut SHORT of the scenes the document still references
+/// ([`max_referenced_scene`]), or an AMBIGUOUS node identity all answer empty — a mirror is
+/// an optimization, never worth a blind write.
 pub(crate) fn scenes_restating_base(
     preset: &serde_json::Value,
     node: &str,
