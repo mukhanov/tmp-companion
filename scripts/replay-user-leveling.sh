@@ -59,6 +59,11 @@
 # `level_footswitches_apply` the REAL "Maverick bridge" DI capture, verbatim, exactly as
 # the UI would for this profile.
 #
+# CORRECTION (HW, 2026-08-19): the last clause above was WRONG, and it cost a whole
+# acceptance run. The `profileId` branch cannot win under the MockRuntime — see
+# `LEVEL_TOPOLOGY_ID` below for why and for the routing that replaces it. The leveling
+# commands are no longer passed `$TOPOLOGY_ID` at all.
+#
 # `e2e_measure_sound` (the P5 re-measure step) has NO `profileId` param at all — only
 # `topologyId`, whose normal resolution (`topology_wav_path`) goes through Tauri's
 # `app.path().resolve(_, BaseDirectory::Resource)`, which a maintainer's own comment in
@@ -199,6 +204,37 @@ COMMIT_WINDOW_WAIT=150
 PROFILE_ID="9a57daa8-b8b3-4a29-a39b-0759eb468d28"
 TOPOLOGY_ID="guitar-filtertron"
 CALIBRATION_LUFS="-22.182825"
+
+# THE LEVELING COMMANDS' OWN STIMULUS ROUTING — deliberately NOT `$TOPOLOGY_ID`.
+#
+# `resolve_stimulus_with_capture`'s profile_id branch calls
+# `profiles::existing_capture_for`, which resolves `app.path().app_config_dir()`. Under the
+# MockRuntime this harness runs on, that is NOT the real `dev.tmpcompanion.app` directory,
+# so the branch returns None even though the capture file is present on disk (the existence
+# check below passes and proves nothing about it). Resolution then reaches
+# `if let Some(tid) = topology_id.filter(|t| !t.is_empty()) { return topology_wav_path(..) }`
+# — an unconditional return — and "guitar-filtertron" canonicalises to "guitar-singlecoil",
+# which DOES resolve. The result: every leveling command solved against a bundled SYNTHETIC
+# sample while `e2e_measure_sound` judged the outcome against the real DI capture. Two
+# different stimuli through a nonlinear amp, and the whole verdict was an artefact
+# (HW, 2026-08-19 — every one of 13 rows landed 0.7-4.4 dB quiet, in one direction).
+#
+# Passing an EMPTY topology id drops that branch (`.filter(|t| !t.is_empty())`) and lets
+# resolution fall through to `TMP_LEVELLER_STIMULUS` — the profile capture exported into the
+# server's env — which is the SAME file `measure_row` already routes to. Leveling and
+# re-measure then share one stimulus by construction.
+#
+# `calibrationLufs` must go null with it. `resolve_stimulus_for_leveling` returns
+# `if from_capture { None } else { calibration_lufs }`, so the real app NULLS calibration
+# whenever the profile capture wins — the capture is already at its calibrated level.
+# Reaching the same bytes via `TMP_LEVELLER_STIMULUS` reports `from_capture=false`, so a
+# non-null calibration here would rescale a capture the app injects verbatim.
+#
+# Nothing else changes: `playback_offset_for` maps an absent/unknown topology to the guitar
+# default, whose offset is 0.0 at every playback level — the same 0.0 "guitar-filtertron"
+# yields (`profiles::playback_offset_lu`).
+LEVEL_TOPOLOGY_ID=""
+LEVEL_CALIBRATION_LUFS="null"
 
 # `profiles::capture_wav_path_in` = `<app_config_dir>/captures/<sanitized-id>.wav`;
 # the profile id above is a plain UUID so sanitize_id is the identity map. app_config_dir
@@ -547,14 +583,14 @@ process_preset() {
   log "[base] leveling slot $slot → $base_target LUFS…"
   body="$(jq -nc \
     --argjson slot "$slot" --argjson t "$base_target" \
-    --arg topo "$TOPOLOGY_ID" --argjson cal "$CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
+    --arg topo "$LEVEL_TOPOLOGY_ID" --argjson cal "$LEVEL_CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
     '{cmd:"level_preset", args:{job:{
         slot:$slot, target_lufs:$t, save:true,
         topology_id:$topo, calibration_lufs:$cal, profile_id:$prof,
         stimulus_path:null,
         block_group_id:null, block_node_id:null, block_parameter_id:null, block_value:null
     }}}')"
-  data="$(invoke_cmd "$body" 240)" || return 1
+  data="$(invoke_cmd "$body" 900)" || return 1
   printf '%s' "$data" > "$OUT_DIR/level-base-$slot.json"
   ok "[base] slot $slot leveled (clamped=$(printf '%s' "$data" | jq -r '.clamped'))"
   gap
@@ -578,12 +614,12 @@ process_preset() {
     log "[scenes] leveling slot $slot's scene rows…"
     body="$(jq -nc \
       --argjson slot "$slot" --argjson jobs "$jobs_json" --argjson candidates "$cand_json" \
-      --arg topo "$TOPOLOGY_ID" --argjson cal "$CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
+      --arg topo "$LEVEL_TOPOLOGY_ID" --argjson cal "$LEVEL_CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
       '{cmd:"level_scenes_apply_batched", args:{
           slot:$slot, jobs:$jobs, candidates:$candidates, save:true, rebalance:false,
           topologyId:$topo, calibrationLufs:$cal, profileId:$prof, onResult:"__CHANNEL__:0"
       }}')"
-    data="$(invoke_cmd "$body" 300)" || return 1
+    data="$(invoke_cmd "$body" 1800)" || return 1
     printf '%s' "$data" > "$OUT_DIR/level-scenes-$slot.json"
     ok "[scenes] slot $slot: $(printf '%s' "$data" | jq 'length') scene row(s) leveled"
     gap
@@ -610,12 +646,12 @@ process_preset() {
     log "[fs] leveling slot $slot's footswitch rows…"
     body="$(jq -nc \
       --argjson slot "$slot" --argjson jobs "$jobs_json" \
-      --arg topo "$TOPOLOGY_ID" --argjson cal "$CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
+      --arg topo "$LEVEL_TOPOLOGY_ID" --argjson cal "$LEVEL_CALIBRATION_LUFS" --arg prof "$PROFILE_ID" \
       '{cmd:"level_footswitches_apply", args:{
           slot:$slot, jobs:$jobs, save:true,
           topologyId:$topo, calibrationLufs:$cal, profileId:$prof, onResult:"__CHANNEL__:0"
       }}')"
-    data="$(invoke_cmd "$body" 300)" || return 1
+    data="$(invoke_cmd "$body" 1800)" || return 1
     printf '%s' "$data" > "$OUT_DIR/level-fs-$slot.json"
     ok "[fs] slot $slot: $(printf '%s' "$data" | jq 'length') footswitch row(s) leveled"
     gap
