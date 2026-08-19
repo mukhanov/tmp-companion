@@ -93,9 +93,36 @@ pub(crate) fn e2e_showcase() -> bool {
     std::env::var("TMP_E2E_SHOWCASE").is_ok()
 }
 
+/// Minimal stderr logger, the twin of `probe`'s: the shared library modules
+/// (leveller floor guards, the footswitch ceiling prepass, session retries)
+/// diagnose through `log::*`, which is silently DROPPED without an installed
+/// logger. In the app tauri-plugin-log owns it; this harness had NO logger at
+/// all, so an ONLINE run's whole device-side diagnosis was invisible — the
+/// `fs prepass switch=N ceiling=…` lines that explain a clamped row went
+/// nowhere, and the server log carried only its two startup lines.
+#[cfg(feature = "e2e")]
+struct StderrLog;
+
+#[cfg(feature = "e2e")]
+impl log::Log for StderrLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 #[cfg(feature = "e2e")]
 pub fn run_e2e_server() {
     use std::net::TcpListener;
+
+    if log::set_logger(&StderrLog).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
 
     let online = e2e_online();
     // OFFLINE only: default the backup fixture so `read_library_via_backup` decodes it
@@ -715,7 +742,9 @@ async fn e2e_measure_sound(
         // right shared derivation for the footswitch case — the divergence is deliberate and
         // documented in notes/leveling.md.
         let force = match footswitch {
-            Some(_) => crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, footswitch),
+            Some(_) => {
+                crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, footswitch)
+            }
             None => Vec::new(),
         };
         // An ASSIGN switch's engaged sound = the leveled param at its saved `valueA`; a

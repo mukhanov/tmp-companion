@@ -873,29 +873,37 @@ pub fn plan_footswitch_jobs(ftsw: &Value, preset: &Value, jobs: &[FsJobKey]) -> 
         let edits_selected_control =
             existing_param_fn_index(ftsw, job.switch, job.lev_node, job.lev_param).is_some();
 
-        if !block_bypassed_in_base(preset, job.lev_node) {
-            // Block ON in base → part of the base sound → measured as-saved; only force every
-            // OTHER footswitch's block off (isolation).
-            // ponytail: accepted edge case — an always-on `param`-target block that some OTHER
-            // switch's on-off also toggles gets forced off here while being the leveled block.
-            // Exotic layout, not the reported bug; acknowledged not handled.
-            let engaged = siblings_off_excluding(ftsw, job.switch);
-            if edits_selected_control {
-                plans.push(FsLevelPlan::Assign { engaged });
-            } else {
-                push_bake(&mut plans, &mut bake_rep, idx, job, ftsw, preset, engaged);
+        if block_bypassed_in_base(preset, job.lev_node) {
+            let activators = onoff_switches_for(ftsw, job.lev_node);
+            if !activators.contains(&job.switch) {
+                plans.push(FsLevelPlan::Clamp(
+                    "block is bypassed in the base preset and this footswitch doesn't enable it"
+                        .into(),
+                ));
+                continue;
             }
-            continue;
         }
-        let activators = onoff_switches_for(ftsw, job.lev_node);
-        if !activators.contains(&job.switch) {
-            plans.push(FsLevelPlan::Clamp(
-                "block is bypassed in the base preset and this footswitch doesn't enable it".into(),
-            ));
-            continue;
-        }
-        // Off in base, this switch enables it: every other switch's block off (siblings) PLUS
-        // this switch's own flip. Disjoint by construction (siblings excludes own nodes).
+        // THE ROW'S ENGAGED ISOLATION: every OTHER switch's block off (siblings) PLUS this
+        // switch's own nodes at their engaged state. Disjoint by construction (siblings
+        // excludes own nodes), and IDENTICAL to what `switch_states` hands the ceiling
+        // prepass — pinned by `plan_on_in_base_still_asserts_its_own_block_bypass`, because
+        // a plan that describes a different sound than the prepass is a solver that
+        // contradicts its own feasibility check.
+        //
+        // A block ON in the base used to skip the second half here, on the reasoning that it
+        // is part of the base sound and so needs no assertion. That is only true in a
+        // one-row batch. A SIBLING row's isolation writes this block's `bypass = true` into
+        // the device's working copy, and every capture's `recall_base` re-asserts that
+        // mutated copy — so the row inherited the sibling's write and measured with the very
+        // block it was levelling switched OFF, where its handle has no authority over
+        // loudness. HW, 2026-08-19, slot 26 "Plumes+BD2+OCD": `ACD_Plumes` (the only block on
+        // in base) converged when solved alone (level 0.3634 → -22.95 LUFS) and clamped in
+        // every batch containing any other row, in either order, with all captures pinned at
+        // -26.96 LUFS. Its prepass ceiling read -21.13 LUFS throughout.
+        //
+        // ponytail: accepted edge case — an always-on `param`-target block that some OTHER
+        // switch's on-off also toggles gets forced off by that sibling entry while being the
+        // leveled block. Exotic layout, not the reported bug; acknowledged not handled.
         let mut engaged = siblings_off_excluding(ftsw, job.switch);
         engaged.extend(engaged_bypass_for_switch(ftsw, preset, job.switch));
         if edits_selected_control {
@@ -1747,6 +1755,12 @@ mod tests {
         // SIBLING switch's block M is still forced off (isolation) so N is measured against the
         // clean base, not base + M. This used to Assign under an "always-assign a base-on
         // block" rule; that rule is gone, the gate is the sole decider now.
+        //
+        // The isolation also asserts N's OWN bypass. It used to stop at the sibling entry, on
+        // the reasoning that a base-on block needs no assertion — hardware disproved that
+        // (2026-08-19, slot 26): a sibling row's isolation writes N's `bypass = true` into the
+        // working copy and `recall_base` re-asserts it, so the row measured with N switched
+        // off. See `plan_on_in_base_still_asserts_its_own_block_bypass`.
         let p = preset_with(
             false,
             None,
@@ -1759,7 +1773,13 @@ mod tests {
                 clear_stale,
                 mirror_scenes,
             } => {
-                assert_eq!(engaged, &vec![("G1".into(), "M".into(), true)]);
+                assert_eq!(
+                    engaged,
+                    &vec![
+                        ("G1".into(), "M".into(), true),
+                        ("G1".into(), "N".into(), false)
+                    ]
+                );
                 assert_eq!(*clear_stale, None);
                 assert!(mirror_scenes.is_empty(), "no scenes → nothing to mirror");
             }
@@ -1944,6 +1964,44 @@ mod tests {
         p.as_object_mut().expect("preset object").remove("scenes");
         let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
         assert!(matches!(plans[0], FsLevelPlan::Bake { .. }));
+    }
+
+    #[test]
+    fn plan_on_in_base_still_asserts_its_own_block_bypass() {
+        // HW, 2026-08-19, slot 26 "Plumes+BD2+OCD". `ACD_Plumes` is the only block ON in the
+        // base, and its row is the only one that failed: solved ALONE it converges
+        // (level 0.3634 → -22.95 LUFS), but in ANY batch containing another row — either
+        // order — all of its captures read the same -26.96 LUFS, the secant's flat-response
+        // branch fires and the row reports a spurious `clamped scene_ceiling`.
+        //
+        // The cause is here, not in the solver. A SIBLING row's isolation
+        // (`siblings_off_excluding`) writes THIS block's `bypass = true` into the device's
+        // working copy, and every capture's `recall_base` re-asserts that mutated copy — so a
+        // plan that omits its own block's bypass inherits the sibling's write and measures
+        // with the block it is levelling switched OFF, where its handle has no authority.
+        // The ceiling prepass was right throughout (-21.13 LUFS) precisely because it goes
+        // through `switch_states`, which DOES assert it.
+        //
+        // So the plan's isolation must equal `switch_states(..).engaged_bypass` — asserted
+        // against that function directly, so the two can never drift apart again.
+        let p = preset_with(
+            /* N on in base */ false,
+            /* M off in base */ Some(true),
+            serde_json::json!([[onoff(&["N"], true)], [onoff(&["M"], false)]]),
+        );
+        let plans = plan_footswitch_jobs(&p["ftsw"], &p, &[key(0, -23.0)]);
+        let FsLevelPlan::Bake { engaged, .. } = &plans[0] else {
+            panic!("expected Bake, got {:?}", plans[0]);
+        };
+        assert!(
+            engaged.contains(&("G1".to_string(), "N".to_string(), false)),
+            "the levelled block's own bypass must be asserted, not assumed — {engaged:?}"
+        );
+        assert_eq!(
+            *engaged,
+            switch_states(&p["ftsw"], &p, 0).engaged_bypass,
+            "plan isolation must match the ceiling prepass's isolation exactly"
+        );
     }
 
     #[test]
