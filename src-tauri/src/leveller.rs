@@ -4636,9 +4636,11 @@ pub fn level_scenes_live_batched(
 /// interrupted one can strand the unit input-muted (`danger.md`).
 ///
 /// `intended_preset_level` is the run's OWN `presetLevel` re-asserted on every reading (see
-/// [`measure_scene_asis`]). The batched scene command passes `None`: this prepass runs BEFORE
-/// the headroom trade decides anything, so there is no run-owned level yet and the ceilings
-/// are — by definition — read at the level the preset currently holds.
+/// [`measure_scene_asis`]). The batched scene command passes the preset's own SAVED level —
+/// not the headroom trade's raise, which is decided AFTER this prepass. It must match what
+/// the solve captures render at: `correct_iter` takes a prepass reading as its `measured0`
+/// and compares it to a post-apply capture, so two different renderings make the first
+/// "response" include the level difference and can defeat the `no_authority` verdict outright.
 pub fn prepass_scene_ceilings(
     jobs: &mut [SceneJob],
     stimulus: &[f32],
@@ -5467,54 +5469,107 @@ const PERSIST_TOL: f64 = 1e-3;
 /// What the saved document holds for one solved write: the SCENE OVERLAY's value for an FS
 /// scene, the base graph node's for base (`scene_overlay` answers `Unknown` at/above
 /// `BASE_SCENE_SLOT`, so base must not go through it).
-fn persisted_value(saved: &serde_json::Value, w: &PersistedWrite) -> Option<f64> {
+/// What a post-save re-read can say about ONE solved write. The third state is the whole
+/// point: "the document does not carry this value" and "the document cannot speak to this
+/// location at all" are different facts, and only the first is evidence of a lost write.
+enum PersistedRead {
+    /// The saved document answers with this value.
+    Value(f64),
+    /// The document COVERS the location and holds nothing there — a genuine miss.
+    Absent,
+    /// The document cannot answer: the section the value lives in never arrived.
+    Unverifiable,
+}
+
+fn persisted_value(saved: &serde_json::Value, w: &PersistedWrite) -> PersistedRead {
     if w.scene_slot >= crate::session::BASE_SCENE_SLOT {
-        return crate::commands::level_footswitch::node_param_f64(
+        // `audioGraph` heads the document, so a tail truncation never reaches it — but a
+        // read that lost it lost everything, and must not be read as a wiped write.
+        if !saved.get("audioGraph").is_some_and(|g| g.is_object()) {
+            return PersistedRead::Unverifiable;
+        }
+        return match crate::commands::level_footswitch::node_param_f64(
             saved,
             &w.node_id,
             &w.parameter_id,
-        );
+        ) {
+            Some(v) => PersistedRead::Value(v),
+            None => PersistedRead::Absent,
+        };
     }
     // CALL-SITE DECISION (three-state split): a value LOOKUP, so `Full` and `BypassOnly`
     // share one arm — read whatever the overlay holds. A `BypassOnly` overlay carries no
     // knob keys, so the lookup misses and the write counts as a MISS, which is right: a
     // scene write there was refused up front (`set_knobs`), so a value reported as written
     // into one is by definition not persisted.
+    //
+    // `Unknown` is the arm that must NOT collapse into that miss (HW, 2026-08-19): it means
+    // the `scenes` section never arrived, and `scenes` sits at the document tail, so it is
+    // exactly what a truncated field-8 read loses. "Friedman HBE" truncates at 21044 B before
+    // its scenes, and the run duly warned that scene 3's `ACD_TwinReverb65NoFx/outputLevel`
+    // "solved 0.7814 but the saved preset holds no such value" — while that scene's own
+    // re-measure of the SAVED state read -22.99 LUFS against its -23 target, i.e. the write
+    // had persisted perfectly. A false "did not persist" is worse than no check: it teaches
+    // the user to distrust correct results, and the external judge SKIPS a good row.
     match scene_overlay(saved, w.scene_slot, &w.node_id) {
         SceneOverlay::Full(params) | SceneOverlay::BypassOnly(params) => {
-            params.get(&w.parameter_id).and_then(|v| v.as_f64())
+            match params.get(&w.parameter_id).and_then(|v| v.as_f64()) {
+                Some(v) => PersistedRead::Value(v),
+                None => PersistedRead::Absent,
+            }
         }
-        SceneOverlay::Absent | SceneOverlay::Unknown => None,
+        SceneOverlay::Absent => PersistedRead::Absent,
+        SceneOverlay::Unknown => PersistedRead::Unverifiable,
     }
 }
 
-/// The solved writes the save did NOT persist, as `(scene_slot, detail)`. A write the saved
-/// document cannot answer counts as a MISS: the gate exists so a report can never show
-/// numbers the save wiped, and "can't tell" is not "fine".
+/// What a post-save re-read found, split by what it can honestly claim.
+#[derive(Debug, Default)]
+pub(crate) struct PersistCheck {
+    /// Writes the save did NOT keep, as `(scene_slot, detail)` — the report must not show
+    /// these numbers as persisted.
+    pub(crate) missed: Vec<(u32, String)>,
+    /// Writes the re-read cannot speak to, as `(scene_slot, detail)`. NOT a miss: the caller
+    /// leaves the verdict unknown rather than stamping a mismatch it cannot support.
+    pub(crate) unverifiable: Vec<(u32, String)>,
+}
+
+/// Grade every solved write against the re-read saved document. A value that diverges (or is
+/// absent from a section that DID arrive) is a miss — the gate exists so a report can never
+/// show numbers the save wiped. A value whose section never arrived is `unverifiable`, which
+/// is not the same thing and must never be reported as a lost write.
 pub(crate) fn persist_mismatches(
     saved: &serde_json::Value,
     writes: &[PersistedWrite],
-) -> Vec<(u32, String)> {
-    writes
-        .iter()
-        .filter_map(|w| match persisted_value(saved, w) {
-            Some(got) if (got - w.value as f64).abs() <= PERSIST_TOL => None,
-            Some(got) => Some((
+) -> PersistCheck {
+    let mut out = PersistCheck::default();
+    for w in writes {
+        match persisted_value(saved, w) {
+            PersistedRead::Value(got) if (got - w.value as f64).abs() <= PERSIST_TOL => {}
+            PersistedRead::Value(got) => out.missed.push((
                 w.scene_slot,
                 format!(
                     "{}/{} solved {:.4} but the save holds {got:.4}",
                     w.node_id, w.parameter_id, w.value
                 ),
             )),
-            None => Some((
+            PersistedRead::Absent => out.missed.push((
                 w.scene_slot,
                 format!(
                     "{}/{} solved {:.4} but the saved preset holds no such value",
                     w.node_id, w.parameter_id, w.value
                 ),
             )),
-        })
-        .collect()
+            PersistedRead::Unverifiable => out.unverifiable.push((
+                w.scene_slot,
+                format!(
+                    "{}/{} solved {:.4} but the re-read carries no section holding it",
+                    w.node_id, w.parameter_id, w.value
+                ),
+            )),
+        }
+    }
+    out
 }
 
 /// Post-save param-level verify: RE-READ the preset and confirm every solved write survived
@@ -5552,18 +5607,30 @@ fn verify_persisted_writes(
             return;
         }
     };
-    let misses = persist_mismatches(&saved, writes);
+    let check = persist_mismatches(&saved, writes);
     for o in outcomes.iter_mut() {
         // Only a scene we actually checked gets a verdict; the rest stay `None` (unknown).
         if !writes.iter().any(|w| w.scene_slot == o.scene_slot) {
             continue;
         }
-        let mismatch = misses.iter().any(|(scene, _)| *scene == o.scene_slot);
+        // A scene the re-read cannot speak to stays `None` too — an unanswerable document is
+        // not evidence of a lost write (see `PersistedRead::Unverifiable`). Second line of
+        // defence behind the complete-or-fail read above, and the one that survives a
+        // document which arrives whole but still carries no `scenes`.
+        if check.unverifiable.iter().any(|(s, _)| *s == o.scene_slot) {
+            continue;
+        }
+        let mismatch = check.missed.iter().any(|(scene, _)| *scene == o.scene_slot);
         o.persist_mismatch = Some(mismatch);
     }
-    for (scene, detail) in &misses {
+    for (scene, detail) in &check.missed {
         log::warn!(
             "slot {slot} scene {scene}: the save did not persist the leveled value — {detail}"
+        );
+    }
+    for (scene, detail) in &check.unverifiable {
+        log::warn!(
+            "slot {slot} scene {scene}: the leveled value is UNCONFIRMED, not lost — {detail}"
         );
     }
 }
@@ -5606,33 +5673,78 @@ pub(crate) fn verify_fs_persisted_writes(
             return;
         }
     };
+    for (idx, verdict) in fs_persist_verdicts(&saved, writes, base_expect) {
+        match verdict {
+            Some(mismatch) => {
+                if let Some(r) = results.get_mut(idx).and_then(|o| o.as_mut()) {
+                    r.persist_mismatch = Some(mismatch);
+                }
+                if mismatch {
+                    log::warn!(
+                        "slot {slot}: FS result idx {idx} did not persist as solved (or the \
+                         run's earlier base save appears reverted)"
+                    );
+                }
+            }
+            // Verdict left unknown on purpose — see `fs_persist_verdicts`.
+            None => log::warn!(
+                "slot {slot}: FS result idx {idx} is UNCONFIRMED, not lost — the re-read \
+                 carries no section holding its value"
+            ),
+        }
+    }
+}
+
+/// The pure grading behind [`verify_fs_persisted_writes`]: `(result index, verdict)` per
+/// write, where `Some(true)` is a lost write, `Some(false)` a kept one, and `None` means the
+/// re-read cannot speak to it.
+///
+/// That third state is the gate (HW, 2026-08-19). A field-8 read of a large preset is
+/// tail-truncated, and the sections these writes live in — `ftsw` for an Assign, `audioGraph`
+/// for a Bake — can simply be missing. Grading a missing SECTION as a missing VALUE reports a
+/// write that landed as a write that vanished, which is worse than no check at all: it
+/// teaches the user to distrust correct results. Second line of defence behind the
+/// complete-or-fail read; it holds even for a document that arrives whole but short.
+fn fs_persist_verdicts(
+    saved: &serde_json::Value,
+    writes: &[(usize, String, String, f32, bool)],
+    base_expect: Option<f32>,
+) -> Vec<(usize, Option<bool>)> {
+    let ftsw = saved.get("ftsw").filter(|f| f.is_array());
+    let has_graph = saved.get("audioGraph").is_some_and(|g| g.is_object());
+    // The base-revert arm reads `audioGraph.presetLevel`, so without the graph its `None`
+    // would read as "reverted" and condemn every switch in the batch on a read defect.
+    if base_expect.is_some() && !has_graph {
+        return writes.iter().map(|w| (w.0, None)).collect();
+    }
     let base_reverted =
-        base_expect.is_some_and(|pl| match crate::audiograph::preset_level(&saved) {
+        base_expect.is_some_and(|pl| match crate::audiograph::preset_level(saved) {
             Some(got) => (got - pl as f64).abs() > PERSIST_TOL,
             None => true,
         });
-    let ftsw = saved.get("ftsw");
-    for (idx, node, param, value, is_assign) in writes {
-        let got = if *is_assign {
-            ftsw.and_then(|f| ftsw_value_a(f, node, param))
-        } else {
-            crate::commands::level_footswitch::node_param_f64(&saved, node, param)
-        };
-        let mismatch = base_reverted
-            || match got {
-                Some(v) => (v - *value as f64).abs() > PERSIST_TOL,
-                None => true,
+    writes
+        .iter()
+        .map(|(idx, node, param, value, is_assign)| {
+            if !if *is_assign {
+                ftsw.is_some()
+            } else {
+                has_graph
+            } {
+                return (*idx, None);
+            }
+            let got = if *is_assign {
+                ftsw.and_then(|f| ftsw_value_a(f, node, param))
+            } else {
+                crate::commands::level_footswitch::node_param_f64(saved, node, param)
             };
-        if let Some(r) = results.get_mut(*idx).and_then(|o| o.as_mut()) {
-            r.persist_mismatch = Some(mismatch);
-        }
-        if mismatch {
-            log::warn!(
-                "slot {slot}: FS result idx {idx} ({node}/{param}) did not persist as solved \
-                 (or the run's earlier base save appears reverted)"
-            );
-        }
-    }
+            let mismatch = base_reverted
+                || match got {
+                    Some(v) => (v - *value as f64).abs() > PERSIST_TOL,
+                    None => true,
+                };
+            (*idx, Some(mismatch))
+        })
+        .collect()
 }
 
 /// Result of the joint-k solve for a scene's amp-knob set.
@@ -7056,13 +7168,17 @@ mod persist_verify_tests {
         let saved = saved_preset();
 
         // Solved == persisted, in the scene overlay and at base: nothing to flag.
-        assert!(persist_mismatches(&saved, &[write(0, 0.72)]).is_empty());
+        assert!(persist_mismatches(&saved, &[write(0, 0.72)])
+            .missed
+            .is_empty());
         assert!(
-            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.40)]).is_empty()
+            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.40)])
+                .missed
+                .is_empty()
         );
 
         // The wipe case: the overlay holds a DIFFERENT value than the run solved.
-        let miss = persist_mismatches(&saved, &[write(0, 0.55)]);
+        let miss = persist_mismatches(&saved, &[write(0, 0.55)]).missed;
         assert_eq!(
             miss.len(),
             1,
@@ -7072,20 +7188,169 @@ mod persist_verify_tests {
 
         // A base write compared against the base graph, same divergence.
         assert_eq!(
-            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.55)]).len(),
+            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.55)])
+                .missed
+                .len(),
             1
         );
 
         // Scene 1 has no overlay for the node at all — the write is simply not there, which
         // is a miss, not an "unknown" to be waved through.
-        let miss = persist_mismatches(&saved, &[write(1, 0.61)]);
+        let miss = persist_mismatches(&saved, &[write(1, 0.61)]).missed;
         assert_eq!(miss.len(), 1, "an absent overlay is a miss: {miss:?}");
         assert_eq!(miss[0].0, 1);
 
         // Only the divergent write is reported when a batch mixes both.
-        let mixed = persist_mismatches(&saved, &[write(0, 0.72), write(1, 0.61)]);
+        let mixed = persist_mismatches(&saved, &[write(0, 0.72), write(1, 0.61)]).missed;
         assert_eq!(mixed.len(), 1);
         assert_eq!(mixed[0].0, 1);
+    }
+
+    /// GATE for the false "did not persist" incident (HW, 2026-08-19, "Friedman HBE"): the
+    /// field-8 read of a large preset truncates at ~21044 B, BEFORE `scenes`. The run then
+    /// warned that scene 3's `ACD_TwinReverb65NoFx/outputLevel` "solved 0.7814 but the saved
+    /// preset holds no such value" — while that same scene's re-measure of the SAVED device
+    /// state read -22.99 LUFS against its -23 target, i.e. the write had persisted perfectly.
+    /// The external judge duly SKIPped a row that should have passed.
+    ///
+    /// A document that cannot answer must be reported as UNCONFIRMED, never as a lost write.
+    /// This is the second line of defence behind `read_saved_preset_complete`: it holds even
+    /// for a document that arrives whole and still carries no `scenes`.
+    #[test]
+    fn a_truncated_reread_is_unconfirmed_not_a_lost_write() {
+        // Exactly what the HBE re-read returned: everything up to the tail, `scenes` gone.
+        let mut truncated = saved_preset();
+        truncated.as_object_mut().expect("object").remove("scenes");
+
+        let check = persist_mismatches(&truncated, &[write(0, 0.72)]);
+        assert!(
+            check.missed.is_empty(),
+            "a scene the re-read cannot see must NOT be reported as a lost write: {:?}",
+            check.missed
+        );
+        assert_eq!(
+            check.unverifiable.len(),
+            1,
+            "it must be reported as unconfirmed instead: {check:?}"
+        );
+        assert_eq!(check.unverifiable[0].0, 0);
+
+        // The base write in the SAME document is still fully checkable — `audioGraph` heads
+        // the document, so a tail truncation never costs it. Grading it as unverifiable too
+        // would throw away a real check.
+        let base = persist_mismatches(&truncated, &[write(crate::session::BASE_SCENE_SLOT, 0.55)]);
+        assert!(base.unverifiable.is_empty(), "{base:?}");
+        assert_eq!(
+            base.missed.len(),
+            1,
+            "base divergence still caught: {base:?}"
+        );
+
+        // A scenes array that ARRIVED but is cut short of the slot is the same class: the
+        // HBE read returned 3 of 4 scenes, the third cut mid-record.
+        let short = persist_mismatches(&saved_preset(), &[write(7, 0.61)]);
+        assert!(
+            short.missed.is_empty(),
+            "a scene slot past the end of a truncated scenes array is unconfirmed: {short:?}"
+        );
+        assert_eq!(short.unverifiable.len(), 1, "{short:?}");
+
+        // And the guarantee that keeps this from becoming a blanket amnesty: when `scenes`
+        // IS present and covers the slot, a genuinely-absent overlay stays a MISS.
+        let real = persist_mismatches(&saved_preset(), &[write(1, 0.61)]);
+        assert_eq!(
+            real.missed.len(),
+            1,
+            "a covered-but-empty overlay is still a lost write: {real:?}"
+        );
+        assert!(real.unverifiable.is_empty(), "{real:?}");
+    }
+
+    /// The FS-lane half of the same gate. An Assign write is read out of `ftsw` and a Bake
+    /// write out of `audioGraph`; either section can be missing from a truncated re-read, and
+    /// a missing SECTION must never be graded as a missing VALUE.
+    #[test]
+    fn a_truncated_reread_leaves_fs_verdicts_unknown_rather_than_lost() {
+        // Base graph + an ftsw table whose switch 0 assigns the amp's outputLevel to 0.72.
+        let full = serde_json::json!({
+            "audioGraph": { "presetLevel": 0.5, "guitarNodes": {
+                "G1": [ { "nodeId": "amp", "FenderId": "amp",
+                          "dspUnitParameters": { "bypass": false, "outputLevel": 0.40 } } ]
+            } },
+            "ftsw": [ [ { "func": "param", "groupId": "G1", "nodeId": "amp",
+                          "parameterId": "outputLevel", "valueA": 0.72, "valueType": 1 } ] ]
+        });
+        let bake = (
+            0usize,
+            "amp".to_string(),
+            "outputLevel".to_string(),
+            0.40,
+            false,
+        );
+        let assign = (
+            1usize,
+            "amp".to_string(),
+            "outputLevel".to_string(),
+            0.72,
+            true,
+        );
+        let writes = [bake.clone(), assign.clone()];
+
+        // Control: the whole document is there, so both writes are gradable and both kept.
+        assert_eq!(
+            fs_persist_verdicts(&full, &writes, Some(0.5)),
+            vec![(0, Some(false)), (1, Some(false))],
+        );
+
+        // `ftsw` gone (the tail a truncated read loses): the ASSIGN becomes unknown, while
+        // the bake — read from the head of the document — is still fully checked.
+        let mut no_ftsw = full.clone();
+        no_ftsw.as_object_mut().expect("object").remove("ftsw");
+        assert_eq!(
+            fs_persist_verdicts(&no_ftsw, &writes, Some(0.5)),
+            vec![(0, Some(false)), (1, None)],
+            "an unreadable ftsw must not condemn the assign, nor cost the bake its check"
+        );
+
+        // `audioGraph` gone: the base-revert arm cannot run either, so the whole batch is
+        // unknown rather than every switch being condemned by a `presetLevel` that is merely
+        // unreadable.
+        let mut no_graph = full.clone();
+        no_graph
+            .as_object_mut()
+            .expect("object")
+            .remove("audioGraph");
+        assert_eq!(
+            fs_persist_verdicts(&no_graph, &writes, Some(0.5)),
+            vec![(0, None), (1, None)],
+        );
+
+        // Not an amnesty: a document that DOES carry both sections still reports real losses.
+        let lost = [
+            (
+                0usize,
+                "amp".to_string(),
+                "outputLevel".to_string(),
+                0.90,
+                false,
+            ),
+            (
+                1usize,
+                "amp".to_string(),
+                "outputLevel".to_string(),
+                0.90,
+                true,
+            ),
+        ];
+        assert_eq!(
+            fs_persist_verdicts(&full, &lost, Some(0.5)),
+            vec![(0, Some(true)), (1, Some(true))],
+        );
+        // …and a base save that reverted still condemns the batch.
+        assert_eq!(
+            fs_persist_verdicts(&full, &writes, Some(0.9)),
+            vec![(0, Some(true)), (1, Some(true))],
+        );
     }
 }
 

@@ -1125,10 +1125,24 @@ fn solve_400_spring(
         } => (engaged.clone(), *clear_stale, mirror_scenes.clone()),
         other => panic!("400 switch {SWITCH} must plan as Bake, got {other:?}"),
     };
+    // CONTRACT CORRECTED 2026-08-19 (HW, fw 1.8.45). This used to assert the opposite — that
+    // a Bake isolates only the SIBLINGS and the leveled block gets NO bypass write, on the
+    // reasoning that a block already ON in the base needs nothing said about it. Hardware
+    // refuted it: a SIBLING row's isolation writes this block's `bypass = true` into the
+    // device working copy, every capture's `recall_base` re-asserts that mutated copy, and
+    // the row then measures with the very block it is levelling switched OFF (slot 26
+    // "Plumes+BD2+OCD", every row clamped — `notes/gotchas.md`). The plan must state the
+    // block's own engaged bypass, and must state EXACTLY what `switch_states` hands the
+    // ceiling prepass, or plan and prepass describe different sounds.
+    assert_eq!(
+        engaged,
+        crate::footswitch::switch_states(&ftsw, &preset, SWITCH).engaged_bypass,
+        "a Bake's isolation must equal the prepass's own engaged state: {engaged:?}"
+    );
     assert!(
-        !engaged.iter().any(|(_, n, _)| n == NODE),
-        "a Bake isolates only the SIBLINGS — the leveled block must get no bypass write, \
-         which is exactly what the widened `model_lufs` predicate exists to handle: {engaged:?}"
+        engaged.iter().any(|(_, n, byp)| n == NODE && !*byp),
+        "the leveled block is ON in this fixture's base, so its own bypass must be asserted \
+         OFF-bypass (engaged) rather than left unstated: {engaged:?}"
     );
     assert!(
         clear_stale.is_none(),
@@ -2359,6 +2373,116 @@ fn load_then_discover_blocks_gates_on_a_pending_same_slot_save() {
         "block discovery materialized the PRE-save doc inside the commit window \
          (preset-24 class), got {}",
         sim.preset_level()
+    );
+}
+
+/// GATE for the stale-`presetLevel` capture incident (HW, 2026-08-19, "Plumes+BD2+OCD").
+///
+/// The barrier above is the FIRST line of defence, and it is not enough. Every capture's
+/// `recall_base` re-runs the device's OWN level-apply, which serves the COMMITTED
+/// `presetLevel` — and that store commits lazily (T+45-100 s, `danger.md`). A preset with no
+/// scenes has its base save and its footswitch batch seconds apart, squarely inside that
+/// window, so the whole batch measured a chain **5.53 dB** quieter than the one the user had
+/// just leveled: base saved 0.51009 and verified -23.0002, while the batch read switch 5's
+/// ceiling at -24.44 for a state that truly measures -18.91 — exactly
+/// `20·log10(0.51009 / 0.26999998)` against the file's ORIGINAL level. Every row then failed
+/// `fs_target_beyond_ceiling` and clamped a target it was comfortably within.
+///
+/// So a capture must not DEPEND on the barrier having waited (two of its four exits are
+/// silent, so which one a run took is not even recoverable from the log): it re-asserts the
+/// preset's own saved level itself. The sim models the device's revert faithfully — a recall
+/// restores `committed_doc(slot).preset_level` once the slot has been saved this run — so
+/// this reproduces the incident offline, without hardware.
+#[test]
+fn a_capture_renders_at_the_saved_preset_level_not_the_stale_committed_one() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+    ]);
+    // 600 s: the base save NEVER commits during the test, i.e. the whole run happens inside
+    // the commit window — the worst case, and the one the incident hit.
+    let sim = install_barrier_sim(600_000);
+    crate::sim_device::set_live(&sim);
+    let stim = test_stim();
+
+    let spec_json = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let rig = spec_json
+        .iter()
+        .find(|p| p.list_index == 400)
+        .expect("400 present");
+    let preset: serde_json::Value = serde_json::from_str(&rig.preset_json).expect("400 json");
+    let ftsw = preset["ftsw"].clone();
+
+    const SWITCH: u32 = 2; // the Boost switch, as in the Bake gate above
+    const NODE: &str = "ACD_Boost";
+    const PARAM: &str = "gain";
+    // The level base leveling just solved and saved — pending, not yet committed.
+    const SAVED_PL: f32 = 0.51;
+    {
+        let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(400).expect("load 400");
+        s.set_preset_level(SAVED_PL).expect("set");
+        s.save_current_preset(400).expect("save");
+    }
+
+    let states = crate::footswitch::switch_states(&ftsw, &preset, SWITCH);
+    let authored = crate::commands::level_footswitch::node_param_f64(&preset, NODE, PARAM)
+        .expect("ACD_Boost.gain") as f32;
+    let probe = crate::leveller::FsCeilingProbe {
+        scene: None,
+        states: &states,
+        handle: (
+            "G1".to_string(),
+            NODE.to_string(),
+            crate::leveller::FsParamTarget::new(NODE, PARAM, authored),
+        ),
+    };
+
+    // THE PRE-FIX SHAPE — assert nothing and let the recall's level-apply decide. It serves
+    // the pre-save committed level, which is the entire defect.
+    let stale = crate::leveller::measure_fs_ceiling(&probe, &stim, None).expect("stale ceiling");
+    let stale_pl = sim.preset_level();
+    assert!(
+        (stale_pl - SAVED_PL).abs() > 0.05,
+        "PREMISE: inside the commit window the recall must serve the PRE-save level, not the \
+         saved {SAVED_PL} — got {stale_pl}. Without this the test proves nothing."
+    );
+
+    // THE SHIPPED SHAPE — the run re-asserts its own saved level on the capture.
+    let fresh =
+        crate::leveller::measure_fs_ceiling(&probe, &stim, Some(SAVED_PL)).expect("fresh ceiling");
+    assert!(
+        (sim.preset_level() - SAVED_PL).abs() < 1e-3,
+        "the capture must render at the SAVED level {SAVED_PL}, got {}",
+        sim.preset_level()
+    );
+    assert!(
+        sim.events().iter().any(|e| matches!(
+            e,
+            crate::sim_device::SimEvent::PresetLevel(v) if (v - SAVED_PL).abs() < 1e-3
+        )),
+        "the capture must SEND setPresetLevel — the recall is what reverted it, so nothing \
+         upstream can be trusted to have left the right value in place"
+    );
+
+    // And the reading actually moves by the level difference: this is the ceiling error that
+    // made every row of the user's batch clamp.
+    let expected = 20.0 * (f64::from(SAVED_PL) / f64::from(stale_pl)).log10();
+    let got = fresh.integrated_lufs - stale.integrated_lufs;
+    assert!(
+        (got - expected).abs() < 0.5,
+        "the stale capture must be off by exactly the level ratio: expected {expected:.2} dB, \
+         got {got:.2} dB ({:.2} → {:.2} LUFS)",
+        stale.integrated_lufs,
+        fresh.integrated_lufs
     );
 }
 

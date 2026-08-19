@@ -416,13 +416,24 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                 let mut started = |scene| {
                     let _ = on_result.send(scene_progress_item(slot, save_run, scene, None));
                 };
-                // No intended `presetLevel` to assert yet: the prepass runs BEFORE the trade
-                // decides whether to move it, so these ceilings are — by definition — read at
-                // the level the preset currently holds.
+                // The preset's own SAVED `presetLevel` — NOT the trade's raise, which PHASE 2
+                // has not decided yet. The prepass must render at the SAME level every later
+                // solve capture does, or the first solve step reads a "response" that is
+                // really the level difference between the two renderings: `correct_iter`
+                // takes this reading as its `measured0` and compares it against a post-apply
+                // capture, so a mismatch of 9.9 dB swamped `no_authority`'s KNOB_TOL_LU and
+                // turned an amps-at-zero scene's actionable routing clamp into a reason-less
+                // headroom one (offline fixture 403 "Clean"). "The level the preset currently
+                // holds" is the intent, and inside a save's lazy-commit window the device's
+                // load store does not hold it — hence asserting it rather than assuming it.
+                let saved_pl = saved
+                    .as_ref()
+                    .and_then(crate::audiograph::preset_level)
+                    .map(|v| v as f32);
                 leveller::prepass_scene_ceilings(
                     &mut scene_jobs,
                     &stim,
-                    None,
+                    saved_pl,
                     &mut started,
                     cancelled,
                 )?;
