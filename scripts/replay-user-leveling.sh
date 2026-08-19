@@ -256,6 +256,14 @@ if [ ! -f "$PROFILE_CAPTURE_WAV" ]; then
   exit 2
 fi
 ok "profile capture WAV confirmed: $PROFILE_CAPTURE_WAV"
+# State the SESSION BEING REPLAYED next to the routing this script actually uses for it, so
+# a run's own log answers "were these really the user's settings?" without reading the
+# source. `$TOPOLOGY_ID`/`$CALIBRATION_LUFS` are the recorded session's values and are
+# deliberately NOT what the leveling commands receive — see `LEVEL_TOPOLOGY_ID` above for
+# why passing them would silently level against a synthetic sample under this harness.
+log "replaying profile $PROFILE_ID (topology $TOPOLOGY_ID, calibration $CALIBRATION_LUFS)"
+log "  leveling commands are passed topologyId='' + calibrationLufs=null so resolution lands"
+log "  on TMP_LEVELLER_STIMULUS — the SAME capture bytes the re-measure judges against"
 
 # shellcheck source=scripts/device-lock.sh disable=SC1091
 . "$REPO/scripts/device-lock.sh"
