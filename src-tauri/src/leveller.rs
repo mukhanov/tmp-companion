@@ -4752,13 +4752,29 @@ pub fn level_scenes_oneshot(
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
-    // A landed headroom trade is holding a RAISED `presetLevel` UNSAVED in the working copy
-    // until this batch's one save. Every per-scene capture below recalls its scene first, and
-    // the recall runs the device's own level-apply (`recall_reassert_save`) — so without
-    // re-asserting the hold's level each capture would render at the device's SAVED (pre-raise)
-    // level and every scene would be solved against the wrong sound. No hold ⇒ nothing unsaved
-    // to re-assert.
-    let intended_preset_level = hold.map(|h| h.preset_level);
+    // THE LEVEL EVERY CAPTURE MUST RENDER AT. Each per-scene capture recalls its scene first,
+    // and the recall runs the device's own level-apply — so a capture renders at whatever
+    // level that apply serves, not at the one this run means.
+    //
+    // Two ways that diverges, and BOTH need the same re-assert:
+    //  · a landed headroom trade holds a RAISED `presetLevel` UNSAVED in the working copy
+    //    until this batch's one save — without the re-assert every scene is solved against
+    //    the pre-raise sound;
+    //  · with no trade, the recall serves the COMMITTED level, and the load store commits
+    //    LAZILY — so shortly after this preset's base row saved a new level, every capture
+    //    still renders at the OLD one. This arm used to be `None`, i.e. exactly that bug.
+    //    HW, fw 1.8.45, 2026-08-19, slot 26: the footswitch lane's twin of this measured a
+    //    whole batch 5.53 dB quiet, that being 20*log10(0.51009/0.2699) — the just-saved
+    //    level over the pre-run one (see `commands/level_footswitch.rs`'s `intended_pl`).
+    //
+    // The trade's unsaved raise wins when there is one; otherwise fall back to the preset's
+    // own SAVED level, read from the complete field-8 doc the caller already holds (the
+    // fresher of the device's two stores). Rendering is then independent of commit timing.
+    let intended_preset_level = hold.map(|h| h.preset_level).or_else(|| {
+        saved
+            .and_then(crate::audiograph::preset_level)
+            .map(|v| v as f32)
+    });
     run_scene_jobs(
         slot,
         jobs,
