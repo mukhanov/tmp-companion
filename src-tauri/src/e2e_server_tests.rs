@@ -1990,29 +1990,35 @@ fn hiwatt_base_leveling_measures_base_not_the_saved_scene() {
     );
 }
 
-/// BUG→GATE (2026-08-19 HW report, "Plumes+BD2+OCD"): BASE means the preset AS SAVED. The
-/// command used to force EVERY footswitch-owned on-off block OFF before the base capture, so a
-/// preset whose pedal is saved ON was measured without it — on the reported preset `ACD_Plumes`
-/// is `bypass: false` in base, the forced-off capture read 4.7 dB quiet, and the solved
-/// `presetLevel` left the real base 4.7 LU ABOVE its target (external ffmpeg read: -18.3 LUFS
-/// against a -23.0 target). Two sibling presets in the same run corroborate the mechanism: one
-/// with a mild always-on block was -0.5 off, one with NO footswitch block on in base was exact.
+/// BUG→GATE (2026-08-20 HW report, "Plumes+BD2+OCD", slot 30): BASE means the preset with NO
+/// footswitch engaged. The command briefly measured base AS SAVED instead — every
+/// footswitch-owned on-off block keeping its saved bypass — which on a preset whose pedal is
+/// saved ON makes "Base" and that pedal's own footswitch row THE SAME SOUND. Measured with the
+/// player's own DI through external ffmpeg `ebur128`: base-as-saved and the FS6 row both read
+/// -22.99 LUFS (identical to three decimals, and FS6's solve converged on the value it started
+/// from), while the same preset with its four pedals forced off sat 4.7 LU away at -27.69 —
+/// never measured, never leveled, and unreachable by any row the run offered.
+///
+/// The as-saved experiment had been argued from an ffmpeg read of -18.3 LUFS against a -23.0
+/// target on this same preset. That number was real but CONFOUNDED: on that day the block's own
+/// footswitch row was clamping in every multi-row batch (see `footswitch.rs`'s isolation note),
+/// which alone leaves the recalled sound exactly that hot. The clamp is fixed; base and its
+/// pedal row are separately reachable again.
 ///
 /// Slot 400 ("E2E Rig") is the offline fixture of that shape: three of its four block-acting
 /// switches own a block that is `bypass: false` in the saved base graph (`ACD_TubeScreamer`,
 /// `ACD_Boost`, `ACD_TMSpring63`) and one owns a block saved OFF (`ACD_CryBabyQ535`). A base run
-/// must leave every one of them at its SAVED state — which offline means the run sends no
-/// `bypass` write for them at all, since `SimState::bypass_writes` (the sole input `model_lufs`
-/// consults for a block's engaged state) is empty until something writes it.
+/// must force EVERY one of them off, whatever its saved state.
 ///
 /// SCOPE HONESTY: this pins the device-visible CAUSE — the same standard
 /// `hiwatt_scene_leveling_never_reseeds_an_existing_overlay` documents — not the LU delta. No
 /// shipped fixture declares a base-ENGAGED block in the sidecar's `leveledParams`, so the
-/// loudness the forced-off state costs is not expressible against this fixture set; that half is
-/// the hardware measurement quoted above. The finite-C assertion below is a non-vacuity guard
-/// (the capture really went through the physics model), not the discriminator.
+/// loudness the isolation costs is not expressible against this fixture set (which is also why
+/// the C assertion below is unchanged at -15: forcing these blocks off moves no modeled
+/// loudness offline); that half is the hardware measurement quoted above. The C assertion is a
+/// non-vacuity guard — the capture really went through the physics model — not the discriminator.
 #[test]
-fn base_leveling_measures_the_preset_as_saved_not_with_the_footswitches_forced_off() {
+fn base_leveling_forces_every_footswitch_owned_block_off_not_the_preset_as_saved() {
     let _serial = serial();
     let sim = hiwatt_sim(); // scenario + sidecar + backup + stimulus env, sim installed
     const RIG: u32 = 400;
@@ -2083,18 +2089,45 @@ fn base_leveling_measures_the_preset_as_saved_not_with_the_footswitches_forced_o
         "the base capture went through the model (400's base C = -15): {r}"
     );
 
-    // THE GATE: not one footswitch-owned block was written — base is the preset as saved.
-    let forced: Vec<&crate::sim_device::SimEvent> = events
+    // THE GATE: every footswitch-owned block was forced OFF, whatever its saved bypass —
+    // base is the preset with nothing switched on.
+    let forced_off: Vec<&String> = events
         .iter()
-        .filter(|e| {
-            matches!(e, crate::sim_device::SimEvent::Bypass { node, .. }
-                if onoff.iter().any(|(_, n)| n == node))
+        .filter_map(|e| match e {
+            crate::sim_device::SimEvent::Bypass { node, on: true }
+                if onoff.iter().any(|(_, n)| n == node) =>
+            {
+                Some(node)
+            }
+            _ => None,
+        })
+        .collect();
+    let missing: Vec<&String> = onoff
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| !forced_off.contains(n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "base leveling must force EVERY footswitch-owned block off — a block left at its saved \
+         ON state makes Base the same sound as that switch's own row. Never forced: {missing:?} \
+         (forced: {forced_off:?})"
+    );
+    // ...and none was forced back ON: an isolation that re-engages a block is not isolation.
+    let forced_on: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            crate::sim_device::SimEvent::Bypass { node, on: false }
+                if onoff.iter().any(|(_, n)| n == node) =>
+            {
+                Some(node)
+            }
+            _ => None,
         })
         .collect();
     assert!(
-        forced.is_empty(),
-        "base leveling must measure the preset AS SAVED — every footswitch-owned block keeps \
-         its saved bypass, so the run may write none of them. Forced: {forced:?}"
+        forced_on.is_empty(),
+        "the base isolation may only force footswitch-owned blocks OFF: {forced_on:?}"
     );
 }
 

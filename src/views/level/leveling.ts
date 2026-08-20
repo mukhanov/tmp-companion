@@ -32,7 +32,8 @@ import type { PickOption } from "../overlays/Pick";
 // `SetupOption`/`RunItem` and the scene-handle-picker wiring can import it from
 // either module without a second, driftable copy.
 import type { SceneHandlePick } from "../../lib/invoke";
-import { shortFallback } from "../../models/blockArt";
+import { blockArtTile, shortFallback } from "../../models/blockArt";
+import { stripNameFor } from "../../models/catalog";
 import { slotLabel } from "../../lib/format";
 
 export type { SceneHandlePick };
@@ -240,7 +241,27 @@ export function instrumentName(
  *  to the backend, but naming it after the default while leveling something else would
  *  still mislead the player reading their own Level list. */
 export function footswitchNameForCandidate(c: LevelParamCandidate): string {
-  return shortFallback(c.fender_id);
+  return blockStripName(c.fender_id);
+}
+
+/** The name the UNIT prints under a footswitch for a block, for rows whose switch has
+ *  no `customLabel` of its own — so the Level list reads the same as the hardware the
+ *  player is looking at.
+ *
+ *  BUG→FIX (2026-08-20, "Plumes+BD2+OCD"): this used to be `shortFallback(fender_id)`,
+ *  which merely de-camel-cases the internal id — `ACD_BluesDriver` → "Blues Driver".
+ *  That is the name of the pedal Fender EMULATES, not any name the device shows: the
+ *  unit's strip reads "Sapphire OD" and the control picker one column over already read
+ *  "SAPPHIRE DRIVE". Three names for one block, none of them matching the unit.
+ *
+ *  Order: the device's own strip name (`name8`), else the Model Guide name, else the
+ *  old de-camel-cased id so an uncatalogued or user block still gets something. */
+function blockStripName(fenderId: string): string {
+  return (
+    stripNameFor(fenderId) ??
+    blockArtTile(fenderId).fullName ??
+    shortFallback(fenderId)
+  );
 }
 
 export function footswitchName(f: FootswitchInfo): string {
@@ -255,7 +276,7 @@ export function footswitchName(f: FootswitchInfo): string {
     const picked = idx >= 0 ? f.level_params[idx] : undefined;
     if (picked) return footswitchNameForCandidate(picked);
   }
-  if (f.functions.length > 0) return shortFallback(f.functions[0].fender_id);
+  if (f.functions.length > 0) return blockStripName(f.functions[0].fender_id);
   return "Footswitch";
 }
 

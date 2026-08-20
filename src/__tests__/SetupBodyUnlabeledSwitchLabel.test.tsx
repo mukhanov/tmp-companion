@@ -119,8 +119,9 @@ describe("SetupBody — label provenance for an unlabeled footswitch", () => {
       levParameterId: "level",
       sceneContext: null,
     });
-    // …and the DISPLAYED row name follows THAT block, not the default Boost.
-    expect(choice.option.sceneName).toBe("Tube Screamer");
+    // …and the DISPLAYED row name follows THAT block, not the default Boost — named as
+    // the UNIT names it ("Greenbox 8" is what the strip reads for ACD_TubeScreamer).
+    expect(choice.option.sceneName).toBe("Greenbox 8");
     expect(choice.option.sceneName).not.toBe("Boost");
   });
 

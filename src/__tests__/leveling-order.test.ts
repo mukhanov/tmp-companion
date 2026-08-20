@@ -142,16 +142,40 @@ describe("chosenFrom run-order", () => {
     });
   });
 
-  it("footswitchName falls back to the toggled block's name when the label is blank", () => {
-    // A footswitch the player never named → the block's friendly name, not a blank row.
+  it("footswitchName falls back to the toggled block's DEVICE name when the label is blank", () => {
+    // A footswitch the player never named → the name the UNIT prints under that switch,
+    // not a blank row. `ACD_TubeScreamer` reads "Greenbox 8" on the hardware; the old
+    // fallback said "Tube Screamer", which is the pedal Fender EMULATES — a name the
+    // device never shows anywhere (BUG→GATE 2026-08-20, see the strip-name gate below).
     const blank: FootswitchInfo = { ...fsw(4, ""), label: "" };
     blank.level_params = [
       { ...blank.level_params[0], fender_id: "ACD_TubeScreamer" },
     ];
-    expect(footswitchName(blank)).toBe("Tube Screamer");
+    expect(footswitchName(blank)).toBe("Greenbox 8");
     // A named footswitch keeps the player's own label.
     expect(footswitchName(fsw(4, "Solo"))).toBe("Solo");
   });
+
+  // BUG→GATE (2026-08-20 HW report, preset 30 "Plumes+BD2+OCD"): all four of that
+  // preset's switches carry an empty `customLabel`, so every row fell back to the
+  // de-camel-cased FenderId — "Blues Driver", "Obsessive Drive", "Rat" — while the unit's
+  // scribble strips read "Sapphire OD", "CSD", "Rodent". The player could not match a row
+  // to the switch under their foot. These are the reported blocks with their reported
+  // strip names; if a future catalog regen drops `strip_name` (the `name8` half of the
+  // display-name table the catalog already reads for `pro_control_name`), this fails.
+  it.each([
+    ["ACD_BluesDriver", "Sapphire OD"],
+    ["ACD_ObsessiveDrive", "CSD"],
+    ["ACD_Rat", "Rodent"],
+    ["ACD_Plumes", "Pinions"],
+  ])(
+    "names an unlabeled switch on %s as the unit does: %s",
+    (fid, expected) => {
+      const f: FootswitchInfo = { ...fsw(4, ""), label: "" };
+      f.level_params = [{ ...f.level_params[0], fender_id: fid }];
+      expect(footswitchName(f)).toBe(expected);
+    },
+  );
 
   // The name is not "any candidate" — it follows the same tone-safe RANKED pick Set up
   // recommends (item 1: `defaultParamIndex` off the wire `class`), never the first
