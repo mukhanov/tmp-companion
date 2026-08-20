@@ -4641,6 +4641,19 @@ pub fn level_scenes_live_batched(
 /// the solve captures render at: `correct_iter` takes a prepass reading as its `measured0`
 /// and compares it to a post-apply capture, so two different renderings make the first
 /// "response" include the level difference and can defeat the `no_authority` verdict outright.
+/// The progress `message` a lane sends while a CEILING PREPASS capture is running.
+///
+/// A progress message on an ACTIVE row is that row's caption, and the wizard renders it two
+/// ways depending on whether a capture is streaming (`RunBody`'s `rowStatus`):
+///
+/// - a capture IS streaming -> the caption is the VERB before the live number, `measuring · -18.9`
+/// - nothing is streaming -> the caption is a NOTE, rendered verbatim, e.g. the freshness
+///   barrier's "waiting for the device to commit the previous save…"
+///
+/// So send THIS one only from inside a measurement loop, wrapped around a `measure_*` call.
+/// A message sent outside a capture is a note by construction and must read as a sentence.
+pub const PREPASS_ACTIVE_MSG: &str = "measuring";
+
 pub fn prepass_scene_ceilings(
     jobs: &mut [SceneJob],
     stimulus: &[f32],

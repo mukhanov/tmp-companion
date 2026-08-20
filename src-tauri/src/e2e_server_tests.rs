@@ -406,6 +406,251 @@ fn level_defaults_base_clamps_and_the_split_lane_footswitch_is_offbranch() {
     );
 }
 
+/// GATE (user report, preset 30 "Plumes+BD2+OCD", 2026-08-20): THE PREPASS MUST ANNOUNCE ITSELF.
+///
+/// The ceiling prepass measures every selected footswitch — one engage, ~10 s — BEFORE the
+/// first row is solved, and it used to stream nothing at all. The wizard's optimistic
+/// `markGroupActive` therefore held row 0 highlighted for the whole sweep while the unit
+/// engaged four different pedals in turn, and the run read as "the Pinions row is leveling
+/// with the Sapphire OD footswitch on". Nothing was misleveled — every capture's isolation
+/// was correct — but the display named the wrong sound for a minute, which is the same thing
+/// to the person watching.
+///
+/// Two halves, both required, because either alone still lies:
+/// 1. ORDERING — all four rows go `active` before ANY row finishes. Per-row events are what
+///    make the highlight follow the device.
+/// 2. CAPTION — each row's FIRST active carries `leveller::PREPASS_ACTIVE_MSG`, and its
+///    SECOND (the solve, phase 2) carries none. A live capture streams throughout, so the
+///    wizard renders an active row's message as the VERB before the live number: with the
+///    caption the prepass reads `measuring · -18.9`, without it `leveling · -18.9` — the
+///    same lie, better aimed. The absent second caption is what flips the verb back.
+///
+/// Observed through `channel_interceptor`, which sees the `Channel` items the offline HTTP
+/// bridge deliberately no-ops (`.claude/rules/e2e.md`) — so this contract is NOT reachable
+/// from a Playwright spec, and this is the seam that owns it. `level_footswitches_apply` ends
+/// in `with_released_seize(...).await`, so `get_ipc_response` returns only after every send
+/// has landed: no polling, no sleep.
+///
+/// Fixture 405 is the incident's own shape — four bare on-off drive pedals on switches 5-8,
+/// four distinct handles, so four plain `Bake` plans with no `BakeShared` sibling (which pays
+/// no capture and correctly gets no prepass tick) and no skips.
+#[test]
+fn the_fs_prepass_announces_every_row_before_any_row_finishes() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+        (
+            "TMP_E2E_BACKUP_FIXTURE",
+            "/../e2e/fixtures/backup-fixture.bin",
+        ),
+        (
+            "TMP_E2E_STIMULUS",
+            "/resources/samples/guitar-humbucker.wav",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+
+    // Every channel item in arrival order. The interceptor consumes them (`true`) so nothing
+    // reaches a webview `eval` that does not exist under the mock runtime.
+    let items: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let sink = items.clone();
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .channel_interceptor(move |_wv, _cb, _id, body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                    lock_ok(&sink).push(v);
+                }
+            }
+            true
+        })
+        .invoke_handler(tauri::generate_handler![level_footswitches_apply])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+
+    // The four drive pedals, in switch order — Rat's handle is `volume`, the others' `level`.
+    let switches: [(u32, &str, &str); 4] = [
+        (5, "ACD_Plumes", "level"),
+        (6, "ACD_BluesDriver", "level"),
+        (7, "ACD_ObsessiveDrive", "level"),
+        (8, "ACD_Rat", "volume"),
+    ];
+    let jobs: Vec<serde_json::Value> = switches
+        .iter()
+        .map(|(sw, node, param)| {
+            serde_json::json!({
+                "switch": sw,
+                "levGroupId": "G1",
+                "levNodeId": node,
+                "levParameterId": param,
+                "targetLufs": -23.0,
+            })
+        })
+        .collect();
+    // `save: false` — this gate owns the run's REPORTING, not its writes, and a save would
+    // drag in the lazy-commit barrier (whose own message is the other half of the caption
+    // contract: a note, sent when nothing is streaming).
+    invoke(
+        &webview,
+        "level_footswitches_apply",
+        serde_json::json!({
+            "slot": 405,
+            "jobs": jobs,
+            "save": false,
+            "topologyId": serde_json::Value::Null,
+            "calibrationLufs": null,
+            "profileId": null,
+            "onResult": "__CHANNEL__:7",
+        }),
+    )
+    .expect("level_footswitches_apply");
+
+    let seen = lock_ok(&items).clone();
+    let first_done = seen
+        .iter()
+        .position(|v| v["status"] == "done")
+        .unwrap_or(seen.len());
+    // Only the PREPASS ticks — phase 2's own `active` for the first row also lands before that
+    // row's `done`, and it is not what this half is about.
+    let announced: Vec<u32> = seen[..first_done]
+        .iter()
+        .filter(|v| v["status"] == "active" && v["message"] == crate::leveller::PREPASS_ACTIVE_MSG)
+        .filter_map(|v| v["switch"].as_u64().map(|n| n as u32))
+        .collect();
+    assert_eq!(
+        announced,
+        vec![5, 6, 7, 8],
+        "every selected row must go active, IN DEVICE ORDER, before any row finishes — the \
+         prepass engages each in turn and the wizard highlights whichever it last heard \
+         about. Got {announced:?} from {seen:?}"
+    );
+    for (sw, _, _) in switches {
+        let captions: Vec<Option<&str>> = seen
+            .iter()
+            .filter(|v| v["status"] == "active" && v["switch"].as_u64() == Some(u64::from(sw)))
+            .map(|v| v["message"].as_str())
+            .collect();
+        assert_eq!(
+            captions.first().copied().flatten(),
+            Some(crate::leveller::PREPASS_ACTIVE_MSG),
+            "switch {sw}'s prepass tick must caption its own phase, or the wizard renders it \
+             with the solve's verb over a live number: {seen:?}"
+        );
+        assert_eq!(
+            captions.get(1).copied().flatten(),
+            None,
+            "switch {sw}'s SOLVE tick must carry no caption — that absence is what flips the \
+             row's verb back from the prepass's: {seen:?}"
+        );
+    }
+}
+
+/// The SCENE half of the caption contract above. This lane already ticked per scene during its
+/// prepass — its highlight followed the device — but both phases built the payload through
+/// `scene_progress_item(.., None)`, so the two ticks were byte-identical and the prepass was
+/// indistinguishable from the solve: with a live capture streaming throughout, a scene being
+/// MEASURED read exactly like a scene being LEVELED.
+///
+/// Same two clauses as the FS gate, minus the ordering one (which held here already): each
+/// scene's FIRST tick carries `leveller::PREPASS_ACTIVE_MSG`, its later ticks carry none.
+/// Fixture 403 is the 4-scene preset the sibling solve/off-branch gate uses.
+#[test]
+fn the_scene_prepass_captions_its_own_phase_and_the_solve_does_not() {
+    let _serial = serial();
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+        (
+            "TMP_E2E_BACKUP_FIXTURE",
+            "/../e2e/fixtures/backup-fixture.bin",
+        ),
+        (
+            "TMP_E2E_STIMULUS",
+            "/resources/samples/guitar-humbucker.wav",
+        ),
+    ]);
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+
+    let items: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let sink = items.clone();
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .channel_interceptor(move |_wv, _cb, _id, body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                    lock_ok(&sink).push(v);
+                }
+            }
+            true
+        })
+        .invoke_handler(tauri::generate_handler![level_scenes_apply_batched])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    let amp = serde_json::json!([
+        {"groupId": "G2", "nodeId": "ampA", "parameterId": "outputLevel", "value": 1.0},
+        {"groupId": "G3", "nodeId": "ampB", "parameterId": "outputLevel", "value": 1.0}
+    ]);
+    invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403,
+            "jobs": (0..4).map(|s| serde_json::json!({"sceneSlot": s, "targetLufs": -23.0})).collect::<Vec<_>>(),
+            "candidates": amp,
+            "save": false, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:7"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+
+    let seen = lock_ok(&items).clone();
+    for scene in 0..4u64 {
+        let captions: Vec<Option<&str>> = seen
+            .iter()
+            // `SceneLevelProgressItem` is `rename_all = "camelCase"` — the wire key is
+            // `sceneSlot`. (The FS item's `switch` is one word, so it is unaffected.)
+            .filter(|v| v["status"] == "active" && v["sceneSlot"].as_u64() == Some(scene))
+            .map(|v| v["message"].as_str())
+            .collect();
+        assert_eq!(
+            captions.first().copied().flatten(),
+            Some(crate::leveller::PREPASS_ACTIVE_MSG),
+            "scene {scene}'s prepass tick must caption its own phase: {seen:?}"
+        );
+        assert!(
+            captions[1..].iter().all(|c| c.is_none()),
+            "scene {scene}'s solve ticks must carry no caption — that absence is what flips the \
+             row's verb back: {seen:?}"
+        );
+    }
+}
+
 /// THE FS PREPASS CEILING (the reordered run's footswitch half): one engage with the leveling
 /// handle PINNED AT THE TOP of its range reads how loud this footswitch sound can possibly be
 /// — a MEASUREMENT, never an extrapolation, because an arbitrary block param has no

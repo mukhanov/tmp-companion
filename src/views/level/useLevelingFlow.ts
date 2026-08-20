@@ -419,9 +419,11 @@ export function useLevelingFlow({
           if (!entry) return;
           if (status === "active") {
             setSoleActive(entry.item);
-            // e.g. the freshness barrier's "waiting for the device to commit the previous
-            // save…" — shown verbatim while no capture is streaming yet (see RunBody's
-            // rowStatus). Cleared once the row resolves so a later re-run's default
+            // The row's caption: the ceiling prepass's "measuring" (rendered as the verb
+            // before the live number, since a capture IS streaming), or the freshness
+            // barrier's "waiting for the device to commit the previous save…" (shown
+            // verbatim, since nothing is). See RunBody's rowStatus. Cleared once the row
+            // resolves — or when a cancelled sweep reverts it — so a later re-run's default
             // "connecting…" isn't shadowed by a stale message.
             entry.item.activeMessage = message ?? null;
             publish(entry.idx, false, false);
@@ -462,8 +464,15 @@ export function useLevelingFlow({
           // follow-up run), but the optimistic `markGroupActive` row never got a
           // backend result — revert it or it spins "stopping…" forever on the
           // finished run (the final done publish picks this mutation up).
+          // Drop its caption with it: a cancelled row never reaches `finishItem`,
+          // which is the only other place that clears one, and every prepass row
+          // now carries "measuring" — so leaving it would shadow the next run's
+          // "connecting…" on each row the stopped run had already reached.
           for (const entry of entries.values()) {
-            if (entry.item.status === "active") entry.item.status = "queued";
+            if (entry.item.status === "active") {
+              entry.item.status = "queued";
+              entry.item.activeMessage = null;
+            }
           }
           return;
         }

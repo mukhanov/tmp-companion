@@ -344,6 +344,20 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                 if handle.refuse_if_not_a_level_control().is_some() {
                     return None;
                 }
+                // The row is about to ENGAGE — every arm that skips a capture has returned
+                // above, so this is the first point where the device's sound and this row
+                // agree. Without it the wizard held ONE row active for the whole prepass
+                // (~10 s per row) while the unit stepped through the others, and the run
+                // read as "leveling the wrong footswitch" (user report, preset 30).
+                // `message` is the row's caption: a capture streams here, so the wizard
+                // renders it as the VERB before the live number (`leveller::PREPASS_ACTIVE_MSG`).
+                // PHASE 2's own `active` carries no message, which flips the verb back.
+                let _ = on_result.send(FootswitchLevelProgressItem {
+                    switch: job.switch,
+                    status: "active".to_string(),
+                    result: None,
+                    message: Some(leveller::PREPASS_ACTIVE_MSG.to_string()),
+                });
                 let states = footswitch::switch_states(&ftsw, &preset, job.switch);
                 let probe = leveller::FsCeilingProbe {
                     // THE ROW'S SCENE CONTEXT (D3). `None` = base — the historical default,

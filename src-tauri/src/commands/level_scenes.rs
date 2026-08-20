@@ -413,8 +413,16 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
             // ceiling next to every target, and its verdict changes what every later sound
             // is solved to).
             {
+                // The prepass tick names its OWN phase — see `leveller::PREPASS_ACTIVE_MSG`.
+                // A capture is streaming when it lands, so the wizard reads it as the verb.
                 let mut started = |scene| {
-                    let _ = on_result.send(scene_progress_item(slot, save_run, scene, None));
+                    let _ = on_result.send(scene_progress_item(
+                        slot,
+                        save_run,
+                        scene,
+                        None,
+                        Some(leveller::PREPASS_ACTIVE_MSG),
+                    ));
                 };
                 // The preset's own SAVED `presetLevel` — NOT the trade's raise, which PHASE 2
                 // has not decided yet. The prepass must render at the SAME level every later
@@ -447,8 +455,10 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
                 save_run,
                 cancelled,
             );
+            // No message: the solve is the wizard's DEFAULT phase, and its bare `active` is
+            // what flips the row's verb back from the prepass's `measuring`.
             let on_scene = |scene, done: Option<&leveller::BatchedSceneOutcome>| {
-                let _ = on_result.send(scene_progress_item(slot, save_run, scene, done));
+                let _ = on_result.send(scene_progress_item(slot, save_run, scene, done, None));
             };
             // PHASE 3 — the writes, on the existing batch runner, unchanged.
             // `rebalance` (opt-in) equalizes a path-MERGE scene's two lanes before joint-k;
@@ -984,18 +994,24 @@ fn trade_for_batch(
 /// (spinner), `Some(outcome)` = it finished (a `done` result or an `error` message). Shared
 /// by `level_scenes_apply_batched` + `redistribute_headroom` so their per-row wire shape can't
 /// drift.
+///
+/// `active_message` is the started row's caption and is consumed ONLY by the `None` arm. The
+/// ceiling prepass passes [`leveller::PREPASS_ACTIVE_MSG`] so the wizard can tell that phase
+/// apart from the solve, which passes `None`; without it the two ticks are byte-identical and
+/// the run reads as though it were already solving.
 fn scene_progress_item(
     slot: u32,
     save: bool,
     scene: u32,
     done: Option<&leveller::BatchedSceneOutcome>,
+    active_message: Option<&str>,
 ) -> SceneLevelProgressItem {
     match done {
         None => SceneLevelProgressItem {
             scene_slot: scene,
             status: "active".to_string(),
             result: None,
-            message: None,
+            message: active_message.map(str::to_string),
         },
         Some(o) => match &o.failure {
             None => SceneLevelProgressItem {
@@ -1406,7 +1422,7 @@ pub(crate) async fn redistribute_headroom<R: tauri::Runtime>(
         let new_preset_level = (f64::from(preset_level) * 10f64.powf(delta_db / 20.0)).min(1.0) as f32;
 
         let on_scene = |scene, done: Option<&leveller::BatchedSceneOutcome>| {
-            let _ = on_result.send(scene_progress_item(slot, true, scene, done));
+            let _ = on_result.send(scene_progress_item(slot, true, scene, done, None));
         };
         let cancelled = || SCENE_LEVEL_CANCEL.load(SeqCst);
         let outcome = leveller::redistribute_clamped_headroom(
