@@ -621,9 +621,15 @@ pub fn probe_channels(slot: u32) -> Result<String, String> {
 /// each input channel's peak/RMS in dBFS. Validates that the dry instrument
 /// (USB-Out 3 → input channel index 2) is capturable for Tier-2 calibration.
 pub fn probe_capture_input(secs: f32) -> Result<String, String> {
-    // Ensure normal mode (re-amp OFF) so the rear instrument input flows.
-    if let Ok(mut s) = Session::connect() {
-        let _ = s.set_reamp_mode(false);
+    // Force normal mode (re-amp OFF) so the front instrument input flows —
+    // VERIFIED, same discipline as `capture_dry_di`: a swallowed OFF on a unit
+    // stuck in re-amp reads as an all-silent take (both jacks muted, USB-Out 3/4
+    // disabled) and would misdirect the very diagnosis this probe exists for.
+    {
+        let mut s = Session::connect()
+            .map_err(|e| format!("could not reach the device to switch re-amp OFF ({e})"))?;
+        s.set_reamp_mode(false)
+            .map_err(|e| format!("re-amp OFF was not accepted by the device ({e})"))?;
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     let cap = audio::capture_input(secs, 48_000)?;

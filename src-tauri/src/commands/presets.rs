@@ -370,7 +370,7 @@ pub(crate) async fn read_library_via_backup<R: tauri::Runtime>(
 /// `settingsBackup` bytes ([`BackupReadResult::settings_bytes`]) land for a future
 /// "support bundle" export. `None` (logged) when the config dir can't be resolved;
 /// never fails the backup read.
-fn device_settings_path<R: tauri::Runtime>(
+pub(crate) fn device_settings_path<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Option<std::path::PathBuf> {
     match profiles::app_config_dir(app) {

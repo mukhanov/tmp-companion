@@ -525,6 +525,35 @@ fn is_active_amp_node(v: &serde_json::Value, group_id: &str, node_id: &str) -> b
     false
 }
 
+/// The device mixer's `USB 3` strip — the dry-instrument send's OWN fader, mute
+/// and Pre/Post — decoded from a `settingsBackup` JSON (`mixerSaveData.usb3`, the
+/// bytes [`BackupReadResult::settings_bytes`] persists to `support/device-settings.json`).
+/// `None` when the snapshot lacks the strip. The Tier-2 calibration pre-flight
+/// (#124) reads it: a muted strip is no dry send at all (a fw 1.8.58 unit shipped
+/// with USB 3/4 muted), and `POST` makes the fader scale the send `PRE` sends at a
+/// fixed 0 dBFS reference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Usb3Strip {
+    pub mute: bool,
+    /// Mixer fader, 0.0..=1.0 (1.0 = unity).
+    pub fader: f32,
+    /// `true` = PRE (fader-independent, the default); `false` = POST.
+    pub pre: bool,
+}
+
+pub(crate) fn usb3_strip(settings_json: &str) -> Option<Usb3Strip> {
+    let v: serde_json::Value = serde_json::from_str(settings_json).ok()?;
+    let s = v.get("mixerSaveData")?.get("usb3")?;
+    Some(Usb3Strip {
+        mute: s.get("muteActive")?.as_bool()?,
+        fader: s.get("faderLevel").and_then(|f| f.as_f64()).unwrap_or(1.0) as f32,
+        pre: s
+            .get("preEnabled")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true),
+    })
+}
+
 #[cfg(test)]
 #[path = "backup_read_tests.rs"]
 mod tests;

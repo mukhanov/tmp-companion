@@ -463,8 +463,38 @@ pub(crate) async fn calibrate_profile(
     secs: f32,
 ) -> Result<CalibrateResult, String> {
     let app2 = app.clone();
+    let settings_path = crate::commands::presets::device_settings_path(&app);
     with_released_seize(state.session.clone(), move || {
-        let (mono, _peak) = crate::probe_api::stimulus::capture_dry_di(secs)?;
+        // #124 pre-flight: the device mixer's USB 3 strip, from the settings snapshot
+        // the startup backup read persisted (`support/device-settings.json`). The
+        // snapshot can be STALE — the mixer may have been touched since connecting —
+        // so it never vetoes a take on its own: a muted strip is the DEFINITE cause
+        // of a silent take (stated ahead of the lane hint), and a POST/off-unity
+        // fader refuses to persist a fader-scaled `calibration_lufs` even when the
+        // take itself landed. A take that succeeds despite a "muted" snapshot is
+        // simply a newer mixer state, and wins.
+        let strip = settings_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|json| crate::backup_read::usb3_strip(&json));
+        let fader_fault = strip
+            .as_ref()
+            .and_then(crate::probe_api::stimulus::usb3_fader_fault);
+        let (mono, _peak) = match crate::probe_api::stimulus::capture_dry_di(secs) {
+            Ok(take) => take,
+            Err(e) => {
+                let cause = strip
+                    .as_ref()
+                    .and_then(crate::probe_api::stimulus::usb3_muted_hint)
+                    .or(fader_fault);
+                return Err(match cause {
+                    Some(c) => format!("{c} [{e}]"),
+                    None => e,
+                });
+            }
+        };
+        if let Some(f) = fader_fault {
+            return Err(f);
+        }
         // Reject a capture that's mostly silence (a valid capture becomes the stimulus,
         // so a few plucks + long gaps would inject a mostly-dead re-amp signal).
         if active_window_fraction(&mono, 48_000) < 0.5 {

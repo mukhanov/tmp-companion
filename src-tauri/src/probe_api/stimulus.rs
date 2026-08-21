@@ -2,6 +2,7 @@
 
 use super::SCRATCH_SLOTS as SCRATCH;
 use crate::audio;
+use crate::backup_read::Usb3Strip;
 use crate::doctor;
 use crate::footswitch;
 use crate::leveller;
@@ -784,20 +785,194 @@ pub(crate) fn probe_stimulus_path(topology_id: &str) -> Result<String, String> {
 /// by `calibrate_profile` (Tier-2) and `probe --capture-wav` so their peak/silence
 /// guards can't drift apart.
 pub(crate) fn capture_dry_di(secs: f32) -> Result<(Vec<f32>, f32), String> {
-    // Ensure normal mode (re-amp OFF) so the front instrument input flows.
-    if let Ok(mut s) = session::Session::connect() {
-        let _ = s.set_reamp_mode(false);
+    // Force normal mode (re-amp OFF) so the front instrument input flows to
+    // USB-Out 3 — VERIFIED, not best-effort. In re-amp mode both input jacks are
+    // muted and USB-Out 3/4 are disabled, so an OFF that never reached the unit
+    // reads as "no instrument signal" with the real cause invisible (a real run:
+    // the monitor's pause-ack came late, this connect raced the still-seized
+    // device, and the swallowed failure left a silent take). A failed connect is
+    // reported, NOT retried — hammering re-opens resets the HID lockout
+    // (`danger.md`); the user retries after a pause.
+    {
+        let mut s = session::Session::connect().map_err(|e| {
+            format!(
+                "could not reach the device to switch re-amp OFF before the capture \
+                 ({e}) — wait a few seconds and try again"
+            )
+        })?;
+        s.set_reamp_mode(false)
+            .map_err(|e| format!("re-amp OFF was not accepted by the device ({e})"))?;
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     let cap = audio::capture_input(secs.clamp(2.0, 30.0), 48_000)?;
-    let mono = cap.channel(audio::DRY_INSTRUMENT_IN_CH);
+    let mono = cap.require_channel(audio::DRY_INSTRUMENT_IN_CH)?;
     let peak = cap.channel_peak(audio::DRY_INSTRUMENT_IN_CH);
-    if peak < 1e-4 {
-        return Err("no instrument signal captured — play continuously during \
-                    the capture (guitar in the front INSTRUMENT input, volume up)"
-            .to_string());
+    if peak < DRY_AUDIBLE_PEAK {
+        let peaks: Vec<f32> = (0..cap.channels).map(|c| cap.channel_peak(c)).collect();
+        return Err(silent_dry_diagnosis(&peaks));
     }
     Ok((mono, peak))
+}
+
+/// Peak floor below which a dry-DI lane counts as silent (−80 dBFS).
+const DRY_AUDIBLE_PEAK: f32 = 1e-4;
+
+/// Why a dry-DI take read silent on USB-Out 3, told from the OTHER lanes' peaks
+/// (index = capture channel: 0/1 processed, 2 dry instrument, 3 dry mic/line).
+/// The lane that DID carry signal names the routing fault, so the error is
+/// self-diagnosing instead of blaming the player: signal on USB-Out 4 means the
+/// guitar is in the MIC/LINE jack; signal on 1/2 only means the unit IS
+/// processing the guitar but its USB 3 dry send is off (USB mode / mixer strip);
+/// nothing anywhere means nothing reached the unit (not playing, or its input
+/// muted by re-amp).
+pub(crate) fn silent_dry_diagnosis(peaks: &[f32]) -> String {
+    let lane = |i: usize| peaks.get(i).copied().unwrap_or(0.0);
+    let processed = lane(0).max(lane(1));
+    let dbfs = |v: f32| {
+        if v >= DRY_AUDIBLE_PEAK {
+            format!("{:.0} dBFS", 20.0 * v.log10())
+        } else {
+            "silent".to_string()
+        }
+    };
+    let hint = if lane(3) >= DRY_AUDIBLE_PEAK {
+        "the signal is on USB-Out 4 (the MIC/LINE jack) — plug the guitar into the \
+         front INSTRUMENT input"
+    } else if processed >= DRY_AUDIBLE_PEAK {
+        "the device is processing a signal but USB-Out 3 carries no dry instrument \
+         send — the USB 3 channel is probably MUTED in the device mixer (on the unit: \
+         Mixer → USB 3 → unmute M, fader up); also check Global Settings → I/O → USB \
+         is in Standard mode"
+    } else {
+        "nothing reached the device's USB outs — play continuously during the capture \
+         (guitar in the front INSTRUMENT input, volume up); if the guitar is also \
+         inaudible through the unit, its input is muted (re-amp mode); if it IS \
+         audible, the USB 3 channel may be muted in the device mixer (Mixer → USB 3 → \
+         unmute M)"
+    };
+    format!(
+        "no instrument signal captured — {hint} [USB-Out 1/2 {} · 3 {} · 4 {}]",
+        dbfs(processed),
+        dbfs(lane(2)),
+        dbfs(lane(3))
+    )
+}
+
+/// #124 pre-flight, mute half: a muted `USB 3` strip is no dry send at all — the
+/// DEFINITE cause of a silent take, so it outranks [`silent_dry_diagnosis`]'s lane
+/// hint. No live mixer write is confirmed on this hardware, so the fix is the
+/// user's, on the unit.
+pub(crate) fn usb3_muted_hint(strip: &Usb3Strip) -> Option<String> {
+    strip.mute.then(|| {
+        "USB 3 is MUTED in the device mixer, so the dry instrument send is off — on \
+         the unit: Global Settings → Mixer → USB 3 → unmute (M), then calibrate again"
+            .to_string()
+    })
+}
+
+/// #124 pre-flight, gain half: on `POST` the fader scales the dry send, so an
+/// off-unity fader yields a DI whose loudness is NOT the instrument's — stored as
+/// `calibration_lufs` it would under- or over-drive every later re-amp. Refused
+/// rather than compensated: the fader's dB law is unmeasured. `PRE` at any
+/// fader, or `POST` at unity, is clean.
+pub(crate) fn usb3_fader_fault(strip: &Usb3Strip) -> Option<String> {
+    (!strip.pre && (strip.fader - 1.0).abs() > 0.01).then(|| {
+        format!(
+            "USB 3 is on POST with its fader at {:.0} % — the dry instrument send would be \
+             fader-scaled; on the unit set USB 3 to PRE (or its fader to unity), then \
+             calibrate again",
+            strip.fader * 100.0
+        )
+    })
+}
+
+#[cfg(test)]
+mod usb3_strip_tests {
+    use super::{usb3_fader_fault, usb3_muted_hint};
+    use crate::backup_read::{usb3_strip, Usb3Strip};
+
+    // The bug's third report (fw 1.8.58, 2026-08-21): the take read
+    // `[USB-Out 1/2 -14 dBFS · 3 silent · 4 silent]` and the unit's own settings
+    // snapshot held this strip — verbatim from its `support/device-settings.json`.
+    const UNIT_1_8_58: &str = r#"{"mixerSaveData":{"usb3":{"faderLevel":1.0,"linkToMasterLvl":false,"muteActive":true,"preEnabled":true,"soloActive":false},"usb4":{"faderLevel":1.0,"linkToMasterLvl":false,"muteActive":true,"preEnabled":true,"soloActive":false}}}"#;
+
+    #[test]
+    fn the_reporting_units_snapshot_decodes_to_a_muted_strip() {
+        let s = usb3_strip(UNIT_1_8_58).expect("strip present");
+        assert_eq!(
+            s,
+            Usb3Strip {
+                mute: true,
+                fader: 1.0,
+                pre: true
+            }
+        );
+        let hint = usb3_muted_hint(&s).expect("muted hint");
+        assert!(hint.contains("MUTED") && hint.contains("Mixer"), "{hint}");
+        assert!(usb3_fader_fault(&s).is_none(), "PRE at unity is gain-clean");
+    }
+
+    #[test]
+    fn post_with_an_off_unity_fader_is_refused_pre_is_not() {
+        let post = Usb3Strip {
+            mute: false,
+            fader: 0.5,
+            pre: false,
+        };
+        let f = usb3_fader_fault(&post).expect("fader fault");
+        assert!(f.contains("POST") && f.contains("50 %"), "{f}");
+        let pre = Usb3Strip { pre: true, ..post };
+        assert!(usb3_fader_fault(&pre).is_none(), "PRE is fader-independent");
+        let post_unity = Usb3Strip { fader: 1.0, ..post };
+        assert!(usb3_fader_fault(&post_unity).is_none());
+        assert!(usb3_muted_hint(&post).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_without_the_strip_is_none_not_a_false_fault() {
+        assert!(usb3_strip(r#"{"mixerSaveData":{"usb12":{}}}"#).is_none());
+        assert!(usb3_strip("not json").is_none());
+    }
+}
+
+#[cfg(test)]
+mod dry_diagnosis_tests {
+    use super::silent_dry_diagnosis;
+
+    // The "calibration can't see the guitar" bug class, second report (fw 1.8.58):
+    // the take read silent on USB-Out 3 and the old error only said "play louder".
+    // The diagnosis must name the lane that DID carry signal.
+
+    #[test]
+    fn signal_on_the_mic_line_lane_points_at_the_wrong_jack() {
+        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3]);
+        assert!(d.contains("MIC/LINE"), "{d}");
+        assert!(d.contains("4 -10 dBFS"), "{d}");
+    }
+
+    #[test]
+    fn processed_only_points_at_the_usb_dry_send() {
+        let d = silent_dry_diagnosis(&[0.5, 0.4, 0.0, 0.0]);
+        assert!(d.contains("USB 3") && d.contains("MUTED"), "{d}");
+        assert!(d.contains("1/2 -6 dBFS"), "{d}");
+        assert!(d.contains("3 silent"), "{d}");
+    }
+
+    #[test]
+    fn all_silent_names_the_muted_input() {
+        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.0]);
+        assert!(
+            d.contains("re-amp") && d.contains("muted in the device mixer"),
+            "{d}"
+        );
+        assert!(d.contains("1/2 silent"), "{d}");
+    }
+
+    #[test]
+    fn a_short_capture_is_read_as_silent_lanes_not_a_panic() {
+        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0]);
+        assert!(d.contains("4 silent"), "{d}");
+    }
 }
 
 /// True clipping flat-tops the waveform — a RUN of consecutive samples pinned at
