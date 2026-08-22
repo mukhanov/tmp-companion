@@ -86,7 +86,10 @@ test.describe("Level re-run — base skip-branch idempotency", () => {
       await page.getByRole("button", { name: /Level 1 preset/ }).click();
       await page.getByText(/I.ve backed up with Pro Control/i).click();
       await page.locator(`[data-pick="target:${preset.name}"]`).click();
-      await page.getByText(/Crunch/).click();
+      await page
+        .locator("[data-pick-menu]")
+        .getByText(/Crunch/)
+        .click();
       await page.getByRole("button", { name: /Level 1 sound/ }).click();
       await expect(
         page.getByRole("button", { name: /^(Done|Accept)$/ }),

@@ -66,7 +66,10 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     ];
     for (const { name, label } of targets) {
       await page.locator(`[data-pick="target:${name}"]`).click();
-      await page.getByText(new RegExp(label)).click();
+      await page
+        .locator("[data-pick-menu]")
+        .getByText(new RegExp(label))
+        .click();
     }
     // The picks must actually BIND — assert each row's trigger now reads its target
     // (guards a silent display-vs-value no-op the always-solving fake re-amp would hide).

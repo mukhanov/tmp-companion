@@ -42,6 +42,7 @@ export function PickPortalMenu({
       />
       <div
         ref={menuRef}
+        data-pick-menu=""
         style={{
           ...s.menuCard,
           position: "absolute",

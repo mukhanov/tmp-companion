@@ -34,7 +34,10 @@ export interface PickProps {
    *  the apply-to-all value (not yet overridden). */
   muted?: boolean;
   /** e2e hook: stable `data-pick` selector on the trigger (e.g. `target:E2E P400`) so a
-   *  test can open a specific row's picker without relying on portal layout. */
+   *  test can open a specific row's picker without relying on portal layout. The open
+   *  menu card carries `data-pick-menu` so option clicks can be SCOPED to it — a bare
+   *  page-wide text match collides with preset names on a real library (eight user
+   *  presets containing "Crunch" matched a `/Crunch/` target pick). */
   tid?: string;
 }
 

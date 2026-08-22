@@ -113,7 +113,7 @@ test.describe("Level — first-run defaults + physics outcomes (offline, sidecar
     await page.getByRole("button", { name: /Level 1 preset/ }).click();
     await page.getByText(/I.ve backed up with Pro Control/i).click();
     await page.locator(`[data-pick="target:${SCENARIO[1].name}"]`).click(); // pick the LOUD target
-    await page.getByText(/Lead/).click();
+    await page.locator("[data-pick-menu]").getByText(/Lead/).click();
     await page.getByRole("button", { name: /Level 1 sound/ }).click();
     await expect(page.getByRole("button", { name: "Accept" })).toBeVisible({
       timeout: 240_000,
@@ -122,7 +122,10 @@ test.describe("Level — first-run defaults + physics outcomes (offline, sidecar
 
     await page.getByRole("button", { name: /Re-level clamped/ }).click();
     await page.locator(`[data-pick="target:${SCENARIO[1].name}"]`).click(); // QUIETER target
-    await page.getByText(/Crunch/).click();
+    await page
+      .locator("[data-pick-menu]")
+      .getByText(/Crunch/)
+      .click();
     await page.getByRole("button", { name: /Level 1 sound/ }).click();
     await expect(page.getByRole("button", { name: "Done" })).toBeVisible({
       timeout: 240_000,
