@@ -249,6 +249,11 @@ export interface TradeSummary {
   cap: TradeCap | null;
   /** The sounds the raise was bought for, by identity. */
   benefiting: SoundId[];
+  /** Human-readable detail for the persist verify (batched scene runner) — e.g. WHY
+   * the re-read could not confirm the value (overlay absent / key missing / the
+   * field-8 read was truncated). Set alongside `persist_mismatch` true (the
+   * reason) or null (an "unconfirmed" note). Optional: older backends omit it. */
+  persist_note?: string | null;
 }
 
 /** Result of leveling one block-acting footswitch's engaged state
@@ -585,11 +590,30 @@ export interface GraphNode {
   cab_sim_id2?: string;
   /** Whether this CabSim runs two cabinets in parallel (`cabsim2enabled`). */
   cab_sim2_enabled?: boolean;
-  /** Allowlisted numeric params (reverb-mix + EQ-10 band gains) harvested from
-   *  `dspUnitParameters` — Doctor's value-aware prescriptions read these.
-   *  Always present server-side (empty map when none). */
+  /** Allowlisted numeric params harvested from `dspUnitParameters` — the
+   *  reverb mix, cab hpf/lpf, graphic-EQ `gain*hz` band gains, and the tone
+   *  controls the Doctor's balance plan drives (amp/pedal bass/mid/treble/
+   *  presence/tone/cut + the parametric's `filterN{frequency,gaindb,q,type}`).
+   *  Doctor's value-aware prescriptions read these. Always present server-side
+   *  (empty map when none). */
   params: Record<string, number>;
 }
+
+/** One node's SPARSE overlay in one saved scene (`session::SceneNodeOverlay`):
+ * the scene's `bypass` when it sets one (absent → the base state holds) plus
+ * its Doctor-allowlisted knob values, resolved to the base graph's `node_id`.
+ * Laid over `GraphNode[]` by the backend (`doctor::effective_nodes`) so a scene
+ * sound is diagnosed/prescribed against the blocks and values the SCENE runs. */
+export interface SceneNodeOverlay {
+  group_id: string;
+  node_id: string;
+  bypassed?: boolean;
+  params: Record<string, number>;
+}
+
+/** Per-preset scene overlays keyed by 0-based list index; the inner array is
+ * indexed by the 0-based `scenes[]` wire index. */
+export type SceneOverlaysByIndex = Map<number, SceneNodeOverlay[][]>;
 
 /** One ordered stage of the chain (mirrors session::Stage). A `series` run of
  * blocks, or a `split` with two parallel lanes (each a series run) joined by a
@@ -768,6 +792,10 @@ export interface BackupPresetRow {
    * params, from the same presetJson — drives the footswitch picker + preset-list
    * tags for the whole library with no extra device read. Empty otherwise. */
   footswitches: FootswitchInfo[];
+  /** Every saved scene's sparse node overlays, indexed by the 0-based `scenes[]`
+   * wire index (`session::extract_scene_overlays`) — the Doctor's per-scene
+   * chain source. Empty for a scene-less/unparseable row. */
+  scene_overlays: SceneNodeOverlay[][];
   /** JSON-visible cause of a silent leveling capture (`backup_read::silence_hint`):
    * `amp_zero` = every active amp's outputLevel saved at 0 (definite silence);
    * `exp_mute` = an exp-pedal binding zeroes an amp outputLevel at one end (silence
@@ -957,6 +985,10 @@ export interface DoctorInputArg {
    *  same backup-scan data as `nodes` — drives the backend's OFFLINE force-bypass
    *  isolation derivation (no live preset read per sound). */
   footswitches: FootswitchInfo[];
+  /** For a SCENE sound: that scene's node overlay (`BackupPresetRow.scene_overlays
+   *  [scene]`) — the backend lays it over `nodes` so prescriptions and the balance
+   *  plan target the blocks/knob values the scene runs. Empty for Base/FS sounds. */
+  sceneOverlay: SceneNodeOverlay[];
 }
 
 /** Streamed per-sound progress row (`lib::DoctorProgressItem`). Diagnoses ride
@@ -1036,6 +1068,54 @@ export interface CutThrough {
   advisory: boolean;
 }
 
+/** A finding key + the quietest playback level it's predicted to fire at
+ * (`doctor::LeveledKey`) — the balance plan's "still fires" rows. */
+export interface DoctorLeveledKey {
+  key: string;
+  fromLevel: PlaybackLevel;
+}
+
+export type PlanControlUnit = "knob" | "db";
+
+/** One knob/band move of the balance plan (`doctor_plan::PlanMove`). `from`/`to`
+ * are raw device values (0..1 for a knob, dB for an EQ band); the `*Label`
+ * pair is the player-facing rendering ("5.0" → "3.5" on the dial, "+2.0 dB"). */
+export interface DoctorPlanMove {
+  groupId: string;
+  nodeId: string;
+  model: string;
+  /** Catalog display name of the block ("'65 Twin Reverb"). */
+  blockName: string;
+  param: string;
+  /** "Bass", "Treble", "250 Hz", "Band 3 (2.6 kHz)". */
+  controlLabel: string;
+  unit: PlanControlUnit;
+  from: number;
+  to: number;
+  fromLabel: string;
+  toLabel: string;
+}
+
+/** The "rebalance with the blocks you have" plan for one diagnosed sound
+ * (`doctor_plan::TonePlan`): concrete moves on the preset's OWN tone controls,
+ * the median-centered band deviations now vs predicted, and the honest
+ * re-diagnosed outcome (`clears` / `remains`). `rx` is the one-click wrapper
+ * (every move as a `param` op) routed through PrescriptionCard's apply → A/B →
+ * save flow. `model` names the nominal response table the prediction rests on
+ * — the UI frames the plan as ESTIMATED because of it. */
+export interface DoctorTonePlan {
+  moves: DoctorPlanMove[];
+  beforeDb: number[];
+  predictedDb: number[];
+  bandLabels: string[];
+  clears: string[];
+  remains: DoctorLeveledKey[];
+  /** Predicted broadband loudness change (dB) — tone knobs move level too. */
+  loudnessDeltaDb: number;
+  rx: DoctorRx;
+  model: string;
+}
+
 export interface DoctorSoundResult {
   key: string;
   listIndex: number;
@@ -1056,6 +1136,10 @@ export interface DoctorSoundResult {
   /** Null when this sound's capture failed or the ratio was degenerate (e.g.
    *  a silent capture). */
   cutThrough: CutThrough | null;
+  /** The balance plan (see `DoctorTonePlan`); null when no tonal finding
+   *  fired, the chain has no drivable tone control, or the moves wouldn't
+   *  clear or ease anything. */
+  plan: DoctorTonePlan | null;
   /** Set when this sound's capture failed (no diags then); the run continued. */
   error: string | null;
   /** How many bands the SNR gate dropped as too quiet to trust — some checks
@@ -1113,6 +1197,52 @@ export interface DoctorCheckResult {
   stopped: boolean;
 }
 
+// ─── Doctor tune loop ────────────────────────────────────────────────────────
+
+/** The player's decision that starts the next tune round
+ * (`commands::doctor_tune::TuneDecision`). */
+export type TuneDecision = "start" | "better" | "worse";
+
+/** Where the loop stands after a step (`TuneStatus`): `candidate` = a
+ * candidate is applied (unsaved) and measured; `converged` = the baseline has
+ * no tonal finding left; `exhausted` = no further variant from this baseline. */
+export type TuneStatus = "candidate" | "converged" | "exhausted";
+
+/** What a round's proposal rested on (`doctor_tune::ProposalNote`). */
+export interface TuneProposalNote {
+  /** `[label "Block · Knob", scale]` — controls whose response the loop has
+   *  re-scaled from measurements. */
+  learned: [string, number][];
+  /** Controls excluded for this variant (player rejections). */
+  excluded: string[];
+  /** Move-cap multiplier in force. */
+  cap: number;
+}
+
+/** One tune round's result (`DoctorTuneStep`). `ops` are the CUMULATIVE ops of
+ * the candidate (what `doctorSave` must persist to keep it); `baselineOps`
+ * those of the last accepted round. */
+export interface DoctorTuneStep {
+  round: number;
+  status: TuneStatus;
+  candidate: DoctorTonePlan | null;
+  note: TuneProposalNote | null;
+  ops: DoctorOp[];
+  baselineOps: DoctorOp[];
+  baselineClip: string;
+  candidateClip: string | null;
+  measured: DoctorApplyMeasure | null;
+  baselineDiags: DoctorDiag[];
+  candidateDiags: DoctorDiag[];
+  cleared: string[];
+  remained: string[];
+  introduced: string[];
+  bandLabels: string[];
+  baselineBalanceDb: number[];
+  candidateBalanceDb: number[] | null;
+  message: string;
+}
+
 /** One prescription's apply job (`lib::DoctorApplyJob`, camelCase wire).
  * `name` is the identity guard — apply refuses if the loaded slot's name
  * doesn't match. Scene-trim ops are NOT accepted here (the frontend routes
@@ -1141,12 +1271,31 @@ export interface DoctorApplyJob {
   /** The preset's block-acting footswitches, paired with `nodes` for the
    *  same isolation derivation. */
   footswitches: FootswitchInfo[];
+  /** The diagnosed scene's node overlay (see `DoctorInputArg.sceneOverlay`) —
+   *  keeps the A/B capture on the same chain read as the check. */
+  sceneOverlay: SceneNodeOverlay[];
+}
+
+/** The measured before/after band balance of an apply's two captures
+ * (`lib::ApplyMeasure`): mean-removed band dB (the results' own `balanceDb`
+ * space) and their per-band difference, family layout. */
+export interface DoctorApplyMeasure {
+  bandLabels: string[];
+  beforeBalanceDb: number[];
+  afterBalanceDb: number[];
+  /** `after − before` per band (dB) — what the fix measurably moved. */
+  deltaDb: number[];
+  /** Integrated loudness change (dB), after − before. */
+  loudnessDeltaDb: number;
 }
 
 /** Result of a live (unsaved) prescription apply: before/after audition clips
  * as `data:audio/wav;base64,…` URLs, rendered in the same command so the A/B
- * compares the stored state against the applied-but-unsaved edit buffer. */
+ * compares the stored state against the applied-but-unsaved edit buffer —
+ * plus the MEASURED per-band change between the two captures (null when a
+ * capture's band analysis failed; the clips still play). */
 export interface DoctorApplyResult {
   beforeClip: string;
   afterClip: string;
+  measured: DoctorApplyMeasure | null;
 }

@@ -15,10 +15,13 @@ import { onBackupProgress } from "../../lib/liveEvents";
 import type {
   ActiveGraph,
   AmpCandidate,
+  DoctorOp,
   FootswitchInfo,
   SceneHandleCandidate,
   SceneHandleRow,
+  GraphNode,
   SceneInfo,
+  SceneOverlaysByIndex,
   SilenceHint,
   SongRecord,
   SetlistRecord,
@@ -62,6 +65,9 @@ export interface LibraryScan {
   /** Per-preset routed signal graph keyed by 0-based LIST INDEX — read from the same
    *  backup. Drives the Copy feature's per-preset signal-path render. */
   graphByIndex: Map<number, ActiveGraph>;
+  /** Per-preset saved-scene node overlays keyed by 0-based LIST INDEX (inner array
+   *  by 0-based scene wire index) — the Doctor's per-scene chain source. */
+  sceneOverlaysByIndex: SceneOverlaysByIndex;
   /** Per-preset silence hint keyed by 0-based LIST INDEX — only flagged presets get an
    *  entry. Refines the Level flow's offbranch ("not on USB 1/2") row status. */
   silenceHintByIndex: Map<number, SilenceHint>;
@@ -105,6 +111,7 @@ const emptyScan = (): LibraryScan => ({
   allFootswitchesByIndex: new Map(),
   blocksByIndex: new Map(),
   graphByIndex: new Map(),
+  sceneOverlaysByIndex: new Map(),
   silenceHintByIndex: new Map(),
   sceneHandlesByIndex: new Map(),
   baseHandlesByIndex: new Map(),
@@ -143,6 +150,69 @@ export function getLibraryScan(): LibraryScan {
   return state;
 }
 
+/** Fold a SAVED Doctor prescription into the cached scan, so the next Doctor run
+ *  (and the balance plan's "from" values) see the preset as the device now holds
+ *  it without a ~22 s re-scan: `param` ops patch the base graph's node params
+ *  (`scene == null`) or the scene's overlay entry (`scene` set — creating the
+ *  entry when the node had none, as the device's Scene Edit enable just did);
+ *  `insert_node` ops append a minimal node to the base graph (`stages`, the
+ *  strip's render source, are left to the next scan). No-op for an unknown
+ *  preset. Exported for the unit test; called by PrescriptionCard on save. */
+export function patchLibraryAfterDoctorSave(
+  listIndex: number,
+  scene: number | null,
+  ops: DoctorOp[],
+): void {
+  const graph = state.graphByIndex.get(listIndex);
+  if (!graph) return;
+  if (scene == null) {
+    const nodes: GraphNode[] = graph.nodes.map((n) => ({
+      ...n,
+      params: { ...n.params },
+    }));
+    for (const op of ops) {
+      if (op.kind === "param") {
+        const n = nodes.find(
+          (x) => x.group_id === op.groupId && x.node_id === op.nodeId,
+        );
+        if (n) n.params[op.param] = op.value;
+      } else {
+        nodes.push({
+          group_id: op.groupId,
+          node_id: op.fenderId,
+          model: op.fenderId,
+          bypassed: false,
+          params: Object.fromEntries(op.params),
+        });
+      }
+    }
+    const graphs = new Map(state.graphByIndex);
+    graphs.set(listIndex, { ...graph, nodes });
+    set({ graphByIndex: graphs });
+    return;
+  }
+  const perScene = (state.sceneOverlaysByIndex.get(listIndex) ?? []).map((sc) =>
+    sc.map((e) => ({ ...e, params: { ...e.params } })),
+  );
+  while (perScene.length <= scene) perScene.push([]);
+  const entries = perScene[scene] ?? [];
+  for (const op of ops) {
+    if (op.kind !== "param") continue;
+    let e = entries.find(
+      (x) => x.group_id === op.groupId && x.node_id === op.nodeId,
+    );
+    if (!e) {
+      e = { group_id: op.groupId, node_id: op.nodeId, params: {} };
+      entries.push(e);
+    }
+    e.params[op.param] = op.value;
+  }
+  perScene[scene] = entries;
+  const overlays = new Map(state.sceneOverlaysByIndex);
+  overlays.set(listIndex, perScene);
+  set({ sceneOverlaysByIndex: overlays });
+}
+
 /** Start the one-shot backup scene read. Idempotent: a call while a scan is in
  *  flight, or after one has completed for this connection, is a no-op (so a tab
  *  switch back to Presets never re-scans). */
@@ -170,6 +240,7 @@ export async function ensureLibraryScan(): Promise<void> {
     const allFsw = new Map<number, FootswitchInfo[]>();
     const blocks = new Map<number, string[]>();
     const graphs = new Map<number, ActiveGraph>();
+    const overlays: SceneOverlaysByIndex = new Map();
     const silence = new Map<number, SilenceHint>();
     const sceneHandles = new Map<number, SceneHandleRow[]>();
     const baseHandles = new Map<number, SceneHandleCandidate[]>();
@@ -190,6 +261,8 @@ export async function ensureLibraryScan(): Promise<void> {
         p.blocks.map((b) => b.fender_id),
       );
       graphs.set(p.slot - 1, p.graph);
+      if (p.scene_overlays.length > 0)
+        overlays.set(p.slot - 1, p.scene_overlays);
       if (p.silence_hint != null) silence.set(p.slot - 1, p.silence_hint);
       sceneHandles.set(p.slot - 1, p.scene_handles);
       baseHandles.set(p.slot - 1, p.base_handles);
@@ -221,6 +294,7 @@ export async function ensureLibraryScan(): Promise<void> {
       allFootswitchesByIndex: allFsw,
       blocksByIndex: blocks,
       graphByIndex: graphs,
+      sceneOverlaysByIndex: overlays,
       silenceHintByIndex: silence,
       sceneHandlesByIndex: sceneHandles,
       baseHandlesByIndex: baseHandles,

@@ -10,6 +10,7 @@ import { useTheme } from "../../theme/ThemeContext";
 import { Icon } from "../../ui/Icon";
 import { SlotLabel } from "../../ui/SlotLabel";
 import { SevDot, SoundRow } from "./SoundRow";
+import { sceneOverlayFor } from "./useDoctorFlow";
 import type { DoctorStimulus } from "./PrescriptionCard";
 import { SceneConsistency } from "./SceneConsistency";
 import { LevelingDamageRow } from "./LevelingDamageRow";
@@ -26,6 +27,7 @@ import type {
   DoctorSoundResult,
   FootswitchInfo,
   SilenceHint,
+  SceneOverlaysByIndex,
 } from "../../lib/types";
 
 export interface PresetResultCardProps {
@@ -36,6 +38,9 @@ export interface PresetResultCardProps {
    *  backup scan as `footswitchInfo` — threaded into every prescription card
    *  so its A/B captures under the diagnosed sound's own context. */
   graphByIndex: Map<number, ActiveGraph>;
+  /** 0-based list index → saved-scene node overlays (per scene wire index) —
+   *  a scene sound's cards hand ITS overlay to the A/B. */
+  sceneOverlaysByIndex: SceneOverlaysByIndex;
   /** Sound key → the stimulus identity it was diagnosed with — threaded into
    *  every prescription card so its A/B replays the diagnosis stimulus. */
   stimulusByKey: Map<string, DoctorStimulus>;
@@ -70,6 +75,7 @@ export function PresetResultCard({
   presetName,
   footswitchInfo,
   graphByIndex,
+  sceneOverlaysByIndex,
   stimulusByKey,
   silenceHintByIndex,
   expanded,
@@ -113,6 +119,11 @@ export function PresetResultCard({
         ownNodeIds={ownNodeIdsFor(sound, presetFootswitches)}
         nodes={presetNodes}
         footswitches={presetFootswitches ?? []}
+        sceneOverlay={sceneOverlayFor(
+          sceneOverlaysByIndex,
+          preset.listIndex,
+          sound.scene,
+        )}
         stimulus={stimulusByKey.get(sound.key)}
         silenceHint={silenceHintByIndex.get(preset.listIndex)}
         open={expanded.has(id)}

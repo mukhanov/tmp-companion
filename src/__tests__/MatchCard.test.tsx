@@ -38,6 +38,7 @@ function sound(balanceDb: number[]): DoctorSoundResult {
     balanceDb,
     bandLabels: LABELS,
     cutThrough: null,
+    plan: null,
     error: null,
     skippedBandCount: 0,
   };
@@ -76,6 +77,7 @@ beforeEach(() => {
   vi.mocked(doctorApply).mockResolvedValue({
     beforeClip: "data:audio/wav;base64,AAAA",
     afterClip: "data:audio/wav;base64,BBBB",
+    measured: null,
   });
 });
 

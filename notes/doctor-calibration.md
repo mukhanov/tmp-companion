@@ -225,3 +225,35 @@ boxy pass + a stacked 2×12 dB Q14 flagrant-ring probe. Findings:
 stacked 2×12 dB Q8 @ 420 Hz → boxy; wah → thin only). Factory silence holds by
 construction (no in-range factory peak reaches either floor at any q). The probed
 preset's stored bytes were sha-verified untouched across all ~20 injection runs.
+
+## 2026-08-22 — balance plan: the NOMINAL tone-control response model (PROVISIONAL)
+
+The balance plan (`src-tauri/src/doctor_plan.rs`, `notes/doctor.md` § "Balance plan")
+solves knob moves against a per-control band response. Status: **every amp/pedal
+shape is NOMINAL** (`nominal-tonestack-v1`) — no hardware sweep has been run yet.
+
+**What the table asserts** (dB per full 0→1 travel, then integrated over the 6/7
+analysis bands): Bass = 18 dB low shelf (`fc` 300 Hz, k 1.5); Mid = 12 dB peak at
+600 Hz (3 oct) + 3 dB flat lift; Treble = 18 dB high shelf (2 kHz, k 1.5);
+Presence = 10 dB high shelf (3.5 kHz, k 2); single amp Tone = 14 dB high shelf
+(1.2 kHz) − 2 dB low shelf; Vox Cut = −12 dB high shelf (3 kHz); pedal
+Tone/Treble/Bass/Mid/Presence = the same families at 12/12/12/12/8 dB, all ×0.6
+(pre-clipping damping). Graphic bands = 1-octave Lorentzian per dB; parametric
+peaks = `Q → bandwidth` Lorentzian per dB.
+
+**Why it is safe to ship nominal**: the solver caps every move (±3.5 dial steps /
+±6 dB), weights "never introduce a finding" 3× over "clear one", the prediction is
+re-diagnosed with the real rules and labelled Estimated, and the apply path returns
+the MEASURED before/after band change next to the A/B — a 2× model error shows up
+as numbers on the card, not as a silent mis-voicing. Nothing is saved without the
+ack-gated Save.
+
+**The calibration arm**: `probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq]
+[--out r.json]`. Per control it captures at `saved ± delta` (one side at an edge),
+reloading the stored preset between steps so each capture isolates ONE knob, and
+reports `measured` (finite-difference dB per unit) vs `nominal` with the per-band
+ratio. Recipe for re-deriving the table: sweep one preset per amp family (Fender
+blackface, tweed, Marshall, Vox, hi-gain, bass) on a CLEAN chain first (shapes),
+then the same amp behind a drive (damping factor), and replace `nominal_shapes`
+with per-family rows keyed by `is_amp_model_id` lineage; bump the `NOMINAL` tag.
+Until then every plan row reads "Estimated".

@@ -19,6 +19,8 @@ import type {
   Store,
   ActiveGraph,
   FootswitchInfo,
+  SceneNodeOverlay,
+  SceneOverlaysByIndex,
 } from "../../lib/types";
 
 /** The Doctor wizard's 3-step rail, shared by the full-page Set up (current 0)
@@ -68,6 +70,22 @@ export interface UseDoctorFlowDeps {
    *  by 0-based list index — the source of each sound's `footswitches` (drives
    *  the backend's OFFLINE force-bypass isolation derivation, no device read). */
   footswitchesByIndex: Map<number, FootswitchInfo[]>;
+  /** Per-preset saved-scene node overlays (0-based list index → per-scene
+   *  wire-index array) from the same backup — a scene sound's `sceneOverlay`. */
+  sceneOverlaysByIndex: SceneOverlaysByIndex;
+}
+
+/** The saved-scene overlay for one sound: the preset's `scene`-indexed entry, or
+ *  empty for a base/footswitch sound (`scene == null`) or an unknown preset. */
+export function sceneOverlayFor(
+  overlays: SceneOverlaysByIndex,
+  listIndex: number,
+  scene: number | null,
+): SceneNodeOverlay[] {
+  if (scene == null) return [];
+  const perScene = overlays.get(listIndex);
+  if (perScene == null || scene >= perScene.length) return [];
+  return perScene[scene] ?? [];
 }
 
 function countTerminal(
@@ -84,6 +102,7 @@ export function useDoctorFlow({
   store,
   graphByIndex,
   footswitchesByIndex,
+  sceneOverlaysByIndex,
 }: UseDoctorFlowDeps) {
   const [run, setRun] = useState<DoctorRunState>(EMPTY_RUN);
   const [result, setResult] = useState<DoctorCheckResult | null>(null);
@@ -128,9 +147,16 @@ export function useDoctorFlow({
           profileId: profile?.id ?? null,
           nodes: graphByIndex.get(o.slot)?.nodes ?? [],
           footswitches: footswitchesByIndex.get(o.slot) ?? [],
+          // A scene sound carries ITS scene's overlay so the backend diagnoses
+          // and prescribes against the chain that scene runs; base/FS → none.
+          sceneOverlay: sceneOverlayFor(
+            sceneOverlaysByIndex,
+            o.slot,
+            o.sceneSlot,
+          ),
         };
       }),
-    [store, graphByIndex, footswitchesByIndex],
+    [store, graphByIndex, footswitchesByIndex, sceneOverlaysByIndex],
   );
 
   // Unmounting mid-run (a tab switch) would orphan the backend check — fire the

@@ -49,6 +49,12 @@ pub struct BackupPresetRow {
     /// params, parsed from the same `presetJson` — drives the footswitch picker +
     /// preset-list tags for the WHOLE library with no extra device read. Empty otherwise.
     pub footswitches: Vec<footswitch::FootswitchInfo>,
+    /// Every saved scene's sparse node overlays (bypass + Doctor-allowlisted
+    /// knob values), indexed by the 0-based `scenes[]` wire index
+    /// ([`session::extract_scene_overlays`]) — so the Doctor diagnoses and
+    /// prescribes a SCENE sound against the blocks/knobs that scene actually
+    /// runs, with no live read. Empty for a scene-less/unparseable row.
+    pub scene_overlays: Vec<Vec<session::SceneNodeOverlay>>,
     /// JSON-visible cause of a silent leveling capture ([`silence_hint`]), refining the
     /// generic "not on USB 1/2" verdict in the Level flow. `None` = no static cause.
     pub silence_hint: Option<&'static str>,
@@ -601,6 +607,10 @@ pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
             blocks,
             graph,
             footswitches,
+            scene_overlays: parsed_graph
+                .as_ref()
+                .map(session::extract_scene_overlays)
+                .unwrap_or_default(),
             silence_hint: parsed_graph.as_ref().and_then(silence_hint),
             scene_handles,
             base_handles,

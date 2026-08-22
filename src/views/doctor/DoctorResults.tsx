@@ -36,6 +36,7 @@ import type {
   DoctorSoundResult,
   FootswitchInfo,
   SilenceHint,
+  SceneOverlaysByIndex,
 } from "../../lib/types";
 
 type Filter = "look" | "all";
@@ -57,6 +58,10 @@ export interface DoctorResultsProps {
    *  backup scan as `footswitchInfo` — threaded into every prescription card
    *  so its A/B captures under the diagnosed sound's own context. */
   graphByIndex: Map<number, ActiveGraph>;
+  /** 0-based list index → the preset's saved-scene node overlays (per scene
+   *  wire index), from the same backup — a scene sound's cards hand ITS overlay
+   *  to the A/B so it captures on the chain the check diagnosed. */
+  sceneOverlaysByIndex: SceneOverlaysByIndex;
   /** Sound key → the stimulus identity it was diagnosed with (the setup-stage
    *  instrument pick) — the prescription cards' A/B replays it. */
   stimulusByKey: Map<string, DoctorStimulus>;
@@ -72,6 +77,7 @@ export function DoctorResults({
   presetNames,
   footswitchInfo,
   graphByIndex,
+  sceneOverlaysByIndex,
   stimulusByKey,
   silenceHintByIndex,
   onCheckMore,
@@ -353,6 +359,7 @@ export function DoctorResults({
               }
               footswitchInfo={footswitchInfo}
               graphByIndex={graphByIndex}
+              sceneOverlaysByIndex={sceneOverlaysByIndex}
               stimulusByKey={stimulusByKey}
               silenceHintByIndex={silenceHintByIndex}
               expanded={expanded}

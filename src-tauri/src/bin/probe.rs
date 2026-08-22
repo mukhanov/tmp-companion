@@ -85,6 +85,11 @@
 //!                                  (on-off isolation + the switch's param-func valueA writes),
 //!                                  printing the diagnosis verdicts — the FS twin of the defect
 //!                                  sweep. Read-only; ends re-amp OFF.
+//!   probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out <report.json>]
+//!                                  Balance-plan calibration: nudge each amp/pedal tone knob of
+//!                                  the preset ±delta (one at a time), capture, and print the
+//!                                  MEASURED per-band dB/unit next to the nominal tone-stack
+//!                                  model's prediction. Never saves; loads the slot; ends re-amp OFF.
 //!   probe --doctor-window-ab <slots_csv> --stim <wav> [--family <guitar|bass|bass-vi>] [--out <report.json>]
 //!                                  CAPTURE-WINDOW A/B evidence arm: per slot, captures the
 //!                                  oracle (full 6s stim + the pinned 2.5s oracle tail —
@@ -588,6 +593,42 @@ fn main() {
             std::process::exit(2);
         }
         match tmp_companion_lib::probe_doctor_fs(slot, switch) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--doctor-knob-sweep") {
+        // --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out <report.json>]
+        let slot: u32 = match args.get(i + 1).and_then(|s| s.parse().ok()) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "usage: probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out <report.json>]"
+                );
+                std::process::exit(2);
+            }
+        };
+        let delta: f64 = match flag_arg(&args, "--delta") {
+            Some(v) => match v.parse::<f64>() {
+                Ok(d) if d.is_finite() => d,
+                _ => {
+                    eprintln!("[probe] --delta must be a finite number (knob fraction, e.g. 0.25)");
+                    std::process::exit(2);
+                }
+            },
+            None => 0.25,
+        };
+        let include_eq = args.iter().any(|a| a == "--eq");
+        let out = flag_arg(&args, "--out");
+        eprintln!("[probe] doctor-knob-sweep: slot {slot}…");
+        match tmp_companion_lib::probe_doctor_knob_sweep(slot, delta, include_eq, out.as_deref()) {
             Ok(report) => {
                 print!("{report}");
                 return;

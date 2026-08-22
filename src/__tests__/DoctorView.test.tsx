@@ -131,6 +131,7 @@ function mockOnePreset(
                 ...(opts.footswitch === true ? [SOLO_FOOTSWITCH] : []),
                 ...(opts.bareFootswitch === true ? [BARE_FOOTSWITCH] : []),
               ],
+              scene_overlays: [],
             },
           ],
           song_presets: [],

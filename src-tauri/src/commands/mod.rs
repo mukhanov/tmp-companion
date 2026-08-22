@@ -14,6 +14,8 @@ pub(crate) mod device;
 #[macro_use]
 pub(crate) mod doctor;
 #[macro_use]
+pub(crate) mod doctor_tune;
+#[macro_use]
 pub(crate) mod edit_tools;
 #[macro_use]
 pub(crate) mod held_edit;

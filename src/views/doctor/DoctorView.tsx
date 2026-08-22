@@ -53,6 +53,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
     allFootswitchInfo,
     silenceHintByIndex,
     graphByIndex,
+    sceneOverlaysByIndex,
     scan,
     togglePreset,
     toggleKey,
@@ -75,6 +76,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
     // the SELECT list below, where a non-levelable FS row has nothing to diagnose as
     // its own sound).
     footswitchesByIndex: allFootswitchInfo,
+    sceneOverlaysByIndex,
   });
 
   // The run recalls presets on the unit — remember the player's live slot so
@@ -186,6 +188,7 @@ export function DoctorView({ connected, onScan }: DoctorViewProps) {
         presetNames={presetNames}
         footswitchInfo={footswitchInfo}
         graphByIndex={graphByIndex}
+        sceneOverlaysByIndex={sceneOverlaysByIndex}
         stimulusByKey={stimulusByKey}
         silenceHintByIndex={silenceHintByIndex}
         onCheckMore={handleCheckMore}

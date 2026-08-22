@@ -36,6 +36,9 @@ import type {
   SceneHandleRow,
   FsSceneContext,
   BackupReadResult,
+  SceneNodeOverlay,
+  DoctorTuneStep,
+  TuneDecision,
   CopyJob,
   CopyApplyItem,
   DoctorInputArg,
@@ -366,13 +369,35 @@ export const doctorSave = (
   expectName: string,
   scene: number | null,
   ops: DoctorOp[],
+  /** The diagnosed scene's node overlay (`DoctorApplyJob.sceneOverlay`) — the
+   *  backend's scene writes are overlay-aware (enable + replay on a sparse entry);
+   *  empty for base sounds. */
+  sceneOverlay: SceneNodeOverlay[] = [],
 ): Promise<void> =>
-  invoke("doctor_save", { listIndex, expectName, scene, ops });
+  invoke("doctor_save", { listIndex, expectName, scene, ops, sceneOverlay });
 
 /** Discard an applied-but-unsaved prescription by reloading the stored preset
  * (the device's edit buffer is dropped on load — the established revert). */
 export const doctorDiscard = (listIndex: number): Promise<void> =>
   invoke("doctor_discard", { listIndex });
+
+/** One round of the Doctor tune loop (`doctor_tune_step`): `start` captures the
+ * saved sound as the baseline and runs round 1; `better`/`worse` judge the last
+ * candidate and run the next round. `ctx` is the sound's apply context (its
+ * `ops` are ignored — the loop owns the ops). Leaves the candidate applied but
+ * UNSAVED; persist with `doctorSave(step.ops)`, end with `doctorTuneEnd`. */
+export const doctorTuneStep = (
+  ctx: DoctorApplyJob,
+  decision: TuneDecision,
+): Promise<DoctorTuneStep> =>
+  invoke("doctor_tune_step", { job: { ctx, decision } });
+
+/** End the tune loop: clear its session; `discard` reloads the stored preset
+ * (drops the unsaved candidate). After a `doctorSave` end WITHOUT discard. */
+export const doctorTuneEnd = (
+  listIndex: number,
+  discard: boolean,
+): Promise<void> => invoke("doctor_tune_end", { listIndex, discard });
 
 // ─── Instrument profiles + persisted store (Settings window) ──────────────────
 
@@ -607,4 +632,6 @@ export const cmd = {
   doctorApply,
   doctorSave,
   doctorDiscard,
+  doctorTuneStep,
+  doctorTuneEnd,
 } as const;

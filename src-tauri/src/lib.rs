@@ -31,6 +31,8 @@ mod device_gate;
 #[cfg(target_os = "macos")]
 mod dock;
 mod doctor;
+mod doctor_plan;
+mod doctor_tune;
 #[cfg(feature = "e2e")]
 mod e2e_server;
 mod footswitch;
@@ -124,6 +126,7 @@ pub use session::{ActiveGraph, GraphNode, Stage};
 // The truncation-aware saved-preset read seam — re-exported at the crate root so the
 // ~20 probe_api call sites and the leveling commands keep addressing it as `crate::read_slot_preset_*`.
 pub(crate) use slot_read::*;
+pub use session::{ActiveGraph, GraphNode, SceneNodeOverlay, Stage};
 
 #[macro_use]
 mod commands;
@@ -137,8 +140,9 @@ pub use bootstrap::run;
 // as dead code); the remaining modules expose only `pub(crate)` items.
 pub use commands::{bulk_replace::*, copy_apply::*, level_scenes::*};
 pub(crate) use commands::{
-    device::*, doctor::*, edit_tools::*, held_edit::*, level_footswitch::*, level_preset::*,
-    library::*, media::*, migration::*, presets::*, setlists::*, settings::*, songs::*, support::*,
+    device::*, doctor::*, doctor_tune::*, edit_tools::*, held_edit::*, level_footswitch::*,
+    level_preset::*, library::*, media::*, migration::*, presets::*, setlists::*, settings::*,
+    songs::*, support::*,
 };
 
 /// Lock a state mutex, recovering the guard if a previous holder panicked and poisoned it

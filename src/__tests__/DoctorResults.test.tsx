@@ -70,6 +70,7 @@ function fixture(): DoctorCheckResult {
               "Air",
             ],
             cutThrough: null,
+            plan: null,
             error: null,
             skippedBandCount: 0,
           },
@@ -136,6 +137,7 @@ function fixture(): DoctorCheckResult {
               "Air",
             ],
             cutThrough: null,
+            plan: null,
             error: null,
             skippedBandCount: 0,
           },
@@ -187,6 +189,7 @@ function fixture(): DoctorCheckResult {
               "Air",
             ],
             cutThrough: null,
+            plan: null,
             error: null,
             skippedBandCount: 0,
           },
@@ -234,6 +237,7 @@ function fixture(): DoctorCheckResult {
               "Air",
             ],
             cutThrough: null,
+            plan: null,
             error: "The capture came back silent — check the cable.",
             skippedBandCount: 0,
           },
@@ -258,6 +262,7 @@ function renderResults(
         presetNames={NAMES}
         footswitchInfo={new Map()}
         graphByIndex={new Map()}
+        sceneOverlaysByIndex={new Map()}
         stimulusByKey={new Map()}
         silenceHintByIndex={silenceHintByIndex}
         onCheckMore={onCheckMore}
@@ -273,6 +278,7 @@ function resetMocks() {
   vi.mocked(doctorApply).mockResolvedValue({
     beforeClip: "data:audio/wav;base64,AAAA",
     afterClip: "data:audio/wav;base64,BBBB",
+    measured: null,
   });
   vi.mocked(doctorSave).mockResolvedValue(undefined);
   vi.mocked(doctorDiscard).mockResolvedValue(undefined);
@@ -325,6 +331,7 @@ describe("DoctorResults — summary + cards", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },
@@ -378,6 +385,7 @@ describe("DoctorResults — summary + cards", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },
@@ -566,6 +574,7 @@ describe("DoctorResults — healthy collapse", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },
@@ -589,6 +598,7 @@ describe("DoctorResults — healthy collapse", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },
@@ -817,9 +827,13 @@ describe("DoctorResults — prescription lifecycle", () => {
     expect(await screen.findByText("Saved to the preset.")).toBeInTheDocument();
     // The save re-applies the SAME ops the card applied (the structural-safety
     // redesign: doctor_save never persists the live edit buffer).
-    expect(doctorSave).toHaveBeenCalledWith(1, "Muddy Rhythm", null, [
-      { kind: "param", groupId: "g", nodeId: "n", param: "hpf", value: 90 },
-    ]);
+    expect(doctorSave).toHaveBeenCalledWith(
+      1,
+      "Muddy Rhythm",
+      null,
+      [{ kind: "param", groupId: "g", nodeId: "n", param: "hpf", value: 90 }],
+      [],
+    );
   });
 
   it("applies a SCENE sound's fix under its own scene, not the base", async () => {
@@ -848,9 +862,21 @@ describe("DoctorResults — prescription lifecycle", () => {
     await user.click(screen.getByText("I've backed up with Pro Control"));
     await user.click(screen.getByRole("button", { name: /save to preset/i }));
     expect(await screen.findByText("Saved to the preset.")).toBeInTheDocument();
-    expect(doctorSave).toHaveBeenCalledWith(1, "Muddy Rhythm", 0, [
-      { kind: "param", groupId: "g", nodeId: "verb", param: "mix", value: 25 },
-    ]);
+    expect(doctorSave).toHaveBeenCalledWith(
+      1,
+      "Muddy Rhythm",
+      0,
+      [
+        {
+          kind: "param",
+          groupId: "g",
+          nodeId: "verb",
+          param: "mix",
+          value: 25,
+        },
+      ],
+      [],
+    );
   });
 
   it("discards an applied prescription back to draft", async () => {
@@ -900,6 +926,7 @@ describe("DoctorResults — prescription lifecycle", () => {
     resolveApply({
       beforeClip: "data:audio/wav;base64,AAAA",
       afterClip: "data:audio/wav;base64,BBBB",
+      measured: null,
     });
     expect(await screen.findByText("Listen & compare")).toBeInTheDocument();
     expect(
@@ -1003,6 +1030,7 @@ describe("DoctorResults — prescription lifecycle", () => {
     resolveApply({
       beforeClip: "data:audio/wav;base64,AAAA",
       afterClip: "data:audio/wav;base64,BBBB",
+      measured: null,
     });
     await waitFor(() => {
       expect(doctorApply).toHaveBeenCalledTimes(1);
@@ -1075,6 +1103,7 @@ describe("DoctorResults — shared-block caption", () => {
       balanceDb: [-6, 4, -2, -8, -12, -18],
       bandLabels: ["Lows", "Low-mids", "Mids", "High-mids", "Highs", "Air"],
       cutThrough: null,
+      plan: null,
       error: null,
       skippedBandCount: 0,
     };
@@ -1134,6 +1163,7 @@ describe("DoctorResults — shared-block caption", () => {
           presetNames={new Map([[0, "Overdrive Rhythm"]])}
           footswitchInfo={fsInfo}
           graphByIndex={new Map()}
+          sceneOverlaysByIndex={new Map()}
           stimulusByKey={new Map()}
           silenceHintByIndex={new Map()}
           onCheckMore={() => undefined}
@@ -1267,6 +1297,7 @@ describe("DoctorResults — spiky (time-domain chain rx)", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },
@@ -1354,6 +1385,7 @@ describe("DoctorResults — severity (possible verdicts)", () => {
                 "Air",
               ],
               cutThrough: null,
+              plan: null,
               error: null,
               skippedBandCount: 0,
             },

@@ -4,7 +4,7 @@
 // the backup acknowledgment, mirroring the Leveling / Copy save-disclaimer model.
 
 import { useEffect, useId, useRef, useState } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 import { useTheme } from "../../theme/ThemeContext";
 import { doctorCard } from "./severity";
@@ -14,6 +14,7 @@ import { Spinner } from "../../ui/Spinner";
 import { Button } from "../../ui/primitives";
 import { BackupAckLabel } from "../../ui/BackupAckLabel";
 import { doctorApply, doctorDiscard, doctorSave } from "../../lib/invoke";
+import { patchLibraryAfterDoctorSave } from "../level/libraryScan";
 import { nodeTileArt } from "../../models/blockArt";
 import { isComboBid } from "../../models/catalog";
 import {
@@ -22,6 +23,7 @@ import {
   type StripGraph,
 } from "../SignalChainView";
 import { ABAudition } from "./ABAudition";
+import { MeasuredChange } from "./MeasuredChange";
 import { useApplyLock } from "./applyLock";
 import type {
   DoctorApplyResult,
@@ -31,6 +33,7 @@ import type {
   DoctorRxKind,
   FootswitchInfo,
   GraphNode,
+  SceneNodeOverlay,
 } from "../../lib/types";
 
 const KIND_ICON: Record<DoctorRxKind, IconName> = {
@@ -81,10 +84,19 @@ export interface PrescriptionCardProps {
   soundFootswitch?: number | null;
   nodes?: GraphNode[];
   footswitches?: FootswitchInfo[];
+  /** The diagnosed scene's node overlay (empty for base/FS sounds) — the A/B
+   *  captures on the same effective chain the check read. */
+  sceneOverlay?: SceneNodeOverlay[];
   /** The diagnosed sound's stimulus identity (instrument profile pick at
    *  setup) — the A/B must replay the SAME stimulus the diagnosis used.
    *  Omitted (→ default stimulus) only by scene-consistency cards. */
   stimulus?: DoctorStimulus;
+  /** Extra draft-state body rendered under the detail line (the balance
+   *  plan's knob table + prediction). Not shown once applied/saved. */
+  children?: ReactNode;
+  /** Overrides the kind badge text ("One-click fix") — the balance plan
+   *  labels its one-click "Your own knobs". */
+  badge?: string;
 }
 
 /** The stimulus identity a diagnosed sound was measured with — the run's own
@@ -110,7 +122,10 @@ export function PrescriptionCard({
   soundFootswitch = null,
   nodes = [],
   footswitches = [],
+  sceneOverlay = [],
   stimulus = DEFAULT_STIMULUS,
+  children,
+  badge,
 }: PrescriptionCardProps) {
   const { t } = useTheme();
   const [phase, setPhase] = useState<Phase>("draft");
@@ -194,6 +209,7 @@ export function PrescriptionCard({
         footswitch: soundFootswitch,
         nodes,
         footswitches,
+        sceneOverlay,
       });
       // If we unmounted while this was in flight (row collapsed, or the
       // Match reference swapped away), the unmount cleanup above already
@@ -240,7 +256,17 @@ export function PrescriptionCard({
     setBusy(true);
     setError(null);
     try {
-      await doctorSave(listIndex, presetName, appliedScene, appliedOps);
+      await doctorSave(
+        listIndex,
+        presetName,
+        appliedScene,
+        appliedOps,
+        sceneOverlay,
+      );
+      // The device now holds these values: fold them into the cached scan so a
+      // re-run of the Doctor (and the balance plan's "from" values) starts from
+      // the saved state instead of the connect-time backup.
+      patchLibraryAfterDoctorSave(listIndex, appliedScene, appliedOps);
       setPhase("saved");
       lock.release(cardId);
     } catch (e) {
@@ -327,6 +353,7 @@ export function PrescriptionCard({
             beforeClip={clips.beforeClip}
             afterClip={clips.afterClip}
           />
+          {clips.measured && <MeasuredChange measured={clips.measured} />}
         </div>
         <div
           style={{
@@ -403,7 +430,7 @@ export function PrescriptionCard({
               {rx.title}
             </span>
             <Tag tone={rx.kind === "advisory" ? "neutral" : "accent"} uppercase>
-              {KIND_BADGE[rx.kind]}
+              {badge ?? KIND_BADGE[rx.kind]}
             </Tag>
           </div>
           <div
@@ -417,6 +444,7 @@ export function PrescriptionCard({
           >
             {rx.detail}
           </div>
+          {children}
           {rx.kind !== "advisory" && (
             <div
               style={{

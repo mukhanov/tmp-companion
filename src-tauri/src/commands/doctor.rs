@@ -37,6 +37,13 @@ pub struct DoctorInput {
     /// absent (pre-scan, or a preset the scan couldn't parse).
     #[serde(default)]
     pub footswitches: Vec<footswitch::FootswitchInfo>,
+    /// For a SCENE sound: that scene's sparse node overlay from the same backup
+    /// scan (`BackupPresetRow.scene_overlays[scene]`) — laid over `nodes` by
+    /// `doctor::effective_nodes` so prescriptions, the balance plan and the
+    /// capture tail see the blocks/knob values the scene runs, not base's.
+    /// Empty for Base/footswitch sounds (and for a pre-overlay payload).
+    #[serde(default)]
+    pub scene_overlay: Vec<session::SceneNodeOverlay>,
 }
 
 /// The force-bypass isolation list for capturing one sound cleanly (mirrors the
@@ -104,7 +111,7 @@ pub(crate) struct SoundIsolation {
 /// isolation: graph present → offline derivation (`derived_force_bypass` +
 /// `derived_param_writes`); graph absent → ONE cached live field-8 read per
 /// preset (`doctor_force_bypass` + `param_fn_values`).
-fn resolve_sound_isolation(
+pub(crate) fn resolve_sound_isolation(
     nodes: &[doctor::DoctorNode],
     footswitches: &[footswitch::FootswitchInfo],
     scene: Option<u32>,
@@ -213,9 +220,74 @@ fn doctor_skip_load(prev: Option<&PrevSound>, list_index: u32, is_scene: bool) -
 /// the leveller's `leveller::floor_suspect` guard, applied to the Doctor's capture
 /// spread instead of a leveling measurement)? `Some` carries the honest error to
 /// surface; `None` means the capture looks live.
-fn floor_error_for(profile_spread_lu: f64, stimulus_spread_lu: f64) -> Option<&'static str> {
+pub(crate) fn floor_error_for(
+    profile_spread_lu: f64,
+    stimulus_spread_lu: f64,
+) -> Option<&'static str> {
     leveller::floor_suspect(profile_spread_lu, stimulus_spread_lu)
         .then_some(leveller::FLOOR_READ_ERR)
+}
+
+/// One Doctor capture → `(profile, output coverage, balance dB)`: the onset-
+/// aligned body PSD, the stimulus-anchored `SoundProfile`, and the output-side
+/// band coverage gate — the ONE analysis every Doctor path runs on a capture
+/// (`doctor_check`'s loop, the tune loop's baseline/candidate rounds), so a
+/// measurement-space change can't drift between them. `label` only names the
+/// sound in the onset warning.
+pub(crate) fn analyze_doctor_capture(
+    samples: &[f32],
+    rate: u32,
+    stereo_loudness: lufs::Loudness,
+    stim: &[f32],
+    tail_ms: u32,
+    family: doctor::Family,
+    label: &str,
+) -> Result<(doctor::SoundProfile, Vec<bool>, Vec<f64>), String> {
+    // Align the body/tail split to where the stimulus actually starts
+    // (I/O latency); the energy step is primary, falling back to the
+    // correlator and then the legacy un-aligned split — see
+    // `leveller::doctor_onset`'s doc for why the correlator alone
+    // can't be trusted here (a peakless correlation curve on a
+    // washed/reverb chain).
+    let onset = leveller::doctor_onset(stim, samples, rate);
+    if !onset.confident() {
+        log::warn!(
+            "doctor: onset not confidently found for {label} ({:?}) — un-aligned tail split",
+            onset.source
+        );
+    }
+    // ONE shared post-onset body PSD for this capture — read by both the
+    // profile's band powers/air-flatness and the output-coverage SNR
+    // gate below, instead of each computing its own (disagreeing) space.
+    let body_psd = doctor::body_psd(samples, rate, onset.signal_start);
+    // The STIMULUS's own PSD — the reference the localized
+    // resonant/boxy rules diff against (`Psd::transfer_db`), so
+    // the stimulus's spectral ridges can't read as chain
+    // resonances. Cheap (~ms) next to the ~5 s capture.
+    let stim_psd = crate::psd::welch_psd(stim, rate as f32);
+    let mut profile = doctor::SoundProfile::from_capture_with_psd_loudness(
+        samples,
+        rate,
+        onset.body_len,
+        onset.body_start,
+        tail_ms,
+        family,
+        &body_psd,
+        Some(&stim_psd),
+        Some(stereo_loudness),
+    )?;
+    // The re-amp stimulus's own band powers — the stimulus-transfer
+    // anchor `compute_rule_metrics` subtracts so a non-humbucker
+    // stimulus (single-coil, DI capture) can't skew the tilt/band
+    // verdicts. THE ONLY production write of this field.
+    profile.stim_bands = Some(stim_psd.band_powers(family.bands()));
+    // The CAPTURED OUTPUT's own band coverage (family layout) — gates on
+    // what the device actually produced, not what the input stimulus
+    // carried, so amp-created HF (fizz/harsh distortion) isn't gated out
+    // just because the DI input never had it.
+    let cov = doctor::output_coverage_with_body(samples, rate, onset.signal_start, family, &body_psd);
+    let balance = doctor::balance(&profile.bands);
+    Ok((profile, cov, balance))
 }
 
 /// How many bands a coverage vector (`doctor::output_coverage_with_body`'s
@@ -233,9 +305,13 @@ fn skipped_band_count(coverage: Option<&[bool]>) -> u32 {
 
 /// The instrument a sound is judged as — from its topology, guitar by default.
 fn instrument_of(item: &DoctorInput) -> doctor::Instrument {
-    doctor::Instrument::from_topology(
-        item.topology_id
-            .as_deref()
+    family_of_topology(item.topology_id.as_deref())
+}
+
+/// [`instrument_of`] off a bare topology id (the apply job's shape).
+pub(crate) fn family_of_topology(topology_id: Option<&str>) -> doctor::Family {
+    doctor::Family::from_topology(
+        topology_id
             .and_then(topologies::by_id)
             .map(|t| t.instrument)
             .unwrap_or("guitar"),
@@ -279,6 +355,13 @@ pub struct DoctorSoundResult {
     /// not a diagnosis: it fires no rule and carries no `Rx`. `None` when this
     /// sound's capture failed or the ratio was degenerate.
     pub cut_through: Option<doctor::CutThrough>,
+    /// The "rebalance with the blocks you have" plan
+    /// (`doctor_plan::generate_plan`): concrete knob/band moves on the
+    /// preset's OWN amp/pedal/EQ controls that the nominal response model
+    /// predicts will clear the tonal findings, re-diagnosed with the real
+    /// rules. `None` when no tonal finding fired, the chain has no drivable
+    /// tone control with a known value, or the moves wouldn't help.
+    pub plan: Option<doctor_plan::TonePlan>,
     /// Set when this sound's capture failed (no diags then); the run continues.
     pub error: Option<String>,
     /// How many of this sound's bands the SNR gate (`doctor::output_coverage_with_body`)
@@ -376,6 +459,10 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
         // Doctor skips a rule whose primary band the stimulus never excited.
         let mut coverage_by_item: std::collections::HashMap<usize, Vec<bool>> =
             std::collections::HashMap::new();
+        // Per-measured-item EFFECTIVE chain (`doctor::effective_nodes`) — the
+        // diagnosis/plan must see the same chain the capture ran.
+        let mut effective_by_item: std::collections::HashMap<usize, Vec<doctor::DoctorNode>> =
+            std::collections::HashMap::new();
         let mut errors: Vec<(usize, String)> = Vec::new();
         // One field-8 preset read per list index, reused across that preset's base
         // + footswitch sounds — the source for each sound's force-bypass isolation.
@@ -386,6 +473,8 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
         // The previous sound's outcome — drives the consecutive-scene load skip
         // (`doctor_skip_load`).
         let mut prev: Option<PrevSound> = None;
+        // The slot whose lazy-commit barrier already ran this run (`doctor_fresh_load`).
+        let mut barrier_done_for: Option<u32> = None;
         for (i, (item, path, kind)) in resolved.iter().enumerate() {
             if DOCTOR_CANCEL.load(SeqCst) {
                 stopped = true;
@@ -413,6 +502,26 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 status: "active".to_string(),
                 message: None,
             });
+            // First load of this slot in the run: wait out a pending lazy commit of an
+            // earlier save (Doctor or leveling) so the capture measures the SAVED sound.
+            if barrier_done_for != Some(item.list_index) {
+                barrier_done_for = Some(item.list_index);
+                if let Err(e) = doctor_fresh_load(item.list_index, || {
+                    let _ = on_result.send(DoctorProgressItem {
+                        key: item.key.clone(),
+                        status: "active".to_string(),
+                        message: Some(
+                            "waiting for the device to commit the previous save…".to_string(),
+                        ),
+                    });
+                }) {
+                    if e == leveller::CANCELLED {
+                        stopped = true;
+                        break;
+                    }
+                    log::warn!("doctor_check: fresh-load barrier for slot {} failed ({e}) — continuing", item.list_index);
+                }
+            }
             // A CAPTURE stimulus (real DI) is injected VERBATIM — calibration
             // scaling is None-by-definition (mirrors the leveling seam), so its
             // amplitude drives the chain as recorded. Synthetic keeps its scalar.
@@ -454,7 +563,10 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
             };
             let family = instrument_of(item);
             let skip_load = doctor_skip_load(prev.as_ref(), item.list_index, item.scene.is_some());
-            let tail_ms_u32 = doctor::doctor_tail_ms(&item.nodes);
+            // The chain THIS sound runs (scene overlay + isolation applied) —
+            // what the tail policy, the rx engine and the plan all read.
+            let effective = doctor::effective_nodes(&item.nodes, &item.scene_overlay, &iso.bypass);
+            let tail_ms_u32 = doctor::doctor_tail_ms(&effective);
             let tail_ms = u64::from(tail_ms_u32);
             // One capture + profile attempt, `skip_load` threaded through (the retry
             // below forces a fresh preset recall — a floor read means the inject
@@ -485,57 +597,16 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                     skip_load,
                     validate.as_ref(),
                 )?;
-                // Align the body/tail split to where the stimulus actually starts
-                // (I/O latency); the energy step is primary, falling back to the
-                // correlator and then the legacy un-aligned split — see
-                // `leveller::doctor_onset`'s doc for why the correlator alone
-                // can't be trusted here (a peakless correlation curve on a
-                // washed/reverb chain).
-                let onset = leveller::doctor_onset(stim, &samples, rate);
-                if !onset.confident() {
-                    log::warn!(
-                        "doctor: onset not confidently found for {} ({:?}) — un-aligned tail split",
-                        item.key,
-                        onset.source
-                    );
-                }
-                // ONE shared post-onset body PSD for this capture — read by both the
-                // profile's band powers/air-flatness and the output-coverage SNR
-                // gate below, instead of each computing its own (disagreeing) space.
-                let body_psd = doctor::body_psd(&samples, rate, onset.signal_start);
-                // The STIMULUS's own PSD — the reference the localized
-                // resonant/boxy rules diff against (`Psd::transfer_db`), so
-                // the stimulus's spectral ridges can't read as chain
-                // resonances. Cheap (~ms) next to the ~5 s capture.
-                let stim_psd = crate::psd::welch_psd(stim, rate as f32);
-                let mut profile = doctor::SoundProfile::from_capture_with_psd_loudness(
+                analyze_doctor_capture(
                     &samples,
                     rate,
-                    onset.body_len,
-                    onset.body_start,
+                    stereo_loudness,
+                    stim,
                     tail_ms_u32,
                     family,
-                    &body_psd,
-                    Some(&stim_psd),
-                    Some(stereo_loudness),
-                )?;
-                // The re-amp stimulus's own band powers — the stimulus-transfer
-                // anchor `compute_rule_metrics` subtracts so a non-humbucker
-                // stimulus (single-coil, DI capture) can't skew the tilt/band
-                // verdicts. THE ONLY production write of this field.
-                profile.stim_bands = Some(stim_psd.band_powers(family.bands()));
-                // The CAPTURED OUTPUT's own band coverage (family layout) — gates on
-                // what the device actually produced, not what the input stimulus
-                // carried, so amp-created HF (fizz/harsh distortion) isn't gated out
-                // just because the DI input never had it.
-                let cov = doctor::output_coverage_with_body(
-                    &samples,
-                    rate,
-                    onset.signal_start,
-                    family,
-                    &body_psd,
-                );
-                Ok((profile, cov))
+                    &item.key,
+                )
+                .map(|(p, cov, _)| (p, cov))
             };
             let result = stim.and_then(|(stim, stim_spread)| {
                 let stim_spread = *stim_spread;
@@ -566,6 +637,7 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 Ok((profile, cov)) => {
                     measured.push((i, profile));
                     coverage_by_item.insert(i, cov);
+                    effective_by_item.insert(i, effective);
                     prev = Some(PrevSound {
                         list_index: item.list_index,
                         wrote: !iso.bypass.is_empty() || !iso.params.is_empty(),
@@ -616,6 +688,12 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
             let instrument = instrument_of(item);
             let band_labels = instrument.labels_owned();
             let cov = coverage_by_item.get(&i);
+            let coverage = cov.map(Vec::as_slice);
+            // The showcase path skips the capture loop (no `effective` entry):
+            // its curated sounds are base-only, so the base graph stands in.
+            let nodes: &[doctor::DoctorNode] = effective_by_item
+                .get(&i)
+                .map_or(item.nodes.as_slice(), Vec::as_slice);
             let (diags, lufs_v, tail, bal) = match profile {
                 Some(p) => (
                     // Diagnosed at ALL three playback levels (each finding tagged
@@ -625,10 +703,10 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                     // by the capture; empty on the showcase's curated profiles).
                     doctor::diagnose_levels(
                         p,
-                        (!item.nodes.is_empty()).then_some(item.nodes.as_slice()),
+                        (!nodes.is_empty()).then_some(nodes),
                         instrument,
                         *kind,
-                        cov.map(Vec::as_slice),
+                        coverage,
                     ),
                     p.integrated_lufs,
                     p.tail_ratio_db,
@@ -637,6 +715,11 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 None => (Vec::new(), 0.0, 0.0, Vec::new()),
             };
             let cut_through = profile.and_then(|p| doctor::cut_through(p, instrument));
+            // The balance plan rides the SAME profile/coverage/kind the
+            // diagnosis used, so its re-diagnosed prediction is comparable.
+            let plan = profile.and_then(|p| {
+                doctor_plan::generate_plan(p, nodes, instrument, *kind, coverage, &diags)
+            });
             // SNR-gate transparency (D4): how many bands the coverage gate
             // dropped for THIS capture — absent (errored/showcase sound) reads
             // as 0, never as "gated" (see `skipped_band_count`'s doc).
@@ -654,6 +737,7 @@ pub(crate) async fn doctor_check<R: tauri::Runtime>(
                 balance_db: bal,
                 band_labels,
                 cut_through,
+                plan,
                 error: err.cloned(),
                 skipped_band_count: skipped,
             }
@@ -789,16 +873,62 @@ pub struct DoctorApplyJob {
     /// isolation derivation.
     #[serde(default)]
     pub footswitches: Vec<footswitch::FootswitchInfo>,
+    /// The diagnosed scene's node overlay (see `DoctorInput::scene_overlay`) —
+    /// keeps the A/B capture tail on the same chain read as the check.
+    #[serde(default)]
+    pub scene_overlay: Vec<session::SceneNodeOverlay>,
 }
 
 /// Result of a live (unsaved) prescription apply: the before/after audition clips
 /// as `data:audio/wav;base64,…` URLs, so the A/B compares the stored state against
-/// the applied-but-unsaved edit buffer.
+/// the applied-but-unsaved edit buffer — plus the MEASURED per-band change
+/// between the two captures (`measured`), so the player sees in numbers what
+/// the fix did, not only hears it (the balance plan's nominal prediction is
+/// checked against this).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorApplyResult {
     pub before_clip: String,
     pub after_clip: String,
+    /// `None` when either capture's band analysis failed (the clips still play).
+    pub measured: Option<ApplyMeasure>,
+}
+
+/// The measured before/after band balance of an apply's two captures
+/// (`doctor::balance` — mean-removed band dB, the Doctor results' own
+/// `balanceDb` space) and their per-band difference, family layout.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyMeasure {
+    pub band_labels: Vec<String>,
+    pub before_balance_db: Vec<f64>,
+    pub after_balance_db: Vec<f64>,
+    /// `after − before` per band (dB) — what the fix measurably moved.
+    pub delta_db: Vec<f64>,
+    /// Integrated loudness change (dB), after − before.
+    pub loudness_delta_db: f64,
+}
+
+/// The band balance + integrated loudness of one apply capture — the same
+/// onset-aligned body-PSD measurement `doctor_check` makes (`body_psd` past
+/// the stimulus pad), so the A/B numbers live in the results' own space.
+fn apply_capture_balance(
+    stim: &[f32],
+    samples: &[f32],
+    rate: u32,
+    family: doctor::Family,
+) -> Option<(Vec<f64>, f64)> {
+    let (onset, confident) = audio::estimate_onset(stim, samples, rate);
+    let signal_start = leveller::doctor_signal_start(onset, confident);
+    let psd = doctor::body_psd(samples, rate, signal_start);
+    let bands = psd.band_powers(family.bands());
+    if bands.iter().any(|b| !(b.is_finite() && *b > 0.0)) {
+        return None;
+    }
+    let lufs = crate::lufs::measure_mono(samples, rate)
+        .ok()?
+        .integrated_lufs;
+    lufs.is_finite().then(|| (doctor::balance(&bands), lufs))
 }
 
 /// Identity of a cached BEFORE clip: sound + stimulus + diagnosed context.
@@ -807,6 +937,10 @@ pub struct DoctorApplyResult {
 /// last two fields) catch a switch between sounds of the SAME preset — a
 /// scene's cached clip must never serve a different scene or the base sound.
 type BeforeKey = (u32, String, String, Option<u32>, Option<u32>, Option<u32>);
+
+/// The cached BEFORE capture: its clip + its band balance/loudness
+/// (`apply_capture_balance`, `None` when that analysis failed).
+type BeforeEntry = (String, Option<(Vec<f64>, f64)>);
 
 /// Single-entry cache of `doctor_apply`'s BEFORE clip (the stored preset captured at
 /// its own level — ~11 s to produce). The before-state is stable across consecutive
@@ -817,7 +951,8 @@ type BeforeKey = (u32, String, String, Option<u32>, Option<u32>, Option<u32>);
 /// mutation routes through — call [`clear_doctor_before_cache`], as does device
 /// detach (`watcher.rs`, an offline unit can be edited elsewhere). Single-entry
 /// bounds memory (one WAV).
-static BEFORE_CACHE: std::sync::Mutex<Option<(BeforeKey, String)>> = std::sync::Mutex::new(None);
+static BEFORE_CACHE: std::sync::Mutex<Option<(BeforeKey, BeforeEntry)>> =
+    std::sync::Mutex::new(None);
 
 /// Drop the cached `doctor_apply` BEFORE clip — call after anything that changes a
 /// stored preset (a save-bearing command) or on device detach.
@@ -825,27 +960,50 @@ pub(crate) fn clear_doctor_before_cache() {
     *crate::lock_ok(&BEFORE_CACHE) = None;
 }
 
-fn before_cache_get(key: &BeforeKey) -> Option<String> {
+fn before_cache_get(key: &BeforeKey) -> Option<BeforeEntry> {
     crate::lock_ok(&BEFORE_CACHE)
         .as_ref()
         .filter(|(k, _)| k == key)
-        .map(|(_, clip)| clip.clone())
+        .map(|(_, entry)| entry.clone())
 }
 
-fn before_cache_put(key: BeforeKey, clip: String) {
-    *crate::lock_ok(&BEFORE_CACHE) = Some((key, clip));
+fn before_cache_put(key: BeforeKey, entry: BeforeEntry) {
+    *crate::lock_ok(&BEFORE_CACHE) = Some((key, entry));
 }
 
 /// Apply every op in `ops` on `s`'s live edit buffer (the caller must already
-/// have `confirm_active` + `begin_live_edit`'d the session). Shared by
-/// `doctor_apply` (unsaved A/B) and `doctor_save` (rebuild-from-scratch
-/// persist) — the ONE home of the per-op wire semantics (`Param` →
-/// `change_parameter`; `InsertNode` → `insert_node` + its param follow-ups —
-/// the fresh node's id == its fender id, Doctor only inserts models ABSENT
-/// from the chain, so no collision). Returns the first failure's detail
-/// string; the caller decides how to recover (both today: restore the stored
-/// preset and report the detail).
-fn apply_doctor_ops(s: &mut Session, ops: &[doctor::DoctorOp]) -> Result<(), String> {
+/// have `confirm_active` + `begin_live_edit`'d the session and recalled
+/// `scene`). Shared by `doctor_apply` (unsaved A/B) and `doctor_save`
+/// (rebuild-from-scratch persist) — the ONE home of the per-op wire semantics
+/// (`Param` → `change_parameter`; `InsertNode` → `insert_node` + its param
+/// follow-ups — the fresh node's id == its fender id, Doctor only inserts
+/// models ABSENT from the chain, so no collision). Returns the first failure's
+/// detail string; the caller decides how to recover (both today: restore the
+/// stored preset and report the detail).
+///
+/// SCENE writes are overlay-aware (HW fw 1.8.58, 2026-08-22 — the same three
+/// cells `leveller::set_knobs` is built on, see `notes/gotchas.md`): a
+/// `changeParameter` in a recalled scene lands in that scene's overlay ONLY when
+/// the node's overlay entry already carries the key; on an entry WITHOUT the key
+/// (a sparse overlay, e.g. `{bypass:false}`) or with NO entry at all the write
+/// leaks to BASE, and `setNodeSceneEdit(enable)` — which makes it land — reseeds
+/// the entry from base's full param set. So per written node, once per call:
+/// entry has the key → bare write; entry lacks the key → enable, replay the
+/// entry's own keys (bypass on the bool wire, numerics on the float wire),
+/// settle, write; no entry → enable, settle, write. `overlay` is the diagnosed
+/// scene's sparse overlay from the backup scan (`DoctorApplyJob::scene_overlay`);
+/// an EMPTY list with `scene = Some` means the payload carried none (legacy
+/// caller / a scene with no node entries — indistinguishable), and falls back to
+/// the bare write with a WARN. Base (`scene = None`) always writes bare.
+fn apply_doctor_ops(
+    s: &mut Session,
+    ops: &[doctor::DoctorOp],
+    scene: Option<u32>,
+    overlay: &[session::SceneNodeOverlay],
+) -> Result<(), String> {
+    // Nodes whose Scene Edit enable (+ replay) already went this call — a second
+    // enable would reseed again and wipe the first write.
+    let mut enabled: Vec<(String, String)> = Vec::new();
     for op in ops {
         let outcome: Result<bool, String> = match op {
             doctor::DoctorOp::Param {
@@ -853,9 +1011,13 @@ fn apply_doctor_ops(s: &mut Session, ops: &[doctor::DoctorOp]) -> Result<(), Str
                 node_id,
                 param,
                 value,
-            } => s
-                .change_parameter(group_id, node_id, param, *value as f32)
-                .map(|_| true),
+            } => {
+                if let Some(scene) = scene {
+                    prepare_scene_write(s, scene, overlay, group_id, node_id, param, &mut enabled)?;
+                }
+                s.change_parameter(group_id, node_id, param, *value as f32)
+                    .map(|_| true)
+            }
             doctor::DoctorOp::InsertNode {
                 group_id,
                 before_fender_id,
@@ -882,6 +1044,71 @@ fn apply_doctor_ops(s: &mut Session, ops: &[doctor::DoctorOp]) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// The pre-write step of an overlay-aware scene write (see [`apply_doctor_ops`]):
+/// decides from the node's overlay entry whether the Scene Edit enable (+ the
+/// entry's own keys replayed over the reseed) must precede the `changeParameter`,
+/// and sends it at most once per node per call.
+fn prepare_scene_write(
+    s: &mut Session,
+    scene: u32,
+    overlay: &[session::SceneNodeOverlay],
+    group_id: &str,
+    node_id: &str,
+    param: &str,
+    enabled: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    if overlay.is_empty() {
+        log::warn!(
+            "doctor apply: scene {scene} write {group_id}/{node_id}.{param} without overlay data — \
+             writing bare (on a node whose overlay entry lacks the key this leaks to base)"
+        );
+        return Ok(());
+    }
+    let key = (group_id.to_string(), node_id.to_string());
+    if enabled.contains(&key) {
+        return Ok(());
+    }
+    let entry = overlay
+        .iter()
+        .find(|o| o.group_id == group_id && o.node_id == node_id);
+    match entry {
+        Some(e) if e.params.contains_key(param) => Ok(()),
+        Some(e) => {
+            log::info!(
+                "doctor apply: scene {scene} overlay entry for {group_id}/{node_id} has no {param} \
+                 key — enabling Scene Edit and replaying its {} own key(s) over the reseed",
+                e.params.len() + usize::from(e.bypassed.is_some())
+            );
+            s.set_node_scene_edit(group_id, node_id, true)?;
+            if let Some(b) = e.bypassed {
+                s.change_parameter_bool(group_id, node_id, "bypass", b)?;
+            }
+            let mut keys: Vec<&String> = e.params.keys().collect();
+            keys.sort();
+            for k in keys {
+                s.change_parameter(group_id, node_id, k, e.params[k] as f32)?;
+            }
+            crate::settle(std::time::Duration::from_millis(
+                leveller::SETTLE_AFTER_SCENE_EDIT_MS,
+            ));
+            enabled.push(key);
+            Ok(())
+        }
+        None => {
+            log::info!(
+                "doctor apply: scene {scene} has no overlay entry for {group_id}/{node_id} — \
+                 enabling Scene Edit before the write"
+            );
+            s.set_node_scene_edit(group_id, node_id, true)?;
+            crate::settle(std::time::Duration::from_millis(
+                leveller::SETTLE_AFTER_SCENE_EDIT_MS,
+            ));
+            enabled.push(key);
+            Ok(())
+        }
+    }
 }
 
 /// Open a live-edit session on `list_index`, confirm identity, recall `scene`,
@@ -915,6 +1142,7 @@ pub(crate) fn ops_session(
     scene: Option<u32>,
     ops: &[doctor::DoctorOp],
     verb: &str,
+    overlay: &[session::SceneNodeOverlay],
 ) -> Result<Session, String> {
     fn restored_err(list_index: u32, verb: &str, detail: String) -> String {
         match leveller::restore_saved_preset(list_index) {
@@ -930,7 +1158,7 @@ pub(crate) fn ops_session(
     let setup = || -> Result<Session, String> {
         let mut s = Session::connect()?;
         s.confirm_active(list_index, Some(expect_name))?;
-        apply_ops_under_scene(&mut s, scene, ops)?;
+        apply_ops_under_scene(&mut s, scene, ops, overlay)?;
         Ok(s)
     };
     setup().map_err(|detail| restored_err(list_index, verb, detail))
@@ -949,32 +1177,75 @@ pub(crate) fn ops_session(
 /// `lastLoadedScene`), not necessarily the diagnosed scene — omitting the recall
 /// let a scene-2 prescription silently write scene-0's overlay (or base) instead.
 ///
-/// KNOWN LIMITATION, now REFUSED rather than silently leaked: when the
-/// diagnosed node has NO EXISTING overlay in `scene`
-/// ([`SceneWriteVerdict::NeedsEnable`]), a bare `changeParameter` here would
-/// leak to base — `set_node_scene_edit` is what forces the overlay into
-/// existence, per leveling's `set_knob`/`set_knobs`, but enabling it here
-/// isn't a free fix: it reseeds the node's scene overlay from base, wiping
-/// any OTHER already-scene-edited params on that node — the same
-/// reseed-wipes-siblings bug leveling's `set_knob`/`set_knobs` has (fixed
-/// there by a measure-the-diff-and-repair pass; no equivalent repair exists
-/// for Doctor). So Doctor never attempts either shape: `doctor_apply` refuses
-/// the apply before this fn ever runs, for the Absent case and for a
-/// `SceneOverlay::BypassOnly` node the audibility guard does NOT clear — see
-/// [`bypass_only_conflict`], which now reads the same
-/// [`scene_write_verdict_for_param`] the leveling lane does instead of
-/// re-deriving a narrower (BypassOnly-only) rule.
+/// The recall alone is not sufficient when the diagnosed node has no overlay
+/// entry in that scene, or an entry without the target key — those writes leak
+/// to base. [`apply_doctor_ops`] handles both with the overlay-aware enable +
+/// replay (HW fw 1.8.58, 2026-08-22), given the scene's overlay from the backup
+/// scan (`overlay`).
 fn apply_ops_under_scene(
     s: &mut Session,
     scene: Option<u32>,
     ops: &[doctor::DoctorOp],
+    overlay: &[session::SceneNodeOverlay],
 ) -> Result<(), String> {
     s.begin_live_edit()?;
     s.load_scene(scene.unwrap_or(session::BASE_SCENE_SLOT))?;
     crate::settle(std::time::Duration::from_millis(
         leveller::SETTLE_AFTER_SET_MS,
     ));
-    apply_doctor_ops(s, ops)
+    apply_doctor_ops(s, ops, scene, overlay)
+}
+
+/// The freshness witness a Doctor save registers for the slot (the same
+/// `SLOT_SAVE_REGISTRY` the leveling lanes use): the first `Param` op, or the
+/// inserted node's first param (its node id == its fender id), scoped to the
+/// diagnosed scene. `None` when the ops carry no param at all (an insert with no
+/// params) — then no barrier can wait on the commit.
+pub(crate) fn doctor_save_witness(
+    ops: &[doctor::DoctorOp],
+    scene: Option<u32>,
+) -> Option<leveller::SaveWitness> {
+    ops.iter().find_map(|op| match op {
+        doctor::DoctorOp::Param {
+            group_id,
+            node_id,
+            param,
+            value,
+        } => Some(leveller::SaveWitness::Param {
+            group: group_id.clone(),
+            node: node_id.clone(),
+            param: param.clone(),
+            value: *value as f32,
+            scene,
+        }),
+        doctor::DoctorOp::InsertNode {
+            group_id,
+            fender_id,
+            params,
+            ..
+        } => params.first().map(|(p, v)| leveller::SaveWitness::Param {
+            group: group_id.clone(),
+            node: fender_id.clone(),
+            param: p.clone(),
+            value: *v as f32,
+            scene,
+        }),
+    })
+}
+
+/// Wait out the device's lazy `saveCurrentPreset` commit before a Doctor load
+/// of `slot` — the leveling lanes' `ensure_fresh_load` barrier, keyed on the
+/// witness `doctor_save` registers. Without it a check/apply within the ~45–100 s
+/// window loads the PRE-save preset and measures the old sound (HW 2026-08-22:
+/// a re-check 11 s after a balance-plan save read identical numbers). `notify`
+/// runs once before a real wait so the UI can say why nothing is moving.
+pub(crate) fn doctor_fresh_load(slot: u32, notify: impl FnOnce()) -> Result<(), String> {
+    if leveller::slot_save_pending_commit(slot) {
+        notify();
+    }
+    leveller::ensure_fresh_load(slot, &mut || {
+        DOCTOR_CANCEL.load(SeqCst) || crate::op_aborted()
+    })
 }
 
 /// Does `ops` contain a scene-context `Param` write [`scene_write_verdict_for_param`]
@@ -1098,9 +1369,11 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                 return Err(e.clone());
             }
             // The Doctor capture tail for this chain — the ONE home of the policy
-            // (`doctor::doctor_tail_ms`); empty `nodes` conservatively keeps the
-            // full wash-analysis tail, same default as before this fix.
-            let tail_ms = u64::from(doctor::doctor_tail_ms(&job.nodes));
+            // (`doctor::doctor_tail_ms`) over the SAME effective chain the check
+            // read (scene overlay + isolation); empty `nodes` conservatively keeps
+            // the full wash-analysis tail, same default as before this fix.
+            let effective = doctor::effective_nodes(&job.nodes, &job.scene_overlay, &iso.bypass);
+            let tail_ms = u64::from(doctor::doctor_tail_ms(&effective));
 
             // (a) BEFORE: capture the stored preset (reamp off at the end). This LOADS
             //     the slot, so (b) below confirms the already-current preset — no reload.
@@ -1118,13 +1391,22 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                 job.scene,
                 job.footswitch,
             );
-            let before_clip = match before_cache_get(&key) {
-                Some(clip) => {
+            let family = family_of_topology(job.topology_id.as_deref());
+            // A load inside the device's lazy-commit window of an earlier Doctor/leveling
+            // save would capture the PRE-save preset as "before" — wait it out first.
+            doctor_fresh_load(job.list_index, || {
+                log::info!(
+                    "doctor_apply: slot {} — waiting for the device to commit the previous save",
+                    job.list_index
+                );
+            })?;
+            let (before_clip, before_measure) = match before_cache_get(&key) {
+                Some(entry) => {
                     leveller::restore_saved_preset(job.list_index)?;
                     crate::settle(std::time::Duration::from_millis(
                         leveller::RECONNECT_GAP_MS,
                     ));
-                    clip
+                    entry
                 }
                 None => {
                     let (before, rate) = leveller::doctor_capture(
@@ -1141,14 +1423,16 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                         "data:audio/wav;base64,{}",
                         base64_encode(&wav_bytes(&before, rate)?)
                     );
-                    before_cache_put(key, clip.clone());
+                    let measure = apply_capture_balance(&stim, &before, rate, family);
+                    let entry = (clip, measure);
+                    before_cache_put(key, entry.clone());
                     // Same inter-session gap the cache-hit branch takes after its
                     // own restore: the BEFORE capture's session just closed, and
                     // `ops_session` opens a fresh one next — let the seize release.
                     crate::settle(std::time::Duration::from_millis(
                         leveller::RECONNECT_GAP_MS,
                     ));
-                    clip
+                    entry
                 }
             };
 
@@ -1157,7 +1441,14 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
             //     defaulted to. NEVER saves. On ANY op failure the stored preset is
             //     reloaded (the partial edit is discarded). Kept OPEN — (c) captures
             //     on this SAME session, never reconnecting.
-            let mut s = ops_session(job.list_index, &job.name, job.scene, &job.ops, "apply")?;
+            let mut s = ops_session(
+                job.list_index,
+                &job.name,
+                job.scene,
+                &job.ops,
+                "apply",
+                &job.scene_overlay,
+            )?;
 
             // (c) AFTER: capture the live edit buffer on the SAME session (b) just
             //     wrote to — NOT a fresh reconnect, which would recall the scene
@@ -1171,21 +1462,23 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
             //     auto-restore (`PrescriptionCard.tsx`'s "a failed apply
             //     auto-restores"), and a stranded mutated buffer would let a
             //     sibling card Apply on top of it.
-            let after_clip = match (|| -> Result<String, String> {
-                let (after, rate) = leveller::doctor_capture_on_session(
-                    &mut s,
-                    &iso.bypass,
-                    &iso.params,
-                    &stim,
-                    None,
-                    tail_ms,
-                )?;
-                Ok(format!(
+            let (after_clip, after_measure) = match (|| -> Result<_, String> {
+                let (after, rate) =
+                    leveller::doctor_capture_on_session(
+                        &mut s,
+                        &iso.bypass,
+                        &iso.params,
+                        &stim,
+                        None,
+                        tail_ms,
+                    )?;
+                let clip = format!(
                     "data:audio/wav;base64,{}",
                     base64_encode(&wav_bytes(&after, rate)?)
-                ))
+                );
+                Ok((clip, apply_capture_balance(&stim, &after, rate, family)))
             })() {
-                Ok(clip) => clip,
+                Ok(pair) => pair,
                 Err(after_err) => {
                     return Err(match leveller::restore_saved_preset(job.list_index) {
                         Ok(()) => after_err,
@@ -1196,9 +1489,28 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
                 }
             };
 
+            let measured = match (before_measure, after_measure) {
+                (Some((before_bal, before_lufs)), Some((after_bal, after_lufs)))
+                    if before_bal.len() == after_bal.len() =>
+                {
+                    Some(ApplyMeasure {
+                        band_labels: family.labels_owned(),
+                        delta_db: after_bal
+                            .iter()
+                            .zip(&before_bal)
+                            .map(|(a, b)| a - b)
+                            .collect(),
+                        before_balance_db: before_bal,
+                        after_balance_db: after_bal,
+                        loudness_delta_db: after_lufs - before_lufs,
+                    })
+                }
+                _ => None,
+            };
             Ok(DoctorApplyResult {
                 before_clip,
                 after_clip,
+                measured,
             })
         };
         let result = run();
@@ -1227,12 +1539,25 @@ pub(crate) async fn doctor_save(
     expect_name: String,
     scene: Option<u32>,
     ops: Vec<doctor::DoctorOp>,
+    scene_overlay: Option<Vec<session::SceneNodeOverlay>>,
 ) -> Result<(), String> {
     with_released_seize(state.session.clone(), move || {
+        let overlay = scene_overlay.unwrap_or_default();
         leveller::restore_saved_preset(list_index)?;
         crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
-        let mut s = ops_session(list_index, &expect_name, scene, &ops, "save")?;
+        let mut s = ops_session(list_index, &expect_name, scene, &ops, "save", &overlay)?;
         s.save_current_preset(list_index)?;
+        // The device commits this save LAZILY (T+45–100 s): register the witness so the
+        // next Doctor/leveling load of this slot waits for the commit instead of
+        // materializing the pre-save preset (`doctor_fresh_load`, `ensure_fresh_load`).
+        if let Some(w) = doctor_save_witness(&ops, scene) {
+            leveller::register_slot_save(list_index, w);
+        } else {
+            log::warn!(
+                "doctor_save: slot {list_index} saved ops with no parameter to witness — a \
+                 same-slot load inside the device's lazy-commit window may read the pre-save preset"
+            );
+        }
         Ok(())
     })
     .await

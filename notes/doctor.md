@@ -160,6 +160,33 @@ reload), and the capture connections use the lean handshake
 floor read retries once after a quiet gap). A single capture can occasionally
 misread — repeated runs are the arbiter.
 
+## The effective chain — a scene sound is diagnosed against ITS chain
+
+Every graph-aware consumer (rx generation, the balance plan, the capture
+tail) reads `doctor::effective_nodes(nodes, scene_overlay, force_bypass)`, not
+the base graph the frontend passes:
+
+- **`scene_overlay`** — the sound's saved-scene sparse overlay from the backup
+  scan (`BackupPresetRow.scene_overlays[scene]` →
+  `DoctorInputArg.sceneOverlay`; `session::extract_scene_overlays` resolves
+  `scenes[i].{guitarNodes,micNodes}.<group>.<FenderId|nodeId>` to the base
+  `node_id` within the group, harvesting `bypass` when present plus the same
+  Doctor param allowlist as the base graph (`session::doctor_param_allowed`)).
+  A scene that bypasses the drive, switches a reverb on, or runs the amp's
+  Bass at 3 instead of 6 is a different chain, and its prescriptions/plan
+  now target those blocks and values. Base/footswitch sounds carry none.
+- **`force_bypass`** — the capture's own isolation list (`resolve_sound_isolation`:
+  Base/scenes = every block-acting footswitch off; a footswitch sound = its
+  blocks engaged, siblings off) applied last, so the diagnosis sees the same
+  on/off state the capture ran (a footswitch sound's plan never proposes a
+  knob on a block the capture had forced off).
+
+`doctor_apply` derives the same effective chain from the job's
+`sceneOverlay` for its tail policy, so the A/B captures on the chain the check
+read. Footswitch PARAM functions (`valueA`/`valueB`) are not emulated by the
+capture and so not by the effective chain either — both see the saved base
+values.
+
 ## Prescriptions & apply
 
 `Rx` derivation is graph-aware (`graph_facts`): fixes prefer an existing
@@ -178,8 +205,33 @@ honest "Set …" title. Apply (`doctor_apply`) edits the device edit buffer
 under the DIAGNOSED scene/footswitch isolation — nothing persists until
 `doctor_save`, which **rebuilds SAVED+ops from scratch** (restore → fresh
 confirmed session → re-apply exactly `ops` → save), so intermediate
-edit-buffer pollution can never be persisted structurally. `doctor_discard`
-reloads the stored preset. The frontend serializes applies (`applyLock.ts`)
+edit-buffer pollution can never be persisted structurally.
+
+**Scene writes are overlay-aware** (HW fw 1.8.58, 2026-08-22 — the same
+three-cell matrix `leveller::set_knobs` rests on, `notes/gotchas.md`): in a
+recalled scene a `changeParameter` lands in the scene overlay only when the
+node's entry already carries the key; on a sparse entry without it (the
+slot-196 scene-0 `{bypass:false}` shape) or with no entry the write leaks to
+BASE, and the Scene Edit enable that makes it land reseeds the entry from base.
+`apply_doctor_ops` therefore reads the diagnosed scene's overlay
+(`DoctorApplyJob.sceneOverlay` / `doctor_save`'s `sceneOverlay`, the backup
+scan's full-doc overlays — every numeric key, not just the Doctor allowlist) and
+per node, once per call: key present → bare write; key missing → enable, replay
+the entry's own keys (bypass on the bool wire, numerics on the float wire),
+settle, write; no entry → enable, settle, write. Base sounds write bare.
+
+**The lazy commit is waited out**: `doctor_save` registers a scene-scoped
+`SaveWitness::Param` in the leveling lanes' `SLOT_SAVE_REGISTRY`, and
+`doctor_check` (first load of each slot, with a "waiting for the device to
+commit the previous save…" progress line) and `doctor_apply` (before the BEFORE
+capture) run `ensure_fresh_load` — a re-check 11 s after a save had measured the
+PRE-save preset (identical numbers, HW 2026-08-22). After a successful save the
+frontend folds the ops into the cached scan (`patchLibraryAfterDoctorSave`:
+base params / the scene overlay entry / an inserted node), so the next run's
+chain and the balance plan's "from" values start from the saved state, not the
+connect-time backup.
+
+`doctor_discard` reloads the stored preset. The frontend serializes applies (`applyLock.ts`)
 and allows ONE unsaved prescription at a time; A/B audition captures
 before/after clips (BEFORE cached per sound — `BEFORE_CACHE`, keyed on
 list index + name + stimulus + calibration + scene + footswitch; a cache hit
@@ -218,6 +270,110 @@ only ("this switch changes X"), never "the old leveler damaged this", since a
 footswitch can legitimately sweep any parameter via Pro Control. Counted by
 `severity.ts::presetLookCount` so a preset whose ONLY finding is a damage
 advisory still surfaces under "Needs a look".
+## Balance plan — rebalance with the blocks you have
+
+`doctor_plan.rs` (pure; called once per diagnosed sound from `commands/doctor.rs`,
+shipped as `DoctorSoundResult.plan`, rendered by `TonePlanCard`). Where the Rx
+engine above reaches for an EQ-10 insert or a generic "roll the amp's Bass
+back" advisory, the plan says **which block, which knob, how far** — on the
+tone controls the preset ALREADY carries — and what that is predicted to fix:
+
+> '65 Twin Reverb · Bass 6.0 → 4.0, Treble 5.0 → 5.5 · Greenbox 8 · Tone 5.0 → 6.0
+> Predicted to clear Muddy at any volume. Dark at stage volume only — still expected.
+
+- **Discovery** (`discover_controls`): every ACTIVE guitar-lane block's tone
+  controls with a KNOWN current value — amp `bass`/`mid`|`middle`/`treb`|`treble`/
+  `presence`|`pres`/`tone`/`cut` (amps by `is_amp_model_id`), a drive pedal's
+  same keys (`DIST_IDS`), graphic-EQ `gain*hz` bands (EQ-10 stereo/mono, EQ-7),
+  and the parametric's PEAK bands (`filterN{frequency,gaindb,q}` with
+  `filterNtype == 2`; its pass/shelf bands are skipped — their type numbering is
+  unverified). The graph param allowlist in `session::extract_active_graph`
+  carries these keys (`doctor_plan::is_tone_param_key`); a control without a
+  value is never written blind. Cab hpf/lpf stay with the boomy/fizzy Rx.
+- **Response model — NOMINAL, `nominal-tonestack-v1`** (`nominal_shapes`):
+  textbook passive-stack shapes integrated over the family's band layout —
+  Bass ≈ 18 dB low shelf under ~300 Hz, Mid ≈ +12 dB/3-oct hump at 600 Hz on a
+  +3 dB level lift, Treble ≈ 18 dB high shelf above 2 kHz, Presence ≈ 10 dB
+  above 3.5 kHz, a single amp Tone ≈ 14 dB treble bleed, Vox Cut negative;
+  pedal controls are smaller and damped ×0.6 (clipping flattens what a
+  pre-drive control does to the OUTPUT). Graphic/parametric bands are the
+  filter's own dB (1-octave Lorentzian / Q → bandwidth), so those moves are
+  near-exact. NOT per-model hardware measurements — the plan is framed
+  **Estimated** in the UI, and `probe --doctor-knob-sweep <slot>` is the HW
+  arm that measures a real preset's per-knob band responses to re-derive the
+  table per amp family (`notes/doctor-calibration.md`).
+- **Solve** (`solve`): coordinate descent over each control's QUANTIZED move
+  grid (knobs 0.05 = half a dial step, EQ 0.5 dB; caps ±0.35 knob / ±6 dB —
+  conservative because the model is nominal) on an objective built from the
+  REAL rule margins: per tonal rule (muddy/boomy/harsh/lost/thin/buried/
+  dark|bright/fizzy) the excess past its gate in the rule's OWN space — both
+  consensus spaces for the band rules (`tilt_split` locals AND
+  `centered_deviations`), the Theil–Sen slope for the tilt rule, raw
+  `Air − Highs` for fizzy — plus a 0.5 dB safety margin. A FIRED rule is
+  gated at the STAGE offsets (the tightest level; firing sets are
+  louder-suffixes, so "cleared" means cleared at every volume) with weight 4;
+  an un-fired rule keeps its rehearsal gate with weight 12 (never trade one
+  finding for another); light collateral (per-band dB change) and move costs
+  break ties toward the smallest change. `rule_gates_agree_with_the_diagnosis`
+  pins the gate transcription to `diagnose_kind` over 400 band vectors.
+- **Predict honestly**: the moves are pushed through the model onto the
+  measured band powers and the predicted profile is RE-DIAGNOSED with
+  `diagnose_levels` (same kind/coverage). `clears` = keys that no longer fire
+  at any level; `remains` = keys still firing, each with its predicted
+  quietest level (quiet → stage-only is progress the card shows). A plan ships
+  only when something clears or eases AND nothing new fires; otherwise
+  `plan: null`. Localized peaks are cleared on the predicted profile (a
+  different measurement space — no claim). A predicted loudness change
+  (band-power sum) is reported; the Level tab re-levels.
+- **Apply**: the plan's `rx` is a standard `OneClick` (one `DoctorOp::Param`
+  per move, absolute values) through `PrescriptionCard` — same one-unsaved-
+  edit lock, BEFORE-clip cache, A/B and ack-gated save. `doctor_apply` now
+  also returns `measured` (`ApplyMeasure`: before/after `balance` band dB, the
+  per-band delta and the loudness delta, from the same onset-aligned body PSD
+  the check uses) and the card prints it under the A/B — the device's answer
+  outranks the prediction. Scene sounds inherit `apply_ops_under_scene`'s
+  known overlay limitation; footswitch sounds get the shared-block caption
+  when a plan move touches a block outside the switch's own set.
+
+## Balance search — the round-by-round tune loop
+
+`doctor_tune.rs` (pure search) + `commands/doctor_tune.rs` (device rounds +
+the per-sound session) + `TuneCard` ("Search for a better balance", under every
+sound with findings). Where the one-shot plan predicts from a nominal model, the
+loop MEASURES: each round proposes moves from the current baseline, applies
+them live (cumulative absolute ops from the saved preset — never saved),
+captures on the same session, diagnoses, and shows the candidate's moves, the
+A/B (baseline vs candidate), the measured band change and which findings
+cleared / remain / appeared. The player decides: **better** (the candidate
+becomes the baseline; the next round starts from it), **not better** (rejected;
+the next round proposes a different variant), **save** (`doctor_save` with the
+step's cumulative ops — the same overlay-aware write + commit witness as every
+Doctor save, then the scan store is patched), **stop** (`doctor_tune_end`
+with discard → the stored preset is reloaded).
+
+- **Calibration** (`doctor_tune::calibrate`): every measured round (accepted
+  or not) is a data point `Δbalance ≈ Σ_c s_c·(r_c − mean r_c)·Δx_c`; a
+  ridge-regularized least squares (λ = 30, prior 1.0, clamp [0.25, 4]) yields
+  per-control scale factors on the nominal responses, so round 2 already moves
+  with this amp's real sensitivities. The card prints what was learned
+  ("'65 Twin Reverb · Bass ×0.56").
+- **Variants after a rejection** (`exclusions` / `cap_for_variant`): streak 1
+  excludes the rejected round's biggest control; 2 excludes every control the
+  rejected rounds moved; 3 halves the move cap; `MAX_VARIANTS` = 4 → "no
+  further suggestion" (keep what was kept, or stop). An acceptance resets the
+  streak.
+- **Termination**: `converged` when the baseline has no tonal finding
+  (`TONAL_KEYS`) left; `exhausted` when no proposal exists (no drivable
+  control, variants used up). Both offer "Save what I kept" when the baseline
+  carries edits.
+- **Device discipline**: round 1 captures the SAVED sound after the
+  lazy-commit barrier (`doctor_fresh_load`); every round = `restore_saved_preset`
+  → `ops_session` (cumulative ops, overlay-aware) → `doctor_capture_on_session
+_with_loudness` → `reamp_off_guaranteed`; ~15 s per round. The session
+  (profiles, clips, trials) lives in one process-wide slot keyed on sound +
+  stimulus; a different sound restarts it. The card holds the app-wide apply
+  lock while a candidate sits unsaved, and ends the loop with a discard on
+  unmount.
 
 ## Cut-through estimate + reference match (flagship)
 
@@ -250,6 +406,11 @@ advisory still surfaces under "Needs a look".
   boxy_peq): each recipe's ops inject live, HIT/MISS/VIOLATION table against
   `must_fire`/`must_not_fire`. The recipe table in `doctor_defects.rs` is the
   fixture set.
+- `probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out r.json]` — the
+  balance plan's calibration arm: nudges each amp/pedal tone knob ±delta one
+  at a time (stored preset reloaded between steps), captures, and prints the
+  MEASURED per-band dB/unit next to the nominal shape + the ratio (JSON with
+  `--out`). Never saves; ends re-amp OFF.
 - `probe --doctor-window-ab` / `--doctor-calib` — window re-baseline vs the
   pinned 6 s oracle · threshold-space sweeps. (The one-shot `--doctor-iso-ab`
   equivalence arm was retired once the offline/live isolation equivalence got

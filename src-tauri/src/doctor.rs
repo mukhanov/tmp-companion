@@ -1397,6 +1397,22 @@ const OTHER_EQ_IDS: [&str; 4] = [
     "ACD_MustangPEQ",
 ];
 const HIGH_LOW_PASS: &str = "ACD_HighLowPass";
+
+/// Block-class predicates shared with the balance plan (`doctor_plan.rs`),
+/// so the plan's control discovery keys on the SAME exact-id tables the
+/// prescriptions use — one vocabulary of "a drive", "a graphic EQ".
+pub(crate) fn is_drive_model(model: &str) -> bool {
+    DIST_IDS.contains(&model)
+}
+/// Graphic EQs whose bands are `gain*hz` keys: the stereo/mono 10-band and
+/// the 7-band Mustang EQ.
+pub(crate) fn is_graphic_eq_model(model: &str) -> bool {
+    model == EQ10_STEREO || model == "ACD_TenBandEQMono" || model == "ACD_MustangSevenBandEq"
+}
+/// The 5-band parametric (`filterN{frequency,gaindb,q,type}` keys).
+pub(crate) fn is_parametric_eq_model(model: &str) -> bool {
+    model == "ACD_FiveBandParamEQ"
+}
 const COMPRESSOR: &str = "ACD_DynaComp"; // classic 2-knob pedal comp, schema-verified
 /// Soft-knee studio comp: transparent post-cab leveling (1.0% CPU vs the
 /// DynaComp's 4.8; DynaComp stays the front-of-chain pedal-squish pick).
@@ -1449,6 +1465,47 @@ impl DoctorNode {
             params: n.params.clone(),
         }
     }
+}
+
+/// The chain as ONE SOUND actually runs it: the base graph with the sound's
+/// saved-scene overlay laid on (`bypass` + knob values the scene re-voices —
+/// `session::extract_scene_overlays`, resolved by `node_id`) and then the
+/// capture's force-bypass isolation applied (`(group, node, bypass)` — Base:
+/// every block-acting footswitch off; a footswitch sound: its own blocks in
+/// the engaged state, siblings off; scenes: all switches off, like Base).
+/// Every graph-aware consumer — rx generation, the balance plan, the capture
+/// tail — reads THIS, not the base graph, so a scene that bypasses the drive
+/// or runs the amp's Bass at 3 instead of 6 gets prescriptions for the blocks
+/// and values it really has. Base sounds with no overlay and no isolation
+/// come back byte-identical.
+pub fn effective_nodes(
+    nodes: &[DoctorNode],
+    scene_overlay: &[crate::session::SceneNodeOverlay],
+    force_bypass: &[(String, String, bool)],
+) -> Vec<DoctorNode> {
+    let mut out: Vec<DoctorNode> = nodes.to_vec();
+    for ov in scene_overlay {
+        for n in out
+            .iter_mut()
+            .filter(|n| n.group_id == ov.group_id && n.node_id == ov.node_id)
+        {
+            if let Some(b) = ov.bypassed {
+                n.bypassed = b;
+            }
+            for (k, v) in &ov.params {
+                n.params.insert(k.clone(), *v);
+            }
+        }
+    }
+    for (group, node, bypass) in force_bypass {
+        for n in out
+            .iter_mut()
+            .filter(|n| &n.group_id == group && &n.node_id == node)
+        {
+            n.bypassed = *bypass;
+        }
+    }
+    out
 }
 
 /// What `generate_rx` needs to know about the preset's chain, gathered in one
@@ -2797,6 +2854,15 @@ pub struct LeveledDiag {
     pub from_level: PlaybackLevel,
 }
 
+/// A finding key + the quietest playback level it fires at — the balance
+/// plan's "still fires, from this volume" row (`doctor_plan::TonePlan.remains`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeveledKey {
+    pub key: String,
+    pub from_level: PlaybackLevel,
+}
+
 /// Diagnose one sound at ALL THREE playback levels and return each finding ONCE,
 /// tagged with the quietest level it fires at. The capture is level-independent
 /// (the offset shifts the comparison THRESHOLD, not the measured deviation), so a
@@ -3276,6 +3342,76 @@ mod tests {
     }
 
     // ── new-metric pure helpers ──
+
+    /// `effective_nodes`: a scene overlay re-voices knobs and flips bypass by
+    /// node id; the isolation list then wins on bypass; nothing else moves.
+    #[test]
+    fn effective_nodes_lays_scene_overlay_then_isolation_over_base() {
+        let node = |group: &str, id: &str, model: &str, bypassed: bool, params: &[(&str, f64)]| {
+            DoctorNode {
+                group_id: group.into(),
+                node_id: id.into(),
+                model: model.into(),
+                bypassed,
+                cab_sim_id: None,
+                cab_sim2_enabled: None,
+                params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            }
+        };
+        let base = vec![
+            node("G1", "drive1", "ACD_TubeScreamer", false, &[("tone", 0.5)]),
+            node(
+                "G1",
+                "amp",
+                "ACD_TwinReverb65NoFx",
+                false,
+                &[("bass", 0.6), ("treb", 0.5)],
+            ),
+            node("G3", "rvb", "ACD_TMSpring63", true, &[("mix", 0.14)]),
+        ];
+        let overlay = vec![
+            crate::session::SceneNodeOverlay {
+                group_id: "G1".into(),
+                node_id: "amp".into(),
+                bypassed: None,
+                params: [("bass".to_string(), 0.3)].into_iter().collect(),
+            },
+            crate::session::SceneNodeOverlay {
+                group_id: "G3".into(),
+                node_id: "rvb".into(),
+                bypassed: Some(false),
+                params: std::collections::HashMap::new(),
+            },
+        ];
+        // Isolation: the drive is a footswitch block, forced OFF for this sound.
+        let fb = vec![("G1".to_string(), "drive1".to_string(), true)];
+        let eff = effective_nodes(&base, &overlay, &fb);
+        assert_eq!(eff.len(), 3);
+        assert!(eff[0].bypassed, "isolation forces the drive off");
+        assert_eq!(eff[0].params.get("tone"), Some(&0.5));
+        assert!(!eff[1].bypassed);
+        assert_eq!(
+            eff[1].params.get("bass"),
+            Some(&0.3),
+            "scene re-voices bass"
+        );
+        assert_eq!(
+            eff[1].params.get("treb"),
+            Some(&0.5),
+            "unoverlaid keys survive"
+        );
+        assert!(!eff[2].bypassed, "scene switches the reverb on");
+        // No overlay + no isolation → identical to base.
+        let same = effective_nodes(&base, &[], &[]);
+        assert_eq!(
+            same.iter()
+                .map(|n| (&n.node_id, n.bypassed))
+                .collect::<Vec<_>>(),
+            base.iter()
+                .map(|n| (&n.node_id, n.bypassed))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn band_db_is_10_log10_floored() {

@@ -28,6 +28,7 @@ import type {
   DoctorSoundResult,
   FootswitchInfo,
   GraphNode,
+  SceneNodeOverlay,
 } from "../../lib/types";
 
 const RESIDUAL_LINE =
@@ -40,6 +41,8 @@ export interface MatchCardProps {
   presetName: string;
   nodes: GraphNode[];
   footswitches: FootswitchInfo[];
+  /** The diagnosed scene's node overlay — threaded into the A/B capture. */
+  sceneOverlay?: SceneNodeOverlay[];
   /** The diagnosed sound's stimulus identity — threaded into the synthetic
    *  prescription's A/B audition. */
   stimulus?: DoctorStimulus;
@@ -52,6 +55,7 @@ export function MatchCard({
   presetName,
   nodes,
   footswitches,
+  sceneOverlay,
   stimulus,
 }: MatchCardProps) {
   const { t } = useTheme();
@@ -155,6 +159,7 @@ export function MatchCard({
         soundFootswitch={sound.footswitch}
         nodes={nodes}
         footswitches={footswitches}
+        sceneOverlay={sceneOverlay}
         stimulus={stimulus}
       />
       {residualLine}

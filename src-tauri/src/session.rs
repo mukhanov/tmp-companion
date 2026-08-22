@@ -215,9 +215,12 @@ pub struct GraphNode {
     pub cab_sim2_enabled: Option<bool>,
     /// ALLOWLISTED current `dspUnitParameters` values for Doctor's value-aware
     /// prescriptions: the reverb wet/dry mix names (`mix`, `wetdrymix`), the cab
-    /// low/high cut (`hpf`, `lpf`), and the EQ-10 `gain*hz` band gains. Empty for
-    /// every other param/node — the full param map would bloat every snapshot/
-    /// backup row for nothing.
+    /// low/high cut (`hpf`, `lpf`), the graphic-EQ `gain*hz` band gains, and the
+    /// tone controls the balance plan drives — amp/pedal `bass`/`mid`/`middle`/
+    /// `treb`/`treble`/`presence`/`pres`/`tone`/`cut` plus the parametric's
+    /// `filterN{frequency,gaindb,q,type}` (`doctor_plan::is_tone_param_key`).
+    /// Empty for every other param/node — the full param map would bloat every
+    /// snapshot/backup row for nothing.
     pub params: std::collections::HashMap<String, f64>,
 }
 
@@ -693,8 +696,47 @@ impl Session {
     /// inside the recognized full sequence), so the scan can't avoid the full
     /// handshake; it drains it instead.
     pub fn drain_until_quiet(&mut self, window_ms: u64, max_windows: u32) -> Result<(), String> {
+        self.drain_until_quiet_inner(window_ms, max_windows, false)
+    }
+
+    /// [`Self::drain_until_quiet`] that KEEPS THE SESSION LIVE: fires the
+    /// live-controller heartbeat on a 250 ms elapsed gate before each pump window
+    /// (the [`Self::read_slot_preset_json_live`] keepalive shape). The plain drain
+    /// is heartbeat-less, and a heartbeat-less pump of more than ~1.5 s lapses a
+    /// session that is meant to stay live (see [`Self::begin_live_edit`]) — after
+    /// which the device answers every later request with an empty
+    /// `connectionError`. Use this from any drain that runs on a session that will
+    /// go on to be the monitor's live session (the strict preset-list retry).
+    ///
+    /// fw 1.8.58 — pending attended validation: the heartbeat-bearing drain is the
+    /// proven `device_backup` / `read_slot_preset_json_live` keepalive shape, but it
+    /// has not yet been A/B'd on this exact retry path (`probe --listen` recipe in
+    /// `notes/protocol.md`).
+    pub fn drain_until_quiet_live(
+        &mut self,
+        window_ms: u64,
+        max_windows: u32,
+    ) -> Result<(), String> {
+        self.drain_until_quiet_inner(window_ms, max_windows, true)
+    }
+
+    fn drain_until_quiet_inner(
+        &mut self,
+        window_ms: u64,
+        max_windows: u32,
+        keepalive: bool,
+    ) -> Result<(), String> {
         let mut last = self.raw.len();
+        let mut last_hb = std::time::Instant::now();
+        // The first window fires a heartbeat unconditionally on the live variant: the
+        // caller reaches a drain only after a quiet stretch (a failed strict harvest).
+        let mut first = true;
         for _ in 0..max_windows {
+            if keepalive && (first || last_hb.elapsed().as_millis() as u64 >= 250) {
+                self.heartbeat()?;
+                last_hb = std::time::Instant::now();
+                first = false;
+            }
             self.pump_collect(window_ms)?;
             if self.raw.len() == last {
                 return Ok(());
@@ -1292,13 +1334,40 @@ impl Session {
     /// NOT for the leveller/probe/clear call sites — they shape their own bursts
     /// and a re-arm would clobber their accumulator timing; they stay on the
     /// tolerant `list_my_presets`.
+    ///
+    /// The retry drain is the HEARTBEAT-BEARING [`Self::drain_until_quiet_live`]:
+    /// the original silent `drain_until_quiet(250, 20)` (up to 5 s with no
+    /// heartbeat) lapsed the session that was about to become the monitor's live
+    /// session — every one of the 2026-08-22 `connectionError` storms (fw 1.8.58)
+    /// started ≤1 s after a reconnect whose strict list retried or failed.
     pub fn list_my_presets_strict(&mut self) -> Result<Vec<PresetEntry>, String> {
+        self.list_my_presets_strict_checked()
+            .map(|(entries, _)| entries)
+    }
+
+    /// [`Self::list_my_presets_strict`] that also reports COMPLETENESS: `true`
+    /// when the list was proven complete by the terminal-frame strict decode,
+    /// `false` when the tolerant longest-wins fallback was served (tail may be
+    /// truncated — the caller must not let it replace a known-complete list; see
+    /// `monitor::merge_startup_presets`).
+    pub fn list_my_presets_strict_checked(&mut self) -> Result<(Vec<PresetEntry>, bool), String> {
         let mut names = self.harvest_preset_list_strict();
-        for _attempt in 0..2 {
+        for attempt in 0..2 {
             if names.is_some() {
                 break;
             }
-            self.drain_until_quiet(250, 20)?;
+            log::info!(
+                "list_my_presets_strict: no complete decode in the handshake reports — \
+                 keepalive drain + re-arm retry {}/2",
+                attempt + 1
+            );
+            // Keepalive drain: keeps live-controller status through the quiet wait.
+            // The bare re-arm below can draw ONE `connectionError` on a live
+            // session (HW 1.8.45, `probe --slotread-live`); that is a single body,
+            // well under the monitor's lapse threshold, and the re-arm is still
+            // the only recipe the device answers a batch-bearing
+            // `preset_list_request` on outside the full handshake.
+            self.drain_until_quiet_live(250, 20)?;
             self.send_and_collect(&proto::connection_request(), 100)?;
             self.send_and_collect(&proto::preset_list_request(1, 1), 200)?;
             for _ in 0..4 {
@@ -1306,24 +1375,25 @@ impl Session {
                     names = Some(found);
                     break;
                 }
+                self.heartbeat()?;
                 self.pump_collect(250)?;
             }
         }
-        let names = match names {
-            Some(n) => n,
+        match names {
+            Some(n) => Ok((preset_entries(n), true)),
             None => {
                 let tolerant = self
                     .best_preset_list()
                     .ok_or_else(|| "no PresetListResponse received from device".to_string())?;
                 log::warn!(
-                    "list_my_presets_strict: no complete decode after retries; serving the \
-                     tolerant longest-wins list ({} records — tail may be truncated)",
+                    "list_my_presets_strict: no complete decode after retries; serving a \
+                     PARTIAL list ({} records, tail may be truncated) — the snapshot \
+                     policy keeps any previous complete list instead",
                     tolerant.len()
                 );
-                tolerant
+                Ok((preset_entries(tolerant), false))
             }
-        };
-        Ok(preset_entries(names))
+        }
     }
 
     /// Best My-Presets list decoded from all reports accumulated so far. Tries BOTH
@@ -3300,6 +3370,112 @@ pub(crate) fn extract_level_candidates(v: &serde_json::Value) -> Vec<LevelBlock>
         }
     }
     out
+/// Doctor's `dspUnitParameters` allowlist (see [`GraphNode::params`]): reverb
+/// mix names + cab low/high cut (hpf/lpf) + graphic-EQ band gains + the
+/// tone-stack / parametric keys the balance plan drives
+/// (`doctor_plan::is_tone_param_key`). ONE predicate for the base graph and
+/// the scene overlays, so a scene's knob value is harvested iff the base's is.
+pub(crate) fn doctor_param_allowed(k: &str) -> bool {
+    k == "mix"
+        || k == "wetdrymix"
+        || k == "hpf"
+        || k == "lpf"
+        || (k.starts_with("gain") && k.ends_with("hz"))
+        || crate::doctor_plan::is_tone_param_key(k)
+}
+
+/// The allowlisted numeric params of one `dspUnitParameters` object.
+fn doctor_params(
+    o: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::HashMap<String, f64> {
+    o.iter()
+        .filter(|(k, _)| doctor_param_allowed(k))
+        .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+        .collect()
+}
+
+/// One node's SPARSE overlay in one saved scene (`scenes[i].{guitarNodes,micNodes}
+/// .<group>.<FenderId|nodeId>.dspUnitParameters`): the scene's `bypass` when it
+/// carries one, plus EVERY numeric param the entry carries (not just the Doctor
+/// allowlist — an overlay entry is already sparse, and a scene WRITE needs the
+/// entry's whole key set: HW fw 1.8.58, 2026-08-22, a `changeParameter` on a node
+/// whose entry lacks the key leaks to BASE, and the Scene Edit enable that makes
+/// it land RESEEDS the entry from base, so the writer replays the entry's own
+/// keys over the reseed — `commands::doctor::apply_doctor_ops`,
+/// `leveller::set_knobs`).
+/// Resolved to the base graph's `node_id` so the Doctor can lay it over
+/// `ActiveGraph.nodes` (`doctor::effective_nodes`) and diagnose/prescribe
+/// against the blocks and knob values the SCENE actually runs — a scene that
+/// bypasses the drive or re-voices the amp is a different chain from base.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
+pub struct SceneNodeOverlay {
+    pub group_id: String,
+    pub node_id: String,
+    /// `Some` only when the overlay carries `bypass`; `None` keeps the base state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypassed: Option<bool>,
+    #[serde(default)]
+    pub params: std::collections::HashMap<String, f64>,
+}
+
+/// Every saved scene's node overlays, indexed by the 0-based `scenes[]` wire
+/// index (the same index `DoctorInput.scene` / `load_scene` use). A scene slot
+/// that isn't an object (truncated read) yields an empty list — the base graph
+/// then stands in, exactly as before overlays existed. Overlay keys are the
+/// node's `FenderId` with a `nodeId` fallback (the same resolution
+/// `overlay_scene_onto_graph` / `scene_overlay` use), matched within the
+/// overlay's OWN group, so a model duplicated across groups can't cross-talk.
+pub(crate) fn extract_scene_overlays(v: &serde_json::Value) -> Vec<Vec<SceneNodeOverlay>> {
+    let Some(scenes) = v.get("scenes").and_then(|s| s.as_array()) else {
+        return Vec::new();
+    };
+    let roster = crate::audiograph::roster(v);
+    scenes
+        .iter()
+        .map(|scene| {
+            let mut out = Vec::new();
+            for graph in ["guitarNodes", "micNodes"] {
+                let Some(groups) = scene.get(graph).and_then(|g| g.as_object()) else {
+                    continue;
+                };
+                let mut group_keys: Vec<&String> = groups.keys().collect();
+                group_keys.sort();
+                for group in group_keys {
+                    let Some(nodes) = groups[group].as_object() else {
+                        continue;
+                    };
+                    for (id, body) in nodes {
+                        let Some(dsp) = body.get("dspUnitParameters").and_then(|p| p.as_object())
+                        else {
+                            continue;
+                        };
+                        // FenderId first, nodeId fallback — within this group.
+                        let node_id = roster
+                            .iter()
+                            .find(|(g, _, fid)| g == group && fid == id)
+                            .or_else(|| roster.iter().find(|(g, nid, _)| g == group && nid == id))
+                            .map(|(_, nid, _)| nid.clone());
+                        let Some(node_id) = node_id else { continue };
+                        let bypassed = dsp.get("bypass").and_then(|b| b.as_bool());
+                        let params: std::collections::HashMap<String, f64> = dsp
+                            .iter()
+                            .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
+                            .collect();
+                        if bypassed.is_none() && params.is_empty() {
+                            continue;
+                        }
+                        out.push(SceneNodeOverlay {
+                            group_id: group.clone(),
+                            node_id,
+                            bypassed,
+                            params,
+                        });
+                    }
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 /// Walk decoded preset JSON into an [`ActiveGraph`] for the active-preset signal chain strip: every
@@ -3360,23 +3536,12 @@ pub(crate) fn extract_active_graph(
                     .and_then(|p| p.get("cabsim2enabled"))
                     .and_then(|b| b.as_bool());
                 // Doctor's allowlist: reverb mix names + cab low/high cut
-                // (hpf/lpf) + EQ-10 band gains (see the GraphNode.params doc) —
-                // numeric values only.
-                let keep = |k: &str| {
-                    k == "mix"
-                        || k == "wetdrymix"
-                        || k == "hpf"
-                        || k == "lpf"
-                        || (k.starts_with("gain") && k.ends_with("hz"))
-                };
-                let node_params: std::collections::HashMap<String, f64> = params
+                // (hpf/lpf) + graphic-EQ band gains + the tone-stack / parametric
+                // keys the balance plan drives (`doctor_plan::is_tone_param_key`;
+                // see the GraphNode.params doc) — numeric values only.
+                let node_params = params
                     .and_then(|p| p.as_object())
-                    .map(|o| {
-                        o.iter()
-                            .filter(|(k, _)| keep(k))
-                            .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
-                            .collect()
-                    })
+                    .map(doctor_params)
                     .unwrap_or_default();
                 blocks.push(GraphNode {
                     group_id: group_id.clone(),
@@ -3852,6 +4017,70 @@ mod tests {
                 blocks: g.nodes.clone()
             }]
         );
+    }
+
+    /// Scene overlays resolve to base node ids (FenderId key, nodeId fallback,
+    /// within the overlay's own group), carry `bypass` only when the scene
+    /// sets it, and harvest every numeric param of the sparse entry.
+    #[test]
+    fn extract_scene_overlays_resolves_ids_and_allowlists_params() {
+        let v = serde_json::json!({
+            "audioGraph": { "guitarNodes": {
+                "G1": [
+                    { "nodeId": "drive1", "FenderId": "ACD_TubeScreamer",
+                      "dspUnitParameters": { "bypass": false, "tone": 0.5, "level": 0.6 } },
+                    { "nodeId": "amp", "FenderId": "ACD_HiwattDR103CanModCabIR",
+                      "dspUnitParameters": { "bypass": false, "bass": 0.48, "treble": 0.27 } }
+                ],
+                "G3": [
+                    { "nodeId": "ACD_TMSpring63", "FenderId": "ACD_TMSpring63",
+                      "dspUnitParameters": { "bypass": true, "mix": 0.14 } }
+                ]
+            } },
+            "scenes": [
+                { "name": "Clean", "guitarNodes": {
+                    "G1": {
+                        // FenderId-keyed: bypass + a tone knob + a non-allowlisted level.
+                        "ACD_TubeScreamer": { "dspUnitParameters": { "bypass": true, "level": 0.9 } },
+                        // Re-voiced amp, no bypass key → bypassed stays None.
+                        "ACD_HiwattDR103CanModCabIR": { "dspUnitParameters": { "bass": 0.3, "treble": 0.6, "mastervolume": 0.4 } }
+                    },
+                    // nodeId-keyed fallback.
+                    "G3": { "ACD_TMSpring63": { "dspUnitParameters": { "bypass": false, "mix": 0.4 } } }
+                } },
+                // A scene with no node overlay at all → empty.
+                { "name": "Same as base" },
+                // A truncated/non-object scene slot → empty, never a panic.
+                null
+            ]
+        });
+        let ov = extract_scene_overlays(&v);
+        assert_eq!(ov.len(), 3);
+        assert_eq!(ov[1], Vec::new());
+        assert_eq!(ov[2], Vec::new());
+        let clean = &ov[0];
+        let find = |node: &str| clean.iter().find(|o| o.node_id == node).expect(node);
+        let drive = find("drive1");
+        assert_eq!(drive.group_id, "G1");
+        assert_eq!(drive.bypassed, Some(true));
+        // EVERY numeric key of the sparse entry rides along (a scene write replays
+        // them over the Scene Edit reseed) — not just the Doctor allowlist.
+        assert_eq!(drive.params.get("level"), Some(&0.9), "{drive:?}");
+        let amp = find("amp");
+        assert_eq!(amp.bypassed, None);
+        assert_eq!(amp.params.get("bass"), Some(&0.3));
+        assert_eq!(amp.params.get("treble"), Some(&0.6));
+        assert_eq!(amp.params.get("mastervolume"), Some(&0.4));
+        let spring = find("ACD_TMSpring63");
+        assert_eq!(spring.group_id, "G3");
+        assert_eq!(spring.bypassed, Some(false));
+        assert_eq!(spring.params.get("mix"), Some(&0.4));
+        // The base graph's own harvest is untouched by the overlays.
+        let g = extract_active_graph(&v, None);
+        let base_amp = g.nodes.iter().find(|n| n.node_id == "amp").unwrap();
+        assert_eq!(base_amp.params.get("bass"), Some(&0.48));
+        // No scenes at all → empty, not an error.
+        assert!(extract_scene_overlays(&serde_json::json!({ "audioGraph": {} })).is_empty());
     }
 
     #[test]

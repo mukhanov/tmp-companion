@@ -57,5 +57,6 @@ export function backupRow(listIndex: number, name: string) {
     })),
     graph: g,
     footswitches: [],
+    scene_overlays: [],
   };
 }

@@ -125,14 +125,40 @@ fn doctor_footswitch_is_optional_and_echoes_to_result() {
         balance_db: Vec::new(),
         band_labels: Vec::new(),
         cut_through: None,
+        plan: None,
         error: None,
         skipped_band_count: 0,
     };
     let v = serde_json::to_value(&row).unwrap();
     assert_eq!(v["footswitch"], 0);
+    // Same explicit-null contract for the balance plan.
+    assert_eq!(v["plan"], serde_json::Value::Null);
     // cutThrough serializes as an explicit null (never an omitted key) when
     // this sound has no estimate — errored sounds, degenerate ratios.
     assert_eq!(v["cutThrough"], serde_json::Value::Null);
+}
+
+/// `DoctorInput.sceneOverlay` rides camelCase on the wire with snake_case
+/// node fields (the `GraphNode` convention), and defaults to empty for a
+/// pre-overlay payload.
+#[test]
+fn doctor_input_scene_overlay_deserializes_and_defaults_empty() {
+    let js = r#"{ "key": "s4:1", "listIndex": 4, "scene": 1, "label": "Lead",
+        "sceneOverlay": [
+            { "group_id": "G1", "node_id": "amp", "bypassed": false, "params": { "bass": 0.3 } },
+            { "group_id": "G1", "node_id": "drive1", "params": {} }
+        ] }"#;
+    let input: DoctorInput = serde_json::from_str(js).expect("deserializes");
+    assert_eq!(input.scene_overlay.len(), 2);
+    assert_eq!(input.scene_overlay[0].bypassed, Some(false));
+    assert_eq!(input.scene_overlay[0].params.get("bass"), Some(&0.3));
+    assert_eq!(input.scene_overlay[1].bypassed, None);
+    let bare = r#"{ "key": "p4", "listIndex": 4, "label": "Base" }"#;
+    let input: DoctorInput = serde_json::from_str(bare).expect("deserializes");
+    assert!(input.scene_overlay.is_empty());
+    let job = r#"{ "listIndex": 4, "name": "Lead", "ops": [] }"#;
+    let job: DoctorApplyJob = serde_json::from_str(job).expect("deserializes");
+    assert!(job.scene_overlay.is_empty());
 }
 
 /// `DoctorSoundResult.cutThrough` carries the estimate's three fields
@@ -156,6 +182,7 @@ fn doctor_sound_result_cut_through_serializes_camel_case() {
             factory_percentile: Some(63.2),
             advisory: false,
         }),
+        plan: None,
         error: None,
         skipped_band_count: 0,
     };
@@ -170,10 +197,54 @@ fn doctor_apply_result_serializes_camel_case() {
     let r = DoctorApplyResult {
         before_clip: "data:audio/wav;base64,AAA".into(),
         after_clip: "data:audio/wav;base64,BBB".into(),
+        measured: Some(ApplyMeasure {
+            band_labels: vec!["Lows".into()],
+            before_balance_db: vec![1.0],
+            after_balance_db: vec![-0.5],
+            delta_db: vec![-1.5],
+            loudness_delta_db: 0.25,
+        }),
     };
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["beforeClip"], "data:audio/wav;base64,AAA");
     assert_eq!(v["afterClip"], "data:audio/wav;base64,BBB");
+    assert_eq!(v["measured"]["bandLabels"][0], "Lows");
+    assert_eq!(v["measured"]["deltaDb"][0], -1.5);
+    assert_eq!(v["measured"]["loudnessDeltaDb"], 0.25);
+    // A failed band analysis serializes as an explicit null (clips still play).
+    let r = DoctorApplyResult {
+        measured: None,
+        ..r
+    };
+    assert_eq!(
+        serde_json::to_value(&r).unwrap()["measured"],
+        serde_json::Value::Null
+    );
+}
+
+/// `apply_capture_balance` on a synthetic capture: a flat-ish noise burst
+/// measures finite balances, and a silent buffer (−inf LUFS) yields `None`
+/// rather than poisoning the A/B numbers.
+#[test]
+fn apply_capture_balance_measures_noise_and_rejects_silence() {
+    let rate = 48_000u32;
+    let n = rate as usize * 2;
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let noise: Vec<f32> = (0..n)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed % 20_001) as f32 / 10_000.0 - 1.0) * 0.3
+        })
+        .collect();
+    let (bal, lufs) = apply_capture_balance(&noise, &noise, rate, doctor::Family::Guitar)
+        .expect("a noise capture measures");
+    assert_eq!(bal.len(), 6);
+    assert!(bal.iter().all(|b| b.is_finite()));
+    assert!(lufs.is_finite() && lufs < 0.0, "{lufs}");
+    let silence = vec![0.0f32; n];
+    assert!(apply_capture_balance(&noise, &silence, rate, doctor::Family::Guitar).is_none());
 }
 
 // ── doctor_force_bypass: isolation force-list per sound (base / footswitch) ──
@@ -581,8 +652,8 @@ fn before_cache_hits_only_the_exact_sound_and_stimulus() {
         None,
         None,
     );
-    before_cache_put(key.clone(), "clip-a".into());
-    assert_eq!(before_cache_get(&key), Some("clip-a".into()));
+    before_cache_put(key.clone(), ("clip-a".into(), None));
+    assert_eq!(before_cache_get(&key), Some(("clip-a".into(), None)));
     // Any identity change misses: renamed preset, different stimulus, different cal.
     assert_eq!(
         before_cache_get(&(
@@ -665,7 +736,7 @@ fn hpf_op() -> Vec<doctor::DoctorOp> {
 fn apply_ops_under_scene_recalls_before_writing() {
     let sim = crate::sim_device::SimDevice::new();
     let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
-    apply_ops_under_scene(&mut s, Some(2), &hpf_op()).expect("apply_ops_under_scene");
+    apply_ops_under_scene(&mut s, Some(2), &hpf_op(), &[]).expect("apply_ops_under_scene");
     let ev = sim.events();
     let scene_edit_pos = ev
         .iter()
@@ -690,7 +761,7 @@ fn apply_ops_under_scene_recalls_base_explicitly_for_none() {
     let sim = crate::sim_device::SimDevice::new().with_saved_scene(0, Some(3));
     let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
     s.load_preset(0).expect("load_preset"); // activates saved scene 3, not base
-    apply_ops_under_scene(&mut s, None, &hpf_op()).expect("apply_ops_under_scene");
+    apply_ops_under_scene(&mut s, None, &hpf_op(), &[]).expect("apply_ops_under_scene");
     let ev = sim.events();
     assert!(
         ev.iter().any(|e| matches!(
@@ -703,4 +774,153 @@ fn apply_ops_under_scene_recalls_base_explicitly_for_none() {
         )),
         "a None scene must write base, not the leftover saved scene 3: {ev:?}"
     );
+}
+
+// ── overlay-aware scene writes (HW fw 1.8.58, 2026-08-22 three-cell matrix) ──────
+
+fn overlay(
+    node: &str,
+    bypassed: Option<bool>,
+    params: &[(&str, f64)],
+) -> session::SceneNodeOverlay {
+    session::SceneNodeOverlay {
+        group_id: "G1".into(),
+        node_id: node.into(),
+        bypassed,
+        params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+    }
+}
+
+fn wire_trace(sim: &crate::sim_device::SimDevice) -> Vec<String> {
+    sim.events()
+        .iter()
+        .filter_map(|e| match e {
+            crate::sim_device::SimEvent::SceneEdit { node, enable, .. } => {
+                Some(format!("edit:{node}={enable}"))
+            }
+            crate::sim_device::SimEvent::Bypass { node, on } => Some(format!("bypass:{node}={on}")),
+            crate::sim_device::SimEvent::ChangeParameter {
+                node, param, value, ..
+            } => Some(format!("param:{node}.{param}={value:.2}")),
+            _ => None,
+        })
+        .collect()
+}
+
+// The entry carries the key → the plain write, no enable (cell "present with key":
+// slot-196 scenes 1/2 persisted through exactly this shape).
+#[test]
+fn doctor_scene_write_is_bare_when_the_overlay_entry_has_the_key() {
+    let sim = crate::sim_device::SimDevice::new();
+    let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+    let ov = [overlay("amp", Some(false), &[("hpf", 20.0), ("bass", 0.5)])];
+    apply_ops_under_scene(&mut s, Some(1), &hpf_op(), &ov).expect("apply");
+    assert_eq!(wire_trace(&sim), vec!["param:amp.hpf=90.00"]);
+}
+
+// A sparse entry without the key: a bare write would leak to base (cell 1) and a bare
+// enable reseeds the entry from base (cell 2) — so enable, replay the entry's own keys
+// (bypass on the bool wire first, numerics sorted), then the write (cell 3).
+#[test]
+fn doctor_scene_write_enables_and_replays_a_key_less_entry() {
+    let sim = crate::sim_device::SimDevice::new();
+    let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+    let ov = [overlay("amp", Some(false), &[("gain", 0.3)])];
+    let ops = vec![
+        doctor::DoctorOp::Param {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            param: "bass".into(),
+            value: 0.4,
+        },
+        // A second write on the SAME node must not re-enable (a second reseed would
+        // wipe the first write).
+        doctor::DoctorOp::Param {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            param: "treb".into(),
+            value: 0.6,
+        },
+    ];
+    apply_ops_under_scene(&mut s, Some(0), &ops, &ov).expect("apply");
+    assert_eq!(
+        wire_trace(&sim),
+        vec![
+            "edit:amp=true",
+            "bypass:amp=false",
+            "param:amp.gain=0.30",
+            "param:amp.bass=0.40",
+            "param:amp.treb=0.60",
+        ]
+    );
+}
+
+// No entry for the node in this scene → enable (nothing to replay), then the write.
+#[test]
+fn doctor_scene_write_enables_when_the_node_has_no_overlay_entry() {
+    let sim = crate::sim_device::SimDevice::new();
+    let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+    let ov = [overlay("other", Some(true), &[])];
+    apply_ops_under_scene(&mut s, Some(2), &hpf_op(), &ov).expect("apply");
+    assert_eq!(
+        wire_trace(&sim),
+        vec!["edit:amp=true", "param:amp.hpf=90.00"]
+    );
+}
+
+// Base writes never touch Scene Edit, whatever the overlay says.
+#[test]
+fn doctor_base_write_never_enables_scene_edit() {
+    let sim = crate::sim_device::SimDevice::new();
+    let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
+    let ov = [overlay("other", Some(true), &[])];
+    apply_ops_under_scene(&mut s, None, &hpf_op(), &ov).expect("apply");
+    assert_eq!(wire_trace(&sim), vec!["param:amp.hpf=90.00"]);
+}
+
+// The save witness: the first Param op, scene-scoped; an insert contributes its first
+// param under the fresh node's id; nothing to witness → None.
+#[test]
+fn doctor_save_witness_picks_the_first_param_scoped_to_the_scene() {
+    let w = doctor_save_witness(&hpf_op(), Some(3)).expect("witness");
+    match w {
+        leveller::SaveWitness::Param {
+            node,
+            param,
+            value,
+            scene,
+            ..
+        } => {
+            assert_eq!(
+                (node.as_str(), param.as_str(), scene),
+                ("amp", "hpf", Some(3))
+            );
+            assert!((value - 90.0).abs() < 1e-6);
+        }
+        other => panic!("unexpected witness {other:?}"),
+    }
+    let insert = vec![doctor::DoctorOp::InsertNode {
+        group_id: "G2".into(),
+        before_fender_id: None,
+        fender_id: "ACD_TenBandEQStereo".into(),
+        params: vec![("gain250hz".into(), -3.0)],
+    }];
+    match doctor_save_witness(&insert, None).expect("witness") {
+        leveller::SaveWitness::Param {
+            node, param, scene, ..
+        } => {
+            assert_eq!(
+                (node.as_str(), param.as_str(), scene),
+                ("ACD_TenBandEQStereo", "gain250hz", None)
+            );
+        }
+        other => panic!("unexpected witness {other:?}"),
+    }
+    let bare_insert = vec![doctor::DoctorOp::InsertNode {
+        group_id: "G2".into(),
+        before_fender_id: None,
+        fender_id: "ACD_DynaComp".into(),
+        params: vec![],
+    }];
+    assert!(doctor_save_witness(&bare_insert, None).is_none());
 }

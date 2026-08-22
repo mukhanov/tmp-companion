@@ -11,10 +11,12 @@ import type {
   BackupReadResult,
   FootswitchInfo,
 } from "../lib/types";
+import type { ActiveGraph, BackupReadResult, GraphNode } from "../lib/types";
 import {
   ensureLibraryScan,
   getLibraryScan,
   invalidateLibrarySongs,
+  patchLibraryAfterDoctorSave,
   resetLibraryScan,
 } from "../views/level/libraryScan";
 
@@ -40,6 +42,7 @@ const row = (slot: number, name: string) => ({
   blocks: [],
   graph: emptyGraph,
   footswitches: [],
+  scene_overlays: [],
   silence_hint: null,
   scene_handles: [],
   base_handles: [],
@@ -87,6 +90,38 @@ describe("libraryScan — songs↔presets axis data", () => {
 
     expect(lib.silenceHintByIndex.get(7)).toBe("amp_zero");
     expect(lib.silenceHintByIndex.has(57)).toBe(false);
+  });
+
+  it("keys saved-scene node overlays by 0-based list index, only for rows that have any", async () => {
+    const overlays = [
+      [
+        {
+          group_id: "G1",
+          node_id: "amp",
+          bypassed: false,
+          params: { bass: 0.3 },
+        },
+      ],
+      [],
+    ];
+    const backup: BackupReadResult = {
+      ...BACKUP,
+      presets: [
+        { ...row(8, "Plexi Crunch"), scene_overlays: overlays },
+        row(58, "Stadium Lead"),
+      ],
+    };
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === "read_library_via_backup"
+        ? Promise.resolve(backup)
+        : Promise.resolve(null),
+    );
+
+    await ensureLibraryScan();
+    const lib = getLibraryScan();
+
+    expect(lib.sceneOverlaysByIndex.get(7)).toEqual(overlays);
+    expect(lib.sceneOverlaysByIndex.has(57)).toBe(false);
   });
 
   it("derives the preset list + song→preset map from one backup", async () => {
@@ -328,5 +363,127 @@ describe("libraryScan — detach mid-scan (generation guard)", () => {
       { slot: 7, name: "Plexi Crunch" },
       { slot: 57, name: "Stadium Lead" },
     ]);
+  });
+});
+
+describe("patchLibraryAfterDoctorSave — the cached scan follows a saved prescription", () => {
+  const amp: GraphNode = {
+    group_id: "G1",
+    node_id: "amp",
+    model: "ACD_TwinReverb65NoFx",
+    bypassed: false,
+    params: { bass: 0.6, treb: 0.5 },
+  };
+
+  beforeEach(() => {
+    resetLibraryScan();
+    vi.mocked(invoke).mockReset();
+  });
+
+  async function seed(
+    sceneOverlays: BackupReadResult["presets"][number]["scene_overlays"],
+  ) {
+    const backup: BackupReadResult = {
+      ...BACKUP,
+      presets: [
+        {
+          ...row(8, "Plexi Crunch"),
+          graph: { ...emptyGraph, nodes: [amp] },
+          scene_overlays: sceneOverlays,
+        },
+      ],
+    };
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === "read_library_via_backup"
+        ? Promise.resolve(backup)
+        : Promise.resolve(null),
+    );
+    await ensureLibraryScan();
+  }
+
+  it("patches base-graph params and appends an inserted node for a base save", async () => {
+    await seed([]);
+    patchLibraryAfterDoctorSave(7, null, [
+      {
+        kind: "param",
+        groupId: "G1",
+        nodeId: "amp",
+        param: "bass",
+        value: 0.4,
+      },
+      {
+        kind: "insert_node",
+        groupId: "G3",
+        beforeFenderId: null,
+        fenderId: "ACD_TenBandEQStereo",
+        params: [["gain250hz", -3]],
+      },
+    ]);
+    const nodes = getLibraryScan().graphByIndex.get(7)?.nodes ?? [];
+    expect(nodes[0]?.params).toEqual({ bass: 0.4, treb: 0.5 });
+    expect(nodes[1]).toEqual({
+      group_id: "G3",
+      node_id: "ACD_TenBandEQStereo",
+      model: "ACD_TenBandEQStereo",
+      bypassed: false,
+      params: { gain250hz: -3 },
+    });
+    // The seeded row object is not mutated in place (new Map + new node objects).
+    expect(amp.params.bass).toBe(0.6);
+  });
+
+  it("patches the scene overlay entry, creating it when the node had none", async () => {
+    await seed([
+      [
+        {
+          group_id: "G1",
+          node_id: "amp",
+          bypassed: false,
+          params: { bass: 0.3 },
+        },
+      ],
+      [],
+    ]);
+    patchLibraryAfterDoctorSave(7, 0, [
+      {
+        kind: "param",
+        groupId: "G1",
+        nodeId: "amp",
+        param: "bass",
+        value: 0.2,
+      },
+    ]);
+    patchLibraryAfterDoctorSave(7, 1, [
+      {
+        kind: "param",
+        groupId: "G1",
+        nodeId: "amp",
+        param: "treb",
+        value: 0.7,
+      },
+    ]);
+    const ov = getLibraryScan().sceneOverlaysByIndex.get(7) ?? [];
+    expect(ov[0]?.[0]?.params).toEqual({ bass: 0.2 });
+    expect(ov[1]).toEqual([
+      { group_id: "G1", node_id: "amp", params: { treb: 0.7 } },
+    ]);
+    // Base params untouched by a scene save.
+    expect(getLibraryScan().graphByIndex.get(7)?.nodes[0]?.params.bass).toBe(
+      0.6,
+    );
+  });
+
+  it("is a no-op for a preset the scan doesn't know", async () => {
+    await seed([]);
+    patchLibraryAfterDoctorSave(99, null, [
+      {
+        kind: "param",
+        groupId: "G1",
+        nodeId: "amp",
+        param: "bass",
+        value: 0.4,
+      },
+    ]);
+    expect(getLibraryScan().graphByIndex.has(99)).toBe(false);
   });
 });

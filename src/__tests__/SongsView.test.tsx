@@ -420,6 +420,7 @@ const pRow = (slot: number, name: string) => ({
   blocks: [],
   graph: emptyGraph,
   footswitches: [],
+  scene_overlays: [],
   silence_hint: null,
   scene_handles: [],
   base_handles: [],

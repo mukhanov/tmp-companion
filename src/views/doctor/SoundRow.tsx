@@ -18,6 +18,8 @@ import { DiagnosisChip } from "./DiagnosisChip";
 import { LevelIndicator } from "./LevelIndicator";
 import { MatchCard } from "./MatchCard";
 import { PrescriptionCard, type DoctorStimulus } from "./PrescriptionCard";
+import { TonePlanCard } from "./TonePlanCard";
+import { TuneCard } from "./TuneCard";
 import { bandLayoutsMatch } from "./matchModel";
 import { offbranchStatus } from "../level/leveling";
 import {
@@ -32,9 +34,11 @@ import {
 import type {
   DoctorDiag,
   DoctorSoundResult,
+  DoctorTonePlan,
   FootswitchInfo,
   GraphNode,
   SilenceHint,
+  SceneNodeOverlay,
 } from "../../lib/types";
 
 /** The Doctor capture's own silent-inject error string (`leveller::NO_SIGNAL_CAPTURED`,
@@ -103,21 +107,23 @@ export function SevDot({ sev }: SevDotProps) {
 
 // ---- shared-block detection (hoisted from PrescriptionCard) -----------------
 
-/** True when any fix on any of this sound's diagnoses touches a block OUTSIDE the
- *  footswitch's own toggled set — i.e. a shared block whose edit affects every
- *  sound of the preset. Only possible for FS sounds (`ownNodeIds != null`). */
+/** True when any fix on any of this sound's diagnoses — or the balance plan's
+ *  moves — touches a block OUTSIDE the footswitch's own toggled set, i.e. a
+ *  shared block whose edit affects every sound of the preset. Only possible
+ *  for FS sounds (`ownNodeIds != null`). */
 function affectsSharedBlock(
   diags: DoctorDiag[],
+  plan: DoctorTonePlan | null,
   ownNodeIds: string[] | undefined,
 ): boolean {
   if (ownNodeIds == null) return false;
-  return diags.some((d) =>
-    d.rx.some((rx) =>
-      rx.ops.some((op) => {
-        const n = op.kind === "param" ? op.nodeId : op.fenderId;
-        return !ownNodeIds.includes(n);
-      }),
-    ),
+  const rxs = diags.flatMap((d) => d.rx);
+  if (plan) rxs.push(plan.rx);
+  return rxs.some((rx) =>
+    rx.ops.some((op) => {
+      const n = op.kind === "param" ? op.nodeId : op.fenderId;
+      return !ownNodeIds.includes(n);
+    }),
   );
 }
 
@@ -135,6 +141,9 @@ export interface SoundRowProps {
    *  sound's own blocks). */
   nodes: GraphNode[];
   footswitches: FootswitchInfo[];
+  /** This sound's saved-scene node overlay (empty for base/FS sounds) — its
+   *  cards hand it to the A/B so the capture runs the chain the check read. */
+  sceneOverlay?: SceneNodeOverlay[];
   /** The stimulus identity this sound was diagnosed with (setup-stage
    *  instrument pick) — its prescription cards' A/B replays it. */
   stimulus?: DoctorStimulus;
@@ -163,6 +172,7 @@ export function SoundRow({
   ownNodeIds,
   nodes,
   footswitches,
+  sceneOverlay = [],
   stimulus,
   silenceHint,
   open,
@@ -189,7 +199,8 @@ export function SoundRow({
   // Worst-first, confident above "possible" — one order for the chips + panels.
   const diags = sortedDiags(sound.diags);
   const hotBands = [...new Set(diags.flatMap((d) => d.bands))];
-  const shared = hasDiags && affectsSharedBlock(sound.diags, ownNodeIds);
+  const shared =
+    hasDiags && affectsSharedBlock(sound.diags, sound.plan, ownNodeIds);
   const lufsOk = Number.isFinite(sound.integratedLufs);
   // A clean sound still expands — to show its cut-through read or let the
   // player pick it as the Match reference. Only an errored capture (no
@@ -530,6 +541,7 @@ export function SoundRow({
                       soundFootswitch={sound.footswitch}
                       nodes={nodes}
                       footswitches={footswitches}
+                      sceneOverlay={sceneOverlay}
                       stimulus={stimulus}
                     />
                   ))}
@@ -537,6 +549,29 @@ export function SoundRow({
               </div>
             );
           })}
+          {sound.plan && (
+            <TonePlanCard
+              sound={sound}
+              plan={sound.plan}
+              listIndex={listIndex}
+              presetName={presetName}
+              nodes={nodes}
+              footswitches={footswitches}
+              sceneOverlay={sceneOverlay}
+              stimulus={stimulus}
+            />
+          )}
+          {hasDiags && (
+            <TuneCard
+              sound={sound}
+              listIndex={listIndex}
+              presetName={presetName}
+              nodes={nodes}
+              footswitches={footswitches}
+              sceneOverlay={sceneOverlay}
+              stimulus={stimulus}
+            />
+          )}
           {sound.cutThrough && <CutThroughCard cutThrough={sound.cutThrough} />}
           {canMatch && (
             <MatchCard
@@ -546,6 +581,7 @@ export function SoundRow({
               presetName={presetName}
               nodes={nodes}
               footswitches={footswitches}
+              sceneOverlay={sceneOverlay}
               stimulus={stimulus}
             />
           )}
