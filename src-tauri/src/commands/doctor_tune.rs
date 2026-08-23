@@ -237,6 +237,8 @@ fn step_result(
                     })
                     .collect(),
                 loudness_delta_db: c.lufs - base.lufs,
+                balance_error_before_db: balance_error(&base.profile, &base.coverage, sess.family),
+                balance_error_after_db: balance_error(&c.profile, &c.coverage, sess.family),
                 rx: doctor::Rx {
                     kind: doctor::RxKind::OneClick,
                     title: format!("Round {}", sess.round),
@@ -317,6 +319,18 @@ fn step_result(
     }
 }
 
+/// A round's measured distance to the authored balance (`doctor_plan::balance_error_db`
+/// at the polish tolerance), off its own capture.
+fn balance_error(profile: &doctor::SoundProfile, coverage: &[bool], family: doctor::Family) -> f64 {
+    let bdb = doctor::band_db(&profile.bands);
+    let dev = doctor::anchor_deviations(
+        doctor::deviations(&bdb, family),
+        profile.stim_bands.as_deref(),
+        family,
+    );
+    doctor_plan::balance_error_db(&dev, family, doctor_plan::POLISH_TOL_DB, Some(coverage))
+}
+
 /// "'65 Twin Reverb: Bass 6.0 → 4.0, Treble 5.0 → 5.5 · Greenbox 8: Tone 5.0 → 6.0".
 fn moves_line(moves: &[doctor_plan::PlanMove]) -> String {
     let mut by_block: Vec<(String, Vec<String>)> = Vec::new();
@@ -341,13 +355,22 @@ fn propose_and_measure(
     job: &DoctorApplyJob,
 ) -> Result<DoctorTuneStep, String> {
     let base_keys = doctor_tune::tonal_keys(&sess.baseline.diags);
-    if base_keys.is_empty() {
+    let base_error = balance_error(&sess.baseline.profile, &sess.baseline.coverage, sess.family);
+    // Converged = the coarse rules are quiet AND the balance sits inside the polish
+    // tolerance of the authored target. Quiet rules alone are not the end: the gates
+    // are ±3–4 dB wide, and "nothing left to fix" while the sound is still 3 dB off
+    // the reference is exactly what the loop exists to push past.
+    if base_keys.is_empty() && base_error <= 0.0 {
         sess.last = None;
         return Ok(step_result(
             sess,
             TuneStatus::Converged,
             None,
-            "No tonal finding is left on this sound — nothing more to move.".to_string(),
+            format!(
+                "No tonal finding is left and every band sits within ±{:.0} dB of the reference \
+                 balance — nothing more to move.",
+                doctor_plan::POLISH_TOL_DB
+            ),
         ));
     }
     let nodes_now = doctor_tune::nodes_with_ops(&sess.nodes, &sess.baseline.ops);
@@ -378,16 +401,19 @@ fn propose_and_measure(
     let Some((plan, note)) = proposal else {
         sess.last = None;
         let why = if sess.rejected_streak >= doctor_tune::MAX_VARIANTS {
-            "Every variant from here was turned down — this is as far as these knobs go. Keep what sounds best, or stop."
+            "Every variant from here was turned down — this is as far as these knobs go. Keep what sounds best, or stop.".to_string()
+        } else if base_keys.is_empty() {
+            format!(
+                "No tonal finding is left; the balance is still {base_error:.1} dB outside ±{:.0} dB of \
+                 the reference, but no move on this chain's knobs gets it closer by ≥ {:.2} dB. Keep \
+                 what sounds best, or stop.",
+                doctor_plan::POLISH_TOL_DB,
+                doctor_plan::POLISH_MIN_GAIN_DB
+            )
         } else {
-            "The model has nothing left to move on this chain (no drivable control, or no move that helps)."
+            "The model has nothing left to move on this chain (no drivable control, or no move that helps).".to_string()
         };
-        return Ok(step_result(
-            sess,
-            TuneStatus::Exhausted,
-            None,
-            why.to_string(),
-        ));
+        return Ok(step_result(sess, TuneStatus::Exhausted, None, why));
     };
     let ops = doctor_tune::merge_ops(&sess.baseline.ops, &plan.moves);
     sess.round += 1;
@@ -457,16 +483,17 @@ fn propose_and_measure(
                 .join(", ")
         )
     };
-    let msg = format!(
-        "Round {}: applied {} — listen, then say whether it's better.{}",
+    let after_error = sess
+        .last
+        .as_ref()
+        .map(|r| balance_error(&r.profile, &r.coverage, sess.family))
+        .unwrap_or(base_error);
+    let msg =
+        format!(
+        "Round {}: applied {} — balance error {base_error:.1} → {after_error:.1} dB (measured). \
+         Listen, then say whether it's better.{}",
         sess.round,
-        moves_line(
-            &sess
-                .last
-                .as_ref()
-                .map(|r| r.moves.clone())
-                .unwrap_or_default()
-        ),
+        moves_line(&sess.last.as_ref().map(|r| r.moves.clone()).unwrap_or_default()),
         learned
     );
     Ok(step_result(sess, TuneStatus::Candidate, Some(note), msg))

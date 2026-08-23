@@ -1112,6 +1112,11 @@ export interface DoctorTonePlan {
   remains: DoctorLeveledKey[];
   /** Predicted broadband loudness change (dB) — tone knobs move level too. */
   loudnessDeltaDb: number;
+  /** Distance to the authored balance beyond the ±1 dB polish tolerance
+   *  (`doctor_plan::balance_error_db`), before and after — 0 = inside it. The
+   *  tune loop drives this down past the coarse rule gates. */
+  balanceErrorBeforeDb: number;
+  balanceErrorAfterDb: number;
   rx: DoctorRx;
   model: string;
 }

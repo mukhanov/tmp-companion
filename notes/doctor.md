@@ -362,10 +362,21 @@ with discard → the stored preset is reloaded).
   rejected rounds moved; 3 halves the move cap; `MAX_VARIANTS` = 4 → "no
   further suggestion" (keep what was kept, or stop). An acceptance resets the
   streak.
+- **Polish mode** (`doctor_plan::generate_plan_mode` with `POLISH_TOL_DB` = 1):
+  the coarse rule gates are ±3–4 dB wide, so "no finding" is not "balanced".
+  The loop's objective adds a term pulling every body band's centered
+  deviation inside ±1 dB of the authored target and the Theil–Sen slope inside
+  ±1 dB/oct (weight 1, below a fired rule's 4), and a round is worth running
+  when it drops `balance_error_db` by ≥ 0.25 dB even with nothing fired. The
+  card prints "Distance to the reference balance: 3.2 → 1.1 dB beyond ±1 dB
+  (measured)" per round. (HW 2026-08-23: after one saved plan the rules were
+  quiet but the player still heard an unbalanced sound — the loop stopped at
+  "nothing left to fix"; this is the fix.)
 - **Termination**: `converged` when the baseline has no tonal finding
-  (`TONAL_KEYS`) left; `exhausted` when no proposal exists (no drivable
-  control, variants used up). Both offer "Save what I kept" when the baseline
-  carries edits.
+  (`TONAL_KEYS`) left AND sits inside the polish tolerance; `exhausted` when
+  no proposal exists (no drivable control, variants used up, or no move that
+  gains ≥ 0.25 dB). Both offer "Save what I kept" when the baseline carries
+  edits.
 - **Device discipline**: round 1 captures the SAVED sound after the
   lazy-commit barrier (`doctor_fresh_load`); every round = `restore_saved_preset`
   → `ops_session` (cumulative ops, overlay-aware) → `doctor_capture_on_session

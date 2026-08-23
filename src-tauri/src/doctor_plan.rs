@@ -612,7 +612,21 @@ pub struct Goal {
     air_minus_highs_db: f64,
     rules: Vec<Rule>,
     coverage: Option<Vec<bool>>,
+    /// POLISH: beyond the rule gates, pull every body band's centered
+    /// deviation inside ±tol dB of the authored target and the Theil–Sen
+    /// slope inside ±[`POLISH_TILT_DB_PER_OCT`] — the tune loop's "keep
+    /// improving" objective once (or even before) the coarse rules are quiet.
+    /// `None` = the one-shot plan (rules only).
+    polish_tol_db: Option<f64>,
 }
+
+/// The polish tilt tolerance (dB/oct) — a third of the dark/bright gate.
+pub const POLISH_TILT_DB_PER_OCT: f64 = 1.0;
+/// Weight of a polish band excess² (dB²) — below a fired rule (4) so a real
+/// finding is always cleared first, above collateral so it is worth moving for.
+const POLISH_WEIGHT: f64 = 1.0;
+/// The smallest drop in [`balance_error_db`] worth a polish round.
+pub const POLISH_MIN_GAIN_DB: f64 = 0.25;
 
 /// Safety margin (dB) inside every gate, so a predicted "clear" isn't a
 /// boundary coin-flip.
@@ -769,7 +783,56 @@ fn goal_for(
         air_minus_highs_db: bdb[air] - bdb[highs],
         rules,
         coverage: coverage.map(<[bool]>::to_vec),
+        polish_tol_db: None,
     }
+}
+
+/// Dead-zone residual: distance outside `[lo, hi]`, 0 inside.
+fn outside(v: f64, lo: f64, hi: f64) -> f64 {
+    if v > hi {
+        v - hi
+    } else if v < lo {
+        v - lo
+    } else {
+        0.0
+    }
+}
+
+/// The balance error of a deviation vector (dB): the largest centered body-band
+/// deviation beyond `tol`, and the Theil–Sen slope beyond the polish tilt
+/// tolerance scaled to band dB — 0 when the balance sits inside the tolerance.
+pub fn balance_error_db(dev: &[f64], family: Family, tol: f64, coverage: Option<&[bool]>) -> f64 {
+    let (lows, _, _, _, highs, _) = family.semantic_bands();
+    let centered = doctor::centered_deviations(dev, family);
+    let band = (lows..=highs)
+        .map(|i| outside(centered[i], -tol, tol).abs())
+        .fold(0.0, f64::max);
+    let (slope, _) = doctor::tilt_split(dev, family, coverage);
+    let tilt = slope.map_or(0.0, |s| {
+        outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT).abs() * TILT_DB_PER_OCT_SCALE
+    });
+    band.max(tilt)
+}
+
+/// The polish objective term — see [`Goal::polish_tol_db`].
+fn polish_excess(goal: &Goal, family: Family, dev_after: &[f64]) -> f64 {
+    let Some(tol) = goal.polish_tol_db else {
+        return 0.0;
+    };
+    let (lows, _, _, _, highs, _) = family.semantic_bands();
+    let centered = doctor::centered_deviations(dev_after, family);
+    let mut j: f64 = (lows..=highs)
+        .map(|i| {
+            let e = outside(centered[i], -tol, tol);
+            e * e
+        })
+        .sum();
+    let (slope, _) = doctor::tilt_split(dev_after, family, goal.coverage.as_deref());
+    if let Some(s) = slope {
+        let e = outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT) * TILT_DB_PER_OCT_SCALE;
+        j += e * e;
+    }
+    POLISH_WEIGHT * j
 }
 
 /// Per-rule excess (dB past the gate, + the safety margin; 0 when safely
@@ -826,6 +889,7 @@ fn objective(goal: &Goal, family: Family, controls: &[Control], x: &[f64]) -> f6
         .zip(&excess)
         .map(|(r, e)| r.weight * e * e)
         .sum();
+    j += polish_excess(goal, family, &dev_after);
     j += COLLATERAL_WEIGHT * delta.iter().map(|d| d * d).sum::<f64>();
     j += MOVE_WEIGHT
         * controls
@@ -936,6 +1000,11 @@ pub struct TonePlan {
     /// Predicted broadband loudness change (dB, band-power sum) — a plan
     /// that moves tone knobs moves level too; the Level tab re-levels.
     pub loudness_delta_db: f64,
+    /// [`balance_error_db`] (±1 dB polish tolerance) before and predicted
+    /// after — the distance to the authored balance the tune loop drives down
+    /// once the coarse findings are quiet.
+    pub balance_error_before_db: f64,
+    pub balance_error_after_db: f64,
     /// The one-click: every move as a `DoctorOp::Param`, through the standard
     /// apply → A/B → save flow.
     pub rx: Rx,
@@ -996,12 +1065,38 @@ pub fn generate_plan_with(
     diags: &[LeveledDiag],
     controls: Vec<Control>,
 ) -> Option<TonePlan> {
+    generate_plan_mode(
+        profile, nodes, family, kind, coverage, diags, controls, None,
+    )
+}
+
+/// The polish tolerance the tune loop works to (dB around the authored
+/// balance, per body band).
+pub const POLISH_TOL_DB: f64 = 1.0;
+
+/// [`generate_plan_with`] plus an optional POLISH objective: with `polish_tol_db`
+/// the plan also pulls the balance inside ±tol of the target (and the tilt
+/// inside ±1 dB/oct) and is worth shipping when it drops the balance error by
+/// ≥ [`POLISH_MIN_GAIN_DB`] even with no finding fired — the tune loop's
+/// "keep improving" mode. Without it (the one-shot card) a plan needs a
+/// fired tonal finding and must clear or ease one.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_plan_mode(
+    profile: &SoundProfile,
+    nodes: &[DoctorNode],
+    family: Family,
+    kind: StimulusKind,
+    coverage: Option<&[bool]>,
+    diags: &[LeveledDiag],
+    controls: Vec<Control>,
+    polish_tol_db: Option<f64>,
+) -> Option<TonePlan> {
     let fired: Vec<&str> = diags
         .iter()
         .map(|d| d.diag.key)
         .filter(|k| is_tonal(k))
         .collect();
-    if fired.is_empty() || nodes.is_empty() || controls.is_empty() {
+    if (fired.is_empty() && polish_tol_db.is_none()) || nodes.is_empty() || controls.is_empty() {
         return None;
     }
     let bdb = doctor::band_db(&profile.bands);
@@ -1010,7 +1105,8 @@ pub fn generate_plan_with(
         profile.stim_bands.as_deref(),
         family,
     );
-    let goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
+    let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
+    goal.polish_tol_db = polish_tol_db;
     let raw = solve(&goal, family, &controls);
     if log::log_enabled!(log::Level::Debug) {
         let (dev_after, delta) = apply_moves(&goal, &controls, &raw);
@@ -1096,9 +1192,16 @@ pub fn generate_plan_with(
         })
         .cloned()
         .collect();
-    // Worth showing? Something clears or eases, and NOTHING new fires — a
-    // plan that trades one finding for another is not a plan.
-    if (clears.is_empty() && eased.is_empty()) || !introduces.is_empty() {
+    let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
+    let tol = polish_tol_db.unwrap_or(POLISH_TOL_DB);
+    let balance_error_before_db = balance_error_db(&dev, family, tol, coverage);
+    let balance_error_after_db = balance_error_db(&dev_after, family, tol, coverage);
+    // Worth showing? NOTHING new fires (a plan that trades one finding for
+    // another is not a plan), and either a finding clears or eases, or — in
+    // polish mode — the balance error drops by a real step.
+    let polishes = polish_tol_db.is_some()
+        && balance_error_before_db - balance_error_after_db >= POLISH_MIN_GAIN_DB;
+    if !introduces.is_empty() || (clears.is_empty() && eased.is_empty() && !polishes) {
         return None;
     }
     let remains: Vec<doctor::LeveledKey> = after
@@ -1110,7 +1213,6 @@ pub fn generate_plan_with(
         })
         .collect();
     let before_c = doctor::centered_deviations(&dev, family);
-    let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
     let after_c = doctor::centered_deviations(&dev_after, family);
 
     let loudness_delta_db = {
@@ -1185,6 +1287,8 @@ pub fn generate_plan_with(
         clears,
         remains,
         loudness_delta_db,
+        balance_error_before_db,
+        balance_error_after_db,
         rx,
         model: NOMINAL,
     })
@@ -1477,6 +1581,63 @@ mod tests {
             StimulusKind::Synthetic,
             None,
             &diags
+        )
+        .is_none());
+    }
+
+    /// POLISH mode (the tune loop): with no finding fired but the balance 2.5 dB
+    /// off the target, the plan still proposes and drops the balance error.
+    #[test]
+    fn polish_mode_keeps_improving_past_the_rule_gates() {
+        // +1.8 dB on the high-mids: under the harsh gate (2.5 tilt-space, no
+        // playback offset), over the ±1 dB polish tolerance.
+        let profile = profile_with([0.0, 0.0, 0.0, 1.8, 0.0, 0.0]);
+        let nodes = vec![twin(0.6, 0.5, 0.5)];
+        let diags = diags_for(&profile, &nodes);
+        assert!(
+            keys(&diags).is_empty(),
+            "inside every gate: {:?}",
+            keys(&diags)
+        );
+        assert!(generate_plan(
+            &profile,
+            &nodes,
+            Family::Guitar,
+            StimulusKind::Synthetic,
+            None,
+            &diags
+        )
+        .is_none());
+        let controls = discover_controls(&nodes, Family::Guitar);
+        let plan = generate_plan_mode(
+            &profile,
+            &nodes,
+            Family::Guitar,
+            StimulusKind::Synthetic,
+            None,
+            &diags,
+            controls,
+            Some(POLISH_TOL_DB),
+        )
+        .expect("polish proposes");
+        assert!(plan.balance_error_before_db > 0.5, "{plan:?}");
+        assert!(
+            plan.balance_error_after_db <= plan.balance_error_before_db - POLISH_MIN_GAIN_DB,
+            "{plan:?}"
+        );
+        assert!(plan.clears.is_empty() && plan.remains.is_empty());
+        // Already inside the tolerance → nothing to polish.
+        let flat = profile_with([0.3, -0.2, 0.1, 0.0, -0.3, 0.0]);
+        let controls = discover_controls(&nodes, Family::Guitar);
+        assert!(generate_plan_mode(
+            &flat,
+            &nodes,
+            Family::Guitar,
+            StimulusKind::Synthetic,
+            None,
+            &[],
+            controls,
+            Some(POLISH_TOL_DB),
         )
         .is_none());
     }

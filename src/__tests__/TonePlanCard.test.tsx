@@ -110,6 +110,8 @@ function plan(overrides: Partial<DoctorTonePlan> = {}): DoctorTonePlan {
     clears: ["muddy"],
     remains: [{ key: "dark", fromLevel: "stage" }],
     loudnessDeltaDb: -1.3,
+    balanceErrorBeforeDb: 4.2,
+    balanceErrorAfterDb: 1.1,
     rx: {
       kind: "oneclick",
       title: "Rebalance with the blocks you have",

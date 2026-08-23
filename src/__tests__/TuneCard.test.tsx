@@ -93,6 +93,8 @@ function stepResult(overrides: Partial<DoctorTuneStep> = {}): DoctorTuneStep {
       clears: ["muddy"],
       remains: [{ key: "dark", fromLevel: "stage" }],
       loudnessDeltaDb: -1.2,
+      balanceErrorBeforeDb: 4.2,
+      balanceErrorAfterDb: 1.1,
       rx: {
         kind: "oneclick",
         title: "Round 1",
@@ -212,6 +214,9 @@ describe("TuneCard", () => {
     );
     expect(screen.getByText("Cleared")).toBeInTheDocument();
     expect(screen.getByText("Still")).toBeInTheDocument();
+    expect(screen.getByTestId("tune-balance-error")).toHaveTextContent(
+      "4.2 → 1.1 dB",
+    );
     expect(
       screen.getByText("Applied to the unit · not saved"),
     ).toBeInTheDocument();

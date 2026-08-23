@@ -374,7 +374,10 @@ pub fn propose(base: &Baseline<'_>, hist: &History<'_>) -> Option<(TonePlan, Pro
     for c in controls.iter_mut() {
         c.cap = cap;
     }
-    let plan = doctor_plan::generate_plan_with(
+    // POLISH mode: the loop keeps improving toward the authored balance past
+    // the coarse rule gates (±1 dB per band, ±1 dB/oct) — "no finding" is
+    // not "done".
+    let plan = doctor_plan::generate_plan_mode(
         base.profile,
         nodes,
         family,
@@ -382,6 +385,7 @@ pub fn propose(base: &Baseline<'_>, hist: &History<'_>) -> Option<(TonePlan, Pro
         coverage,
         diags,
         controls,
+        Some(doctor_plan::POLISH_TOL_DB),
     )?;
     Some((
         plan,
