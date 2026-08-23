@@ -1246,6 +1246,7 @@ pub fn generate_plan_mode(
         clears: Vec<String>,
         remains: Vec<String>,
         introduces: Vec<String>,
+        hard_introduces: Vec<String>,
         eased: Vec<String>,
         polishes: bool,
     }
@@ -1301,6 +1302,22 @@ pub fn generate_plan_mode(
             .filter(|k| !fired.contains(k))
             .map(|k| (*k).to_string())
             .collect();
+        // A HARD introduction is a CONFIDENT new finding (severity ≥ 1.0 — past
+        // the "possible" cutoff, `severity.ts::POSSIBLE_MAX_SEVERITY`). In polish
+        // mode a near-threshold ("possible") nudge into a neighbouring band is a
+        // fair trade the PLAYER judges each round (it shows in the card's "New"
+        // row); only a confident new defect is a real regression the search must
+        // refuse. The one-shot plan (unattended) refuses ANY introduction.
+        let hard_introduces: Vec<String> = introduces
+            .iter()
+            .filter(|k| {
+                after
+                    .iter()
+                    .filter(|d| &d.diag.key == k)
+                    .any(|d| d.diag.severity >= 1.0)
+            })
+            .cloned()
+            .collect();
         let eased: Vec<String> = remains
             .iter()
             .filter(|k| {
@@ -1321,6 +1338,7 @@ pub fn generate_plan_mode(
             clears,
             remains,
             introduces,
+            hard_introduces,
             eased,
             polishes,
         })
@@ -1361,13 +1379,20 @@ pub fn generate_plan_mode(
         let Some(c) = evaluate_from(&scaled) else {
             break;
         };
-        if c.introduces.is_empty() {
+        // Polish mode only DROPS on a HARD (confident) introduction; the one-shot
+        // plan drops on ANY introduction (unattended).
+        let block: Vec<String> = if polish_tol_db.is_some() {
+            c.hard_introduces.clone()
+        } else {
+            c.introduces.clone()
+        };
+        if block.is_empty() {
             cand = Some(c);
             break;
         }
-        // Drop the kept move that moves an introduced finding's band(s) hardest
+        // Drop the kept move that pushes the blocking finding's band(s) hardest
         // in the firing direction (a boost into muddy/boomy, a cut into lost…).
-        let bands = finding_bands(&c.introduces);
+        let bands = finding_bands(&block);
         let worst = keep
             .iter()
             .copied()
@@ -1388,7 +1413,12 @@ pub fn generate_plan_mode(
         }
     }
     let cand = cand.filter(|c| {
-        c.introduces.is_empty() && (!c.clears.is_empty() || !c.eased.is_empty() || c.polishes)
+        let blocked = if polish_tol_db.is_some() {
+            !c.hard_introduces.is_empty()
+        } else {
+            !c.introduces.is_empty()
+        };
+        !blocked && (!c.clears.is_empty() || !c.eased.is_empty() || c.polishes)
     })?;
 
     let Candidate {
@@ -1398,6 +1428,7 @@ pub fn generate_plan_mode(
         clears,
         remains,
         introduces: _,
+        hard_introduces: _,
         eased: _,
         polishes: _,
     } = cand;

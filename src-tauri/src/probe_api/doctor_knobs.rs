@@ -249,10 +249,25 @@ pub fn probe_doctor_knob_sweep(
 /// when nothing is proposed, WHY (no control / energy already low / no move
 /// helps). Diagnostic instrument for "the balance search says No further
 /// suggestion but the sound is clearly off". Ends re-amp OFF.
-pub fn probe_doctor_plan_dry(slot: u32, scene: Option<u32>) -> Result<String, String> {
+pub fn probe_doctor_plan_dry(
+    slot: u32,
+    scene: Option<u32>,
+    stim_wav: Option<&str>,
+) -> Result<String, String> {
     use crate::doctor_plan;
-    let stim = leveller::doctor_stim_slice(read_stimulus_48k(&probe_stimulus_path(
-        "guitar-humbucker",
+    // A captured DI (a profile's Tier-2 wav) is injected VERBATIM and diagnosed
+    // in CAPTURE space — the same seam the app uses when a profile is picked;
+    // else the synthetic humbucker sample. This is exactly what changes a
+    // scene's balance/diagnoses between "dry synthetic" and "what the player
+    // saw", so the arm must be able to reproduce both.
+    let kind = if stim_wav.is_some() {
+        doctor::StimulusKind::Capture
+    } else {
+        doctor::StimulusKind::Synthetic
+    };
+    let stim = leveller::doctor_stim_slice(read_stimulus_48k(&stim_wav.map_or_else(
+        || probe_stimulus_path("guitar-humbucker"),
+        |w| Ok(w.to_string()),
     )?)?);
     let (preset, _, _) = crate::read_slot_preset_parsed(slot)?;
     let name = preset
@@ -371,7 +386,7 @@ pub fn probe_doctor_plan_dry(slot: u32, scene: Option<u32>) -> Result<String, St
         &profile,
         &nodes,
         family,
-        doctor::StimulusKind::Synthetic,
+        kind,
         Some(&coverage),
         &diags,
         controls,

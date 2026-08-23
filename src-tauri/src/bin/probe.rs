@@ -85,11 +85,12 @@
 //!                                  (on-off isolation + the switch's param-func valueA writes),
 //!                                  printing the diagnosis verdicts — the FS twin of the defect
 //!                                  sweep. Read-only; ends re-amp OFF.
-//!   probe --doctor-plan-dry <slot> [<scene>]
+//!   probe --doctor-plan-dry <slot> [<scene>] [--stim <di.wav>]
 //!                                  READ-ONLY one-round dump of the balance search: capture the
-//!                                  sound (base or a 0-based scene), diagnose, discover controls,
-//!                                  run the solve + ship-gate and print WHY it does/doesn't propose.
-//!                                  Never writes/saves; ends re-amp OFF.
+//!                                  sound (base or a 0-based scene; --stim injects a profile's DI
+//!                                  wav in CAPTURE space, else the synthetic humbucker), diagnose,
+//!                                  discover controls, run the solve + ship-gate and print WHY it
+//!                                  does/doesn't propose. Never writes/saves; ends re-amp OFF.
 //!   probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out <report.json>]
 //!                                  Balance-plan calibration: nudge each amp/pedal tone knob of
 //!                                  the preset ±delta (one at a time), capture, and print the
@@ -620,7 +621,8 @@ fn main() {
             }
         };
         let scene: Option<u32> = args.get(i + 2).and_then(|s| s.parse().ok());
-        match tmp_companion_lib::probe_doctor_plan_dry(slot, scene) {
+        let stim = flag_arg(&args, "--stim");
+        match tmp_companion_lib::probe_doctor_plan_dry(slot, scene, stim.as_deref()) {
             Ok(r) => {
                 print!("{r}");
                 return;
