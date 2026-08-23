@@ -377,6 +377,18 @@ with discard → the stored preset is reloaded).
   evened over several auditioned steps, not one lurch. The player is the
   arbiter of taste — a polish move that erodes the preset's character gets
   "not better" and is excluded.
+- **Greedy back-off** (`generate_plan_mode`): the solved move can fix the
+  balance along one lever while another over-corrects and INTRODUCES a finding
+  (HW 2026-08-23: a bright Strat's polish CUT the harsh top — good — AND
+  boosted the low end into `muddy`; scaling the whole vector down shrinks the
+  useful cut too, so the plan was refused and the loop looked stuck at "no
+  suggestion"). So the ship path keeps the full move, then while the
+  re-diagnosis shows an introduced finding, DROPS the single move that pushes
+  hardest into that finding's band and re-diagnoses — the character-preserving
+  cut survives, the offending boost is dropped. Diagnostic: `probe
+--doctor-plan-dry <slot> [scene]` prints the effective chain, the capture
+  balance, the discovered controls, the raw solve, the polish energy and the
+  ship-gate verdict (why a round does or doesn't propose).
 - **Termination**: `converged` when the baseline has no tonal finding
   (`TONAL_KEYS`) left AND the polish energy is under `POLISH_MIN_ENERGY`;
   `exhausted` when no proposal exists — and when that is "no finding, no move

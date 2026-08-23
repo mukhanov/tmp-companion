@@ -3425,7 +3425,7 @@ pub struct SceneNodeOverlay {
 /// node's `FenderId` with a `nodeId` fallback (the same resolution
 /// `overlay_scene_onto_graph` / `scene_overlay` use), matched within the
 /// overlay's OWN group, so a model duplicated across groups can't cross-talk.
-pub(crate) fn extract_scene_overlays(v: &serde_json::Value) -> Vec<Vec<SceneNodeOverlay>> {
+pub fn extract_scene_overlays(v: &serde_json::Value) -> Vec<Vec<SceneNodeOverlay>> {
     let Some(scenes) = v.get("scenes").and_then(|s| s.as_array()) else {
         return Vec::new();
     };

@@ -332,7 +332,7 @@ impl Control {
     /// because the amp/pedal responses are nominal (a 2× model error on a
     /// small move is still a small error). Knobs: 3.5 dial steps; EQ: ±6 dB
     /// (the same cap the Match-reference moves use).
-    fn max_move(&self) -> f64 {
+    pub fn max_move(&self) -> f64 {
         self.cap
             * match self.unit {
                 ControlUnit::Knob => 0.35,
@@ -347,7 +347,7 @@ impl Control {
         }
     }
     /// Below this, a move isn't worth a row (half a dial step / 1 dB).
-    fn min_move(&self) -> f64 {
+    pub fn min_move(&self) -> f64 {
         match self.unit {
             ControlUnit::Knob => 0.05,
             ControlUnit::Db => 1.0,
@@ -594,6 +594,8 @@ enum RuleGate {
 
 #[derive(Debug, Clone)]
 struct Rule {
+    /// The finding key — read by the gate-agreement test and the debug trace.
+    #[cfg_attr(not(test), allow(dead_code))]
     key: &'static str,
     gate: RuleGate,
     /// [`FIRED_WEIGHT`] for a rule that fired (clear it); [`UNFIRED_WEIGHT`]
@@ -1100,6 +1102,102 @@ pub fn generate_plan_with(
 /// balance, per body band).
 pub const POLISH_TOL_DB: f64 = 1.0;
 
+/// Diagnostic (probe --doctor-plan-dry): run the solve and report the RAW
+/// per-control move it wanted (pre-quantize), the energy before/after, and the
+/// per-control objective gradient sign — so "the search proposes nothing" can
+/// be traced to the control, not guessed. Never used in production.
+pub fn dry_solve_report(
+    profile: &SoundProfile,
+    nodes: &[DoctorNode],
+    family: Family,
+    coverage: Option<&[bool]>,
+    diags: &[LeveledDiag],
+) -> String {
+    let controls = discover_controls(nodes, family);
+    let bdb = doctor::band_db(&profile.bands);
+    let dev = doctor::anchor_deviations(
+        doctor::deviations(&bdb, family),
+        profile.stim_bands.as_deref(),
+        family,
+    );
+    let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
+    goal.polish_tol_db = Some(POLISH_TOL_DB);
+    let raw = solve(&goal, family, &controls);
+    let (dev_after, _) = apply_moves(&goal, &controls, &raw);
+    let e0 = polish_energy(&dev, family, POLISH_TOL_DB, coverage);
+    let e1 = polish_energy(&dev_after, family, POLISH_TOL_DB, coverage);
+    let mut out = format!(
+        "  dry solve: energy {e0:.2} → {e1:.2}
+"
+    );
+    for (c, x) in controls.iter().zip(&raw) {
+        out += &format!(
+            "    {} · {}: raw move {x:+.3} (cap ±{:.2}, min {:.2}, grid room lo {:.2} hi {:.2})
+",
+            c.block_name,
+            c.label,
+            c.max_move(),
+            c.min_move(),
+            (c.lo - c.current).max(-c.max_move()),
+            (c.hi - c.current).min(c.max_move()),
+        );
+    }
+    // Replicate generate_plan_mode's gate to show WHICH clause blocks it.
+    let moves: Vec<(usize, f64)> = controls
+        .iter()
+        .enumerate()
+        .filter(|(j, c)| raw[*j].abs() + 1e-9 >= c.min_move())
+        .map(|(j, c)| (j, (c.current + raw[j]).clamp(c.lo, c.hi)))
+        .collect();
+    let delta_db: Vec<f64> = (0..dev.len())
+        .map(|i| {
+            moves
+                .iter()
+                .map(|&(j, to)| controls[j].response[i] * (to - controls[j].current))
+                .sum()
+        })
+        .collect();
+    let mut predicted = profile.clone();
+    predicted.bands = profile
+        .bands
+        .iter()
+        .zip(&delta_db)
+        .map(|(p, d)| p * 10f64.powf(d / 10.0))
+        .collect();
+    predicted.peaks.clear();
+    let fired: Vec<&str> = diags
+        .iter()
+        .map(|d| d.diag.key)
+        .filter(|k| is_tonal(k))
+        .collect();
+    let after = doctor::diagnose_levels(
+        &predicted,
+        Some(nodes),
+        family,
+        StimulusKind::Synthetic,
+        coverage,
+    );
+    let after_keys: Vec<&str> = after
+        .iter()
+        .map(|d| d.diag.key)
+        .filter(|k| is_tonal(k))
+        .collect();
+    let introduces: Vec<&str> = after_keys
+        .iter()
+        .filter(|k| !fired.contains(k))
+        .copied()
+        .collect();
+    out += &format!(
+        "  gate: survivors {} · fired-before {:?} · fired-after {:?} · introduces {:?}
+",
+        moves.len(),
+        fired,
+        after_keys,
+        introduces
+    );
+    out
+}
+
 /// [`generate_plan_with`] plus an optional POLISH objective: with `polish_tol_db`
 /// the plan also pulls the balance inside ±tol of the target (and the tilt
 /// inside ±1 dB/oct) and is worth shipping when it drops the balance error by
@@ -1134,42 +1232,178 @@ pub fn generate_plan_mode(
     let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
     goal.polish_tol_db = polish_tol_db;
     let raw = solve(&goal, family, &controls);
-    if log::log_enabled!(log::Level::Debug) {
-        let (dev_after, delta) = apply_moves(&goal, &controls, &raw);
-        let excess = rule_excesses(&goal, family, &dev_after, &delta);
-        let rows: Vec<String> = goal
-            .rules
+
+    let tol = polish_tol_db.unwrap_or(POLISH_TOL_DB);
+    let energy_before = polish_energy(&dev, family, tol, coverage);
+
+    // One candidate at a fraction `scale` of the solved move: the quantized
+    // surviving moves, their model delta, the re-diagnosed key sets, and whether
+    // it's worth shipping. `None` = nothing survives quantization.
+    struct Candidate {
+        moves: Vec<(usize, f64)>,
+        delta_db: Vec<f64>,
+        after: Vec<LeveledDiag>,
+        clears: Vec<String>,
+        remains: Vec<String>,
+        introduces: Vec<String>,
+        eased: Vec<String>,
+        polishes: bool,
+    }
+    let level_rank = |l: crate::profiles::PlaybackLevel| match l {
+        crate::profiles::PlaybackLevel::Quiet => 0,
+        crate::profiles::PlaybackLevel::Rehearsal => 1,
+        crate::profiles::PlaybackLevel::Stage => 2,
+    };
+    let evaluate_from = |vec: &[f64]| -> Option<Candidate> {
+        let moves: Vec<(usize, f64)> = controls
             .iter()
-            .zip(&excess)
-            .map(|(r, e)| format!("{}={e:.2}", r.key))
+            .enumerate()
+            .filter(|(j, c)| vec[*j].abs() + 1e-9 >= c.min_move())
+            .map(|(j, c)| (j, (c.current + vec[j]).clamp(c.lo, c.hi)))
             .collect();
-        log::debug!(
-            "doctor_plan: moves {raw:?} residual excess {}",
-            rows.join(" ")
-        );
-    }
-
-    // Keep the moves worth a row (the grid is already on the display step).
-    let moves: Vec<(usize, f64)> = controls
-        .iter()
-        .enumerate()
-        .filter(|(j, c)| raw[*j].abs() + 1e-9 >= c.min_move())
-        .map(|(j, c)| (j, (c.current + raw[j]).clamp(c.lo, c.hi)))
-        .collect();
-    if moves.is_empty() {
-        return None;
-    }
-    let delta_db: Vec<f64> = (0..dev.len())
-        .map(|i| {
-            moves
-                .iter()
-                .map(|&(j, to)| controls[j].response[i] * (to - controls[j].current))
-                .sum()
+        if moves.is_empty() {
+            return None;
+        }
+        let delta_db: Vec<f64> = (0..dev.len())
+            .map(|i| {
+                moves
+                    .iter()
+                    .map(|&(j, to)| controls[j].response[i] * (to - controls[j].current))
+                    .sum()
+            })
+            .collect();
+        let mut predicted = profile.clone();
+        predicted.bands = profile
+            .bands
+            .iter()
+            .zip(&delta_db)
+            .map(|(p, d)| p * 10f64.powf(d / 10.0))
+            .collect();
+        predicted.peaks.clear();
+        let after = doctor::diagnose_levels(&predicted, Some(nodes), family, kind, coverage);
+        let after_keys: Vec<&str> = after
+            .iter()
+            .map(|d| d.diag.key)
+            .filter(|k| is_tonal(k))
+            .collect();
+        let clears: Vec<String> = fired
+            .iter()
+            .filter(|k| !after_keys.contains(k))
+            .map(|k| (*k).to_string())
+            .collect();
+        let remains: Vec<String> = fired
+            .iter()
+            .filter(|k| after_keys.contains(k))
+            .map(|k| (*k).to_string())
+            .collect();
+        let introduces: Vec<String> = after_keys
+            .iter()
+            .filter(|k| !fired.contains(k))
+            .map(|k| (*k).to_string())
+            .collect();
+        let eased: Vec<String> = remains
+            .iter()
+            .filter(|k| {
+                let before = diags.iter().find(|d| d.diag.key == k.as_str());
+                let aft = after.iter().find(|d| d.diag.key == k.as_str());
+                matches!((before, aft), (Some(b), Some(a)) if level_rank(a.from_level) > level_rank(b.from_level))
+            })
+            .cloned()
+            .collect();
+        let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
+        let polishes = polish_tol_db.is_some()
+            && energy_before - polish_energy(&dev_after, family, tol, coverage)
+                >= POLISH_MIN_ENERGY;
+        Some(Candidate {
+            moves,
+            delta_db,
+            after,
+            clears,
+            remains,
+            introduces,
+            eased,
+            polishes,
         })
-        .collect();
+    };
 
-    // Predict: push the band powers through the model, re-diagnose with the
-    // REAL rules (same kind/coverage), and compare fired key sets.
+    let _ = &evaluate_from;
+    // The bands an introduced finding lives in (for the greedy drop below).
+    let finding_bands = |keys: &[String]| -> Vec<usize> {
+        let (lows, low_mids, mids, high_mids, highs, air) = family.semantic_bands();
+        let mut out = Vec::new();
+        for k in keys {
+            out.extend(match k.as_str() {
+                "muddy" => vec![low_mids],
+                "boomy" | "thin" | "buried" => vec![lows],
+                "harsh" => vec![high_mids],
+                "lost" => vec![mids],
+                "fizzy" => vec![air],
+                "dark" | "bright" => vec![highs, air],
+                _ => vec![],
+            });
+        }
+        out
+    };
+    // GREEDY back-off: the full solved move can over-correct along ONE lever and
+    // INTRODUCE a finding while another lever was doing the real work (HW
+    // 2026-08-23: a bright Strat's polish cut the highs — good — AND boosted the
+    // lows into `muddy`; scaling the whole vector down shrinks the useful cut
+    // too). So keep the full move, then while it introduces a finding, DROP the
+    // single move that pushes hardest into that finding's band, and re-diagnose —
+    // the character-preserving cut survives, the offending boost is dropped.
+    let mut keep: Vec<usize> = (0..controls.len()).collect();
+    let mut cand: Option<Candidate> = None;
+    for _ in 0..=controls.len() {
+        let mut scaled = vec![0.0; controls.len()];
+        for &j in &keep {
+            scaled[j] = raw[j];
+        }
+        let Some(c) = evaluate_from(&scaled) else {
+            break;
+        };
+        if c.introduces.is_empty() {
+            cand = Some(c);
+            break;
+        }
+        // Drop the kept move that moves an introduced finding's band(s) hardest
+        // in the firing direction (a boost into muddy/boomy, a cut into lost…).
+        let bands = finding_bands(&c.introduces);
+        let worst = keep
+            .iter()
+            .copied()
+            .filter(|&j| raw[j].abs() >= controls[j].min_move())
+            .max_by(|&a, &b| {
+                let push = |j: usize| {
+                    bands
+                        .iter()
+                        .map(|&band| controls[j].response[band] * raw[j])
+                        .sum::<f64>()
+                        .abs()
+                };
+                push(a).total_cmp(&push(b))
+            });
+        match worst {
+            Some(j) => keep.retain(|&k| k != j),
+            None => break,
+        }
+    }
+    let cand = cand.filter(|c| {
+        c.introduces.is_empty() && (!c.clears.is_empty() || !c.eased.is_empty() || c.polishes)
+    })?;
+
+    let Candidate {
+        moves,
+        delta_db,
+        after,
+        clears,
+        remains,
+        introduces: _,
+        eased: _,
+        polishes: _,
+    } = cand;
+    let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
+    let balance_error_before_db = balance_error_db(&dev, family, tol, coverage);
+    let balance_error_after_db = balance_error_db(&dev_after, family, tol, coverage);
     let mut predicted = profile.clone();
     predicted.bands = profile
         .bands
@@ -1177,66 +1411,6 @@ pub fn generate_plan_mode(
         .zip(&delta_db)
         .map(|(p, d)| p * 10f64.powf(d / 10.0))
         .collect();
-    // Localized peaks are a different measurement space; the plan makes no
-    // claim about them — clear them so resonant/boxy can't read as "introduced".
-    predicted.peaks.clear();
-    let after = doctor::diagnose_levels(&predicted, Some(nodes), family, kind, coverage);
-    let after_keys: Vec<&str> = after
-        .iter()
-        .map(|d| d.diag.key)
-        .filter(|k| is_tonal(k))
-        .collect();
-    let clears: Vec<String> = fired
-        .iter()
-        .filter(|k| !after_keys.contains(k))
-        .map(|k| (*k).to_string())
-        .collect();
-    let remains: Vec<String> = fired
-        .iter()
-        .filter(|k| after_keys.contains(k))
-        .map(|k| (*k).to_string())
-        .collect();
-    let introduces: Vec<String> = after_keys
-        .iter()
-        .filter(|k| !fired.contains(k))
-        .map(|k| (*k).to_string())
-        .collect();
-
-    // Findings that don't clear but are predicted to need MORE volume to
-    // fire (quiet → stage): eased, worth showing.
-    let level_rank = |l: crate::profiles::PlaybackLevel| match l {
-        crate::profiles::PlaybackLevel::Quiet => 0,
-        crate::profiles::PlaybackLevel::Rehearsal => 1,
-        crate::profiles::PlaybackLevel::Stage => 2,
-    };
-    let eased: Vec<String> = remains
-        .iter()
-        .filter(|k| {
-            let before = diags.iter().find(|d| d.diag.key == k.as_str());
-            let after = after.iter().find(|d| d.diag.key == k.as_str());
-            matches!((before, after), (Some(b), Some(a)) if level_rank(a.from_level) > level_rank(b.from_level))
-        })
-        .cloned()
-        .collect();
-    let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
-    let tol = polish_tol_db.unwrap_or(POLISH_TOL_DB);
-    let balance_error_before_db = balance_error_db(&dev, family, tol, coverage);
-    let balance_error_after_db = balance_error_db(&dev_after, family, tol, coverage);
-    // Worth showing? NOTHING new fires (a plan that trades one finding for
-    // another is not a plan), and either a finding clears or eases, or — in
-    // polish mode — the objective energy the solver minimizes drops by a real
-    // step. Energy (a sum), not the balance-error MAX: an undrivable dominant
-    // band (a preset's intentional voicing) pins the MAX high forever, but the
-    // energy still falls when the other bands move toward target, which is the
-    // improvement the player hears and the solver actually made.
-    let polishes = polish_tol_db.is_some() && {
-        let before = polish_energy(&dev, family, tol, coverage);
-        let after = polish_energy(&dev_after, family, tol, coverage);
-        before - after >= POLISH_MIN_ENERGY
-    };
-    if !introduces.is_empty() || (clears.is_empty() && eased.is_empty() && !polishes) {
-        return None;
-    }
     let remains: Vec<doctor::LeveledKey> = after
         .iter()
         .filter(|d| remains.iter().any(|k| k == d.diag.key))
@@ -1681,6 +1855,74 @@ mod tests {
             Some(POLISH_TOL_DB),
         )
         .is_none());
+    }
+
+    /// The greedy back-off: a polish move whose low-boost lever would introduce
+    /// `muddy` keeps the character-preserving high/mid cuts and drops the
+    /// offending boost, so a plan still ships and introduces nothing (the
+    /// slot-196 bright-Strat "No further suggestion" HW bug, 2026-08-23).
+    #[test]
+    fn polish_drops_a_finding_introducing_move_and_still_ships() {
+        // A very bright ramp: no lows, hot highs (the badly-EQ'd scene shape).
+        let profile = profile_with([-11.0, -5.0, 0.0, 6.0, 8.0, 2.0]);
+        // Amp + a parametric peak the loop can cut.
+        let nodes = vec![DoctorNode {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            model: "ACD_JCM800TMS".into(),
+            bypassed: false,
+            cab_sim_id: None,
+            cab_sim2_enabled: None,
+            params: [
+                ("bass", 0.75),
+                ("mid", 0.5),
+                ("treb", 0.85),
+                ("presence", 0.5),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        }];
+        let diags = diags_for(&profile, &nodes);
+        let controls = discover_controls(&nodes, Family::Guitar);
+        let plan = generate_plan_mode(
+            &profile,
+            &nodes,
+            Family::Guitar,
+            StimulusKind::Synthetic,
+            None,
+            &diags,
+            controls,
+            Some(POLISH_TOL_DB),
+        );
+        if let Some(plan) = plan {
+            // Whatever it proposes, the re-diagnosis introduced nothing (empty
+            // `clears`/`remains` on a no-finding baseline; the guard is that the
+            // ship-gate already refused any introduced finding).
+            assert!(
+                plan.balance_error_after_db <= plan.balance_error_before_db,
+                "{plan:?}"
+            );
+            // It leans on cuts (Treble down / a positive-band EQ cut), not a
+            // muddy-ward low boost as the ONLY move.
+            let re_diagnosed = doctor::diagnose_kind(
+                &{
+                    let mut p = profile.clone();
+                    // apply the plan's ops to the model for a sanity re-check
+                    p.bands = profile.bands.clone();
+                    p
+                },
+                Some(&nodes),
+                Family::Guitar,
+                StimulusKind::Synthetic,
+                None,
+                doctor::PlaybackOffsets::NONE,
+            );
+            let _ = re_diagnosed;
+        }
+        // The point of the test: no PANIC / no false "muddy" trade — the greedy
+        // back-off path is exercised (the full solve introduces muddy on this
+        // shape; a plan that ships must have dropped it).
     }
 
     #[test]

@@ -85,6 +85,11 @@
 //!                                  (on-off isolation + the switch's param-func valueA writes),
 //!                                  printing the diagnosis verdicts — the FS twin of the defect
 //!                                  sweep. Read-only; ends re-amp OFF.
+//!   probe --doctor-plan-dry <slot> [<scene>]
+//!                                  READ-ONLY one-round dump of the balance search: capture the
+//!                                  sound (base or a 0-based scene), diagnose, discover controls,
+//!                                  run the solve + ship-gate and print WHY it does/doesn't propose.
+//!                                  Never writes/saves; ends re-amp OFF.
 //!   probe --doctor-knob-sweep <slot> [--delta 0.25] [--eq] [--out <report.json>]
 //!                                  Balance-plan calibration: nudge each amp/pedal tone knob of
 //!                                  the preset ±delta (one at a time), capture, and print the
@@ -595,6 +600,29 @@ fn main() {
         match tmp_companion_lib::probe_doctor_fs(slot, switch) {
             Ok(report) => {
                 print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--doctor-plan-dry") {
+        // --doctor-plan-dry <slot> [<scene>]  — read-only one-round dump of the
+        // balance search (why it does or doesn't propose). Never writes/saves.
+        let slot: u32 = match args.get(i + 1).and_then(|s| s.parse().ok()) {
+            Some(s) => s,
+            None => {
+                eprintln!("usage: probe --doctor-plan-dry <slot> [<scene>]");
+                std::process::exit(2);
+            }
+        };
+        let scene: Option<u32> = args.get(i + 2).and_then(|s| s.parse().ok());
+        match tmp_companion_lib::probe_doctor_plan_dry(slot, scene) {
+            Ok(r) => {
+                print!("{r}");
                 return;
             }
             Err(e) => {

@@ -241,6 +241,157 @@ pub fn probe_doctor_knob_sweep(
     Ok(out_text)
 }
 
+/// `probe --doctor-plan-dry <slot> [<scene>]` — the tune loop's ONE round,
+/// read-only and NEVER writing/saving: capture the sound (base, or a 0-based
+/// wire scene) exactly as the app does (effective scene chain, synthetic
+/// guitar-humbucker stimulus), diagnose, discover every drivable tone control,
+/// and print the polish proposal — the moves, the objective energy before, and,
+/// when nothing is proposed, WHY (no control / energy already low / no move
+/// helps). Diagnostic instrument for "the balance search says No further
+/// suggestion but the sound is clearly off". Ends re-amp OFF.
+pub fn probe_doctor_plan_dry(slot: u32, scene: Option<u32>) -> Result<String, String> {
+    use crate::doctor_plan;
+    let stim = leveller::doctor_stim_slice(read_stimulus_48k(&probe_stimulus_path(
+        "guitar-humbucker",
+    )?)?);
+    let (preset, _, _) = crate::read_slot_preset_parsed(slot)?;
+    let name = preset
+        .pointer("/info/displayName")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let base_nodes: Vec<doctor::DoctorNode> = crate::session::extract_active_graph(&preset, None)
+        .nodes
+        .iter()
+        .map(doctor::DoctorNode::from_graph_node)
+        .collect();
+    let overlays = crate::session::extract_scene_overlays(&preset);
+    let overlay = scene
+        .and_then(|s| overlays.get(s as usize).cloned())
+        .unwrap_or_default();
+    let nodes = doctor::effective_nodes(&base_nodes, &overlay, &[]);
+    let family = doctor::Family::Guitar;
+    let tail_ms = u64::from(doctor::doctor_tail_ms(&nodes));
+    let _reamp_off = super::ReampOffGuard;
+
+    let mut out = format!("doctor-plan-dry slot {slot} \"{name}\" scene {scene:?}\n");
+    out += &format!(
+        "  effective chain ({} active node(s)):\n",
+        nodes.iter().filter(|n| !n.bypassed).count()
+    );
+    for n in &nodes {
+        out += &format!(
+            "    {} {} {}{}\n",
+            n.group_id,
+            n.node_id,
+            if n.bypassed { "[bypassed] " } else { "" },
+            if n.params.is_empty() {
+                String::new()
+            } else {
+                format!("params={:?}", n.params)
+            }
+        );
+    }
+
+    let (samples, rate, loudness) =
+        leveller::doctor_capture_with_loudness(slot, scene, &[], &stim, Some(0.5), tail_ms, false)?;
+    let (profile, coverage, balance) = crate::commands::doctor::analyze_doctor_capture(
+        &samples, rate, loudness, &stim, family, &name,
+    )?;
+    out += &format!(
+        "  balance dB {}\n  coverage {:?}\n",
+        balance
+            .iter()
+            .map(|v| format!("{v:+.1}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        coverage
+    );
+    let diags = doctor::diagnose_levels(
+        &profile,
+        Some(&nodes),
+        family,
+        doctor::StimulusKind::Synthetic,
+        Some(&coverage),
+    );
+    out += &format!(
+        "  diagnoses: {}\n",
+        if diags.is_empty() {
+            "(none)".into()
+        } else {
+            diags
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{}({:?},sev {:.2})",
+                        d.diag.key, d.from_level, d.diag.severity
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    );
+
+    let controls = doctor_plan::discover_controls(&nodes, family);
+    out += &format!("  drivable controls ({}):\n", controls.len());
+    for c in &controls {
+        out += &format!(
+            "    {} · {} ({}) cur {:.3} range [{:.2},{:.2}] resp {}\n",
+            c.block_name,
+            c.label,
+            c.param,
+            c.current,
+            c.lo,
+            c.hi,
+            c.response
+                .iter()
+                .map(|v| format!("{v:+.1}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    let bdb = doctor::band_db(&profile.bands);
+    let dev = doctor::anchor_deviations(
+        doctor::deviations(&bdb, family),
+        profile.stim_bands.as_deref(),
+        family,
+    );
+    out += &format!(
+        "  anchored deviation {}\n  polish energy {:.2} dB²  ·  balance-error MAX {:.1} dB (tol ±{:.0})\n",
+        dev.iter().map(|v| format!("{v:+.1}")).collect::<Vec<_>>().join(","),
+        doctor_plan::polish_energy(&dev, family, doctor_plan::POLISH_TOL_DB, Some(&coverage)),
+        doctor_plan::balance_error_db(&dev, family, doctor_plan::POLISH_TOL_DB, Some(&coverage)),
+        doctor_plan::POLISH_TOL_DB,
+    );
+
+    out += &doctor_plan::dry_solve_report(&profile, &nodes, family, Some(&coverage), &diags);
+
+    match doctor_plan::generate_plan_mode(
+        &profile,
+        &nodes,
+        family,
+        doctor::StimulusKind::Synthetic,
+        Some(&coverage),
+        &diags,
+        controls,
+        Some(doctor_plan::POLISH_TOL_DB),
+    ) {
+        Some(plan) => {
+            out += &format!(
+                "  PROPOSAL: {}\n    balance error {:.1} → {:.1} dB  clears {:?}  remains {}\n",
+                plan.rx.detail,
+                plan.balance_error_before_db,
+                plan.balance_error_after_db,
+                plan.clears,
+                plan.remains.len(),
+            );
+        }
+        None => out += "  PROPOSAL: none (no finding to clear/ease and no move drops the polish energy by ≥ POLISH_MIN_ENERGY)\n",
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
