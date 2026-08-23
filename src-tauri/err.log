@@ -1,0 +1,3 @@
+[probe] doctor sweep over 2 slot(s), topology=guitar-humbucker…
+[INFO] set_knobs[t]: write presetLevel=0.5000 returned at 253 ms
+[INFO] set_knobs[t]: write presetLevel=0.5000 returned at 254 ms

@@ -214,15 +214,17 @@ fn cap_units(m: &PlanMove) -> f64 {
     (m.to - m.from) / cap
 }
 
-/// Move-cap multiplier per rejection streak: full for the first two variants
-/// (they change WHICH controls move), half from the third (same controls,
-/// smaller step).
+/// The tune loop's base move-cap multiplier: HALF the one-shot plan's cap, so
+/// each round is a gentle, auditioned step the player approves one by one
+/// (~1.75 dial steps / ±3 dB max) rather than the plan's one big swing —
+/// large deviations get evened out over several rounds, not in one lurch.
+pub const TUNE_BASE_CAP: f64 = 0.5;
+
+/// Move-cap multiplier per rejection streak, ON TOP of [`TUNE_BASE_CAP`]: full
+/// for the first two variants (they change WHICH controls move), half from the
+/// third (same controls, smaller step).
 pub fn cap_for_variant(variant: u32) -> f64 {
-    if variant >= 3 {
-        0.5
-    } else {
-        1.0
-    }
+    TUNE_BASE_CAP * if variant >= 3 { 0.5 } else { 1.0 }
 }
 
 /// Rejection streaks beyond this get no new proposal ("this is as far as the
@@ -536,8 +538,8 @@ mod tests {
         let v2 = exclusions(&[&t1, &t2], 2);
         assert_eq!(v2.len(), 3);
         assert!(exclusions(&[&t1, &t2], 3).is_empty());
-        assert_eq!(cap_for_variant(0), 1.0);
-        assert_eq!(cap_for_variant(3), 0.5);
+        assert_eq!(cap_for_variant(0), TUNE_BASE_CAP);
+        assert_eq!(cap_for_variant(3), TUNE_BASE_CAP * 0.5);
     }
 
     #[test]

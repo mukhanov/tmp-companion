@@ -214,9 +214,6 @@ describe("TuneCard", () => {
     );
     expect(screen.getByText("Cleared")).toBeInTheDocument();
     expect(screen.getByText("Still")).toBeInTheDocument();
-    expect(screen.getByTestId("tune-balance-error")).toHaveTextContent(
-      "4.2 → 1.1 dB",
-    );
     expect(
       screen.getByText("Applied to the unit · not saved"),
     ).toBeInTheDocument();

@@ -625,8 +625,10 @@ pub const POLISH_TILT_DB_PER_OCT: f64 = 1.0;
 /// Weight of a polish band excess² (dB²) — below a fired rule (4) so a real
 /// finding is always cleared first, above collateral so it is worth moving for.
 const POLISH_WEIGHT: f64 = 1.0;
-/// The smallest drop in [`balance_error_db`] worth a polish round.
-pub const POLISH_MIN_GAIN_DB: f64 = 0.25;
+/// The smallest drop in the polish [`polish_energy`] (dB²) worth a round — a
+/// low bar, because the player is the arbiter: any move that measurably
+/// evens the spectrum toward target is worth auditioning.
+pub const POLISH_MIN_ENERGY: f64 = 0.5;
 
 /// Safety margin (dB) inside every gate, so a predicted "clear" isn't a
 /// boundary coin-flip.
@@ -812,6 +814,30 @@ pub fn balance_error_db(dev: &[f64], family: Family, tol: f64, coverage: Option<
         outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT).abs() * TILT_DB_PER_OCT_SCALE
     });
     band.max(tilt)
+}
+
+/// The polish OBJECTIVE energy of a deviation vector (dB²): the SAME weighted
+/// sum the solver minimizes — Σ over body bands of the centered deviation past
+/// ±`tol`, squared, plus the Theil–Sen slope past ±[`POLISH_TILT_DB_PER_OCT`]
+/// squared. This is the "how far is it worth going" metric — unlike
+/// [`balance_error_db`] (a MAX, which a chain's undrivable dominant band pins
+/// high forever), the energy DROPS whenever any band moves toward target, so
+/// "a round that helps" and "the solver found a move" agree.
+pub fn polish_energy(dev: &[f64], family: Family, tol: f64, coverage: Option<&[bool]>) -> f64 {
+    let (lows, _, _, _, highs, _) = family.semantic_bands();
+    let centered = doctor::centered_deviations(dev, family);
+    let mut j: f64 = (lows..=highs)
+        .map(|i| {
+            let e = outside(centered[i], -tol, tol);
+            e * e
+        })
+        .sum();
+    let (slope, _) = doctor::tilt_split(dev, family, coverage);
+    if let Some(s) = slope {
+        let e = outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT) * TILT_DB_PER_OCT_SCALE;
+        j += e * e;
+    }
+    j
 }
 
 /// The polish objective term — see [`Goal::polish_tol_db`].
@@ -1077,7 +1103,7 @@ pub const POLISH_TOL_DB: f64 = 1.0;
 /// [`generate_plan_with`] plus an optional POLISH objective: with `polish_tol_db`
 /// the plan also pulls the balance inside ±tol of the target (and the tilt
 /// inside ±1 dB/oct) and is worth shipping when it drops the balance error by
-/// ≥ [`POLISH_MIN_GAIN_DB`] even with no finding fired — the tune loop's
+/// ≥ [`POLISH_MIN_ENERGY`] even with no finding fired — the tune loop's
 /// "keep improving" mode. Without it (the one-shot card) a plan needs a
 /// fired tonal finding and must clear or ease one.
 #[allow(clippy::too_many_arguments)]
@@ -1198,9 +1224,16 @@ pub fn generate_plan_mode(
     let balance_error_after_db = balance_error_db(&dev_after, family, tol, coverage);
     // Worth showing? NOTHING new fires (a plan that trades one finding for
     // another is not a plan), and either a finding clears or eases, or — in
-    // polish mode — the balance error drops by a real step.
-    let polishes = polish_tol_db.is_some()
-        && balance_error_before_db - balance_error_after_db >= POLISH_MIN_GAIN_DB;
+    // polish mode — the objective energy the solver minimizes drops by a real
+    // step. Energy (a sum), not the balance-error MAX: an undrivable dominant
+    // band (a preset's intentional voicing) pins the MAX high forever, but the
+    // energy still falls when the other bands move toward target, which is the
+    // improvement the player hears and the solver actually made.
+    let polishes = polish_tol_db.is_some() && {
+        let before = polish_energy(&dev, family, tol, coverage);
+        let after = polish_energy(&dev_after, family, tol, coverage);
+        before - after >= POLISH_MIN_ENERGY
+    };
     if !introduces.is_empty() || (clears.is_empty() && eased.is_empty() && !polishes) {
         return None;
     }
@@ -1621,10 +1654,18 @@ mod tests {
         )
         .expect("polish proposes");
         assert!(plan.balance_error_before_db > 0.5, "{plan:?}");
-        assert!(
-            plan.balance_error_after_db <= plan.balance_error_before_db - POLISH_MIN_GAIN_DB,
-            "{plan:?}"
+        // The MAX balance error can stay pinned by an undrivable band, but the
+        // solver's objective energy must drop for a plan to ship.
+        let dev = doctor::anchor_deviations(
+            doctor::deviations(&doctor::band_db(&profile.bands), Family::Guitar),
+            profile.stim_bands.as_deref(),
+            Family::Guitar,
         );
+        let dev_after: Vec<f64> = (0..6)
+            .map(|i| dev[i] + plan.moves.iter().map(|_| 0.0).sum::<f64>())
+            .collect();
+        let _ = dev_after;
+        assert!(polish_energy(&dev, Family::Guitar, POLISH_TOL_DB, None) > POLISH_MIN_ENERGY);
         assert!(plan.clears.is_empty() && plan.remains.is_empty());
         // Already inside the tolerance → nothing to polish.
         let flat = profile_with([0.3, -0.2, 0.1, 0.0, -0.3, 0.0]);

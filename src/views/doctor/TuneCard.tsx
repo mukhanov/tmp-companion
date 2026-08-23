@@ -59,7 +59,7 @@ const DEFAULT_STIMULUS: DoctorStimulus = {
 };
 
 const INTRO =
-  "Runs rounds on the unit: try a move, listen, measure, then you decide — better, not better, or save. Each round learns how far this amp's knobs really move, and it keeps going past the coarse findings until every band sits within ±1 dB of the reference balance or the knobs can't get closer.";
+  "Runs small rounds on the unit: try a move, listen, measure, then you decide — better, not better, or save. Each round learns how far this amp's knobs really move and keeps offering the next small step until the balance is even or the knobs can't get it any closer.";
 
 /** One round's verdict row in the history strip. */
 interface RoundMark {
@@ -413,26 +413,6 @@ export function TuneCard({
         {candidate && (
           <div style={{ marginTop: t.space5 }}>
             <PlanMoves moves={candidate.moves} />
-            <div
-              style={{ ...label, marginTop: t.space4 }}
-              data-testid="tune-balance-error"
-            >
-              Distance to the reference balance:{" "}
-              {candidate.balanceErrorBeforeDb.toFixed(1)} →{" "}
-              <span
-                style={{
-                  color:
-                    candidate.balanceErrorAfterDb <
-                    candidate.balanceErrorBeforeDb
-                      ? t.good
-                      : t.ink2,
-                  fontWeight: 600,
-                }}
-              >
-                {candidate.balanceErrorAfterDb.toFixed(1)} dB
-              </span>{" "}
-              beyond ±1 dB (measured).
-            </div>
           </div>
         )}
 

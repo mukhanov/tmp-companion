@@ -364,19 +364,25 @@ with discard → the stored preset is reloaded).
   streak.
 - **Polish mode** (`doctor_plan::generate_plan_mode` with `POLISH_TOL_DB` = 1):
   the coarse rule gates are ±3–4 dB wide, so "no finding" is not "balanced".
-  The loop's objective adds a term pulling every body band's centered
-  deviation inside ±1 dB of the authored target and the Theil–Sen slope inside
-  ±1 dB/oct (weight 1, below a fired rule's 4), and a round is worth running
-  when it drops `balance_error_db` by ≥ 0.25 dB even with nothing fired. The
-  card prints "Distance to the reference balance: 3.2 → 1.1 dB beyond ±1 dB
-  (measured)" per round. (HW 2026-08-23: after one saved plan the rules were
-  quiet but the player still heard an unbalanced sound — the loop stopped at
-  "nothing left to fix"; this is the fix.)
+  The objective adds a term pulling every body band's centered deviation inside
+  ±1 dB of the authored target and the Theil–Sen slope inside ±1 dB/oct (weight
+  1, below a fired rule's 4). The "worth a round" test is the drop in
+  `polish_energy` — the SAME weighted SUM the solver minimizes — by ≥
+  `POLISH_MIN_ENERGY` (0.5 dB²), NOT the `balance_error_db` MAX: an
+  intentionally-voiced preset has one undrivable dominant band (e.g. a bright
+  Strat's −17 dB Lows) that pins the MAX high forever while the other bands
+  still even out, and deciding on the MAX made the loop stop with "no move
+  helps" though every round it did help (HW 2026-08-23). Rounds are GENTLE
+  (`doctor_tune::TUNE_BASE_CAP` = half the one-shot cap): a big imbalance is
+  evened over several auditioned steps, not one lurch. The player is the
+  arbiter of taste — a polish move that erodes the preset's character gets
+  "not better" and is excluded.
 - **Termination**: `converged` when the baseline has no tonal finding
-  (`TONAL_KEYS`) left AND sits inside the polish tolerance; `exhausted` when
-  no proposal exists (no drivable control, variants used up, or no move that
-  gains ≥ 0.25 dB). Both offer "Save what I kept" when the baseline carries
-  edits.
+  (`TONAL_KEYS`) left AND the polish energy is under `POLISH_MIN_ENERGY`;
+  `exhausted` when no proposal exists — and when that is "no finding, no move
+  evens it further", the message names it as the preset's own VOICING (a cab
+  or amp swap is the bigger change), not a defect the knobs can fix. Both
+  offer "Save what I kept" when the baseline carries edits.
 - **Device discipline**: round 1 captures the SAVED sound after the
   lazy-commit barrier (`doctor_fresh_load`); every round = `restore_saved_preset`
   → `ops_session` (cumulative ops, overlay-aware) → `doctor_capture_on_session
