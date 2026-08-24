@@ -524,31 +524,25 @@ pub(crate) async fn calibrate_profile(
         // #124 pre-flight: the device mixer's USB 3 strip, from the settings snapshot
         // the startup backup read persisted (`support/device-settings.json`). The
         // snapshot can be STALE — the mixer may have been touched since connecting —
-        // so it never vetoes a take on its own: a muted strip is the DEFINITE cause
-        // of a silent take (stated ahead of the lane hint), and a POST/off-unity
-        // fader refuses to persist a fader-scaled `calibration_lufs` even when the
-        // take itself landed. A take that succeeds despite a "muted" snapshot is
-        // simply a newer mixer state, and wins.
+        // and the two halves treat that risk DIFFERENTLY on purpose:
+        //
+        // - MUTE only ever EXPLAINS a take that produced nothing. It is handed to
+        //   `capture_dry_di`, which consults it solely on its silent-take path, so a
+        //   take that lands despite a "muted" snapshot is simply a newer mixer state
+        //   and wins. It is deliberately NOT prepended to arbitrary capture errors —
+        //   doing so turned a mid-capture unplug into a confident "USB 3 is MUTED".
+        // - The POST/off-unity FADER does veto a take that landed, because a landed
+        //   take persists the capture as the leveling stimulus (injected verbatim at
+        //   gain 1), so a fader-scaled one corrupts every later re-amp invisibly.
+        //   `usb3_fader_fault` carries the full reasoning and the replug recovery.
         let strip = settings_path
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|json| crate::backup_read::usb3_strip(&json));
-        let fader_fault = strip
+        let (mono, _peak) = crate::probe_api::stimulus::capture_dry_di(secs, strip.as_ref())?;
+        if let Some(f) = strip
             .as_ref()
-            .and_then(crate::probe_api::stimulus::usb3_fader_fault);
-        let (mono, _peak) = match crate::probe_api::stimulus::capture_dry_di(secs) {
-            Ok(take) => take,
-            Err(e) => {
-                let cause = strip
-                    .as_ref()
-                    .and_then(crate::probe_api::stimulus::usb3_muted_hint)
-                    .or(fader_fault);
-                return Err(match cause {
-                    Some(c) => format!("{c} [{e}]"),
-                    None => e,
-                });
-            }
-        };
-        if let Some(f) = fader_fault {
+            .and_then(crate::probe_api::stimulus::usb3_fader_fault)
+        {
             return Err(f);
         }
         // Reject a capture that's mostly silence (a valid capture becomes the stimulus,

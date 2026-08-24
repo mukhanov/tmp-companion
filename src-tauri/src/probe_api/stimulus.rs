@@ -785,7 +785,14 @@ pub(crate) fn probe_stimulus_path(topology_id: &str) -> Result<String, String> {
 /// OFF) and return `(mono samples, peak)`. The ONE dry-DI capture recipe — shared
 /// by `calibrate_profile` (Tier-2) and `probe --capture-wav` so their peak/silence
 /// guards can't drift apart.
-pub(crate) fn capture_dry_di(secs: f32) -> Result<(Vec<f32>, f32), String> {
+/// `strip` is the device mixer's USB 3 state from the startup backup snapshot, and is
+/// consulted ONLY to explain a silent take (see [`silent_dry_diagnosis`]) — never to
+/// refuse a capture that landed. `None` when unknown (no snapshot, or a caller that
+/// has none, like `probe --capture-wav`).
+pub(crate) fn capture_dry_di(
+    secs: f32,
+    strip: Option<&Usb3Strip>,
+) -> Result<(Vec<f32>, f32), String> {
     // Force normal mode (re-amp OFF) so the front instrument input flows to
     // USB-Out 3 — VERIFIED, not best-effort. In re-amp mode both input jacks are
     // muted and USB-Out 3/4 are disabled, so an OFF that never reached the unit
@@ -793,12 +800,22 @@ pub(crate) fn capture_dry_di(secs: f32) -> Result<(Vec<f32>, f32), String> {
     // the monitor's pause-ack came late, this connect raced the still-seized
     // device, and the swallowed failure left a silent take). A failed connect is
     // reported, NOT retried — hammering re-opens resets the HID lockout
-    // (`danger.md`); the user retries after a pause.
+    // (`danger.md`), so the message must not invite a fast retry.
+    //
+    // `connect_lean` (not `connect`): the OFF is a single setter needing no handshake
+    // payload, and the lean shape is the narrowest window onto a device this call is
+    // already racing — the same shape `leveller::reamp_off_guaranteed` sends every
+    // run-end OFF through. Failing loud is safe here: `set_reamp_mode` errors only on
+    // transport failure (the flaky `ReAmpModeChanged` echo comes back as
+    // `Option<bool>`, never `Err`), so a green send is a real send.
     {
-        let mut s = session::Session::connect().map_err(|e| {
+        let mut s = session::Session::connect_lean().map_err(|e| {
             format!(
                 "could not reach the device to switch re-amp OFF before the capture \
-                 ({e}) — wait a few seconds and try again"
+                 ({e}) — close Pro Control if it is running; otherwise the device is \
+                 in its post-session open lockout, which every retry RESTARTS: wait \
+                 ~30 s without clicking Calibrate, or unplug and replug the unit \
+                 (a replug also refreshes the mixer snapshot)"
             )
         })?;
         s.set_reamp_mode(false)
@@ -810,7 +827,7 @@ pub(crate) fn capture_dry_di(secs: f32) -> Result<(Vec<f32>, f32), String> {
     let peak = cap.channel_peak(audio::DRY_INSTRUMENT_IN_CH);
     if peak < DRY_AUDIBLE_PEAK {
         let peaks: Vec<f32> = (0..cap.channels).map(|c| cap.channel_peak(c)).collect();
-        return Err(silent_dry_diagnosis(&peaks));
+        return Err(silent_dry_diagnosis(&peaks, strip));
     }
     Ok((mono, peak))
 }
@@ -826,7 +843,14 @@ const DRY_AUDIBLE_PEAK: f32 = 1e-4;
 /// processing the guitar but its USB 3 dry send is off (USB mode / mixer strip);
 /// nothing anywhere means nothing reached the unit (not playing, or its input
 /// muted by re-amp).
-pub(crate) fn silent_dry_diagnosis(peaks: &[f32]) -> String {
+///
+/// A `strip` whose state makes silence CERTAIN ([`usb3_silent_cause`]) outranks all
+/// three lane guesses — it is a fact about the send, not an inference from what the
+/// other lanes carried. It is consulted only on this silent path: the snapshot can be
+/// stale, and prepending it to EVERY `capture_dry_di` failure (the shape this
+/// replaced) turned unrelated faults — a mid-capture unplug, a channel-count
+/// mismatch — into a confident "USB 3 is MUTED" misdiagnosis.
+pub(crate) fn silent_dry_diagnosis(peaks: &[f32], strip: Option<&Usb3Strip>) -> String {
     let lane = |i: usize| peaks.get(i).copied().unwrap_or(0.0);
     let processed = lane(0).max(lane(1));
     let dbfs = |v: f32| {
@@ -836,7 +860,10 @@ pub(crate) fn silent_dry_diagnosis(peaks: &[f32]) -> String {
             "silent".to_string()
         }
     };
-    let hint = if lane(3) >= DRY_AUDIBLE_PEAK {
+    let certain = strip.and_then(usb3_silent_cause);
+    let hint = if let Some(cause) = certain.as_deref() {
+        cause
+    } else if lane(3) >= DRY_AUDIBLE_PEAK {
         "the signal is on USB-Out 4 (the MIC/LINE jack) — plug the guitar into the \
          front INSTRUMENT input"
     } else if processed >= DRY_AUDIBLE_PEAK {
@@ -871,17 +898,52 @@ pub(crate) fn usb3_muted_hint(strip: &Usb3Strip) -> Option<String> {
     })
 }
 
+/// Every `USB 3` strip state under which a silent USB-Out 3 is EXPLAINED rather than
+/// guessed at — the two that make the send carry nothing at all:
+/// - muted ([`usb3_muted_hint`]);
+/// - `POST` with the fader all the way down, where the fader IS the send's gain.
+///
+/// `PRE` is fader-independent, so a `PRE` strip at any fader explains nothing and
+/// returns `None` — the lane hints then speak. Distinct from [`usb3_fader_fault`],
+/// which judges whether a take that LANDED is metrologically usable; this one only
+/// explains a take that produced nothing.
+pub(crate) fn usb3_silent_cause(strip: &Usb3Strip) -> Option<String> {
+    usb3_muted_hint(strip).or_else(|| {
+        (!strip.pre && strip.fader.abs() <= 0.01).then(|| {
+            "USB 3 is on POST with its fader at zero, so the dry instrument send is \
+             silent — on the unit: Global Settings → Mixer → USB 3 → set it to PRE (or \
+             raise the fader to unity), then calibrate again"
+                .to_string()
+        })
+    })
+}
+
 /// #124 pre-flight, gain half: on `POST` the fader scales the dry send, so an
-/// off-unity fader yields a DI whose loudness is NOT the instrument's — stored as
-/// `calibration_lufs` it would under- or over-drive every later re-amp. Refused
+/// off-unity fader yields a DI whose loudness is NOT the instrument's. Refused
 /// rather than compensated: the fader's dB law is unmeasured. `PRE` at any
 /// fader, or `POST` at unity, is clean.
+///
+/// THIS ONE DOES VETO A TAKE THAT LANDED, deliberately — the asymmetry with
+/// [`usb3_muted_hint`] is the whole point, and mistaking it for a bug is a
+/// well-trodden path (both a review pass and CodeRabbit filed it as one). The reason
+/// is that a successful take persists TWO things, not just the scalar: `store_capture`
+/// writes the capture, and `resolve_stimulus_for_leveling` then injects that WAV
+/// **verbatim at gain 1** as the profile's stimulus. A fader-scaled capture therefore
+/// drives every later re-amp through a nonlinear amp chain at the wrong level — wrong
+/// breakup, wrong `C`, silently wrong leveling and Doctor verdicts until someone
+/// recalibrates. Warning instead of refusing would trade a recoverable annoyance for
+/// durable, invisible corruption. (`clipped` is NOT a counter-precedent: it warns AND
+/// `store_capture` unlinks the capture, so no corrupt artifact survives.)
+///
+/// The snapshot behind it CAN be stale, which is why the message names the refresh:
+/// a detach fires `resetLibraryScan`, so a replug re-reads the mixer state.
 pub(crate) fn usb3_fader_fault(strip: &Usb3Strip) -> Option<String> {
     (!strip.pre && (strip.fader - 1.0).abs() > 0.01).then(|| {
         format!(
             "USB 3 is on POST with its fader at {:.0} % — the dry instrument send would be \
-             fader-scaled; on the unit set USB 3 to PRE (or its fader to unity), then \
-             calibrate again",
+             fader-scaled, and the capture is stored as the leveling stimulus, so this take \
+             cannot be trusted; on the unit set USB 3 to PRE (or its fader to unity), then \
+             unplug and replug the unit so the app re-reads the mixer, and calibrate again",
             strip.fader * 100.0
         )
     })
@@ -938,7 +1000,7 @@ mod usb3_strip_tests {
 
 #[cfg(test)]
 mod dry_diagnosis_tests {
-    use super::silent_dry_diagnosis;
+    use super::{silent_dry_diagnosis, usb3_silent_cause, Usb3Strip};
 
     // The "calibration can't see the guitar" bug class, second report (fw 1.8.58):
     // the take read silent on USB-Out 3 and the old error only said "play louder".
@@ -946,14 +1008,14 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn signal_on_the_mic_line_lane_points_at_the_wrong_jack() {
-        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3]);
+        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3], None);
         assert!(d.contains("MIC/LINE"), "{d}");
         assert!(d.contains("4 -10 dBFS"), "{d}");
     }
 
     #[test]
     fn processed_only_points_at_the_usb_dry_send() {
-        let d = silent_dry_diagnosis(&[0.5, 0.4, 0.0, 0.0]);
+        let d = silent_dry_diagnosis(&[0.5, 0.4, 0.0, 0.0], None);
         assert!(d.contains("USB 3") && d.contains("MUTED"), "{d}");
         assert!(d.contains("1/2 -6 dBFS"), "{d}");
         assert!(d.contains("3 silent"), "{d}");
@@ -961,7 +1023,7 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn all_silent_names_the_muted_input() {
-        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.0]);
+        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.0], None);
         assert!(
             d.contains("re-amp") && d.contains("muted in the device mixer"),
             "{d}"
@@ -971,8 +1033,60 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn a_short_capture_is_read_as_silent_lanes_not_a_panic() {
-        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0]);
+        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0], None);
         assert!(d.contains("4 silent"), "{d}");
+    }
+
+    // ── the snapshot is a TIE-BREAKER on the silent path, nothing more ────────
+    // Review found the mute hint prepended to EVERY `capture_dry_di` failure, so a
+    // mid-capture unplug reported "USB 3 is MUTED … [could not reach the device]".
+    // The strip now reaches only this function, and only outranks the lane guesses
+    // when it makes silence CERTAIN.
+
+    #[test]
+    fn a_muted_strip_outranks_the_lane_guess_and_keeps_the_readout() {
+        let muted = Usb3Strip {
+            mute: true,
+            fader: 1.0,
+            pre: true,
+        };
+        // Lanes alone would blame the MIC/LINE jack; the strip knows better.
+        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3], Some(&muted));
+        assert!(d.contains("MUTED"), "{d}");
+        assert!(
+            !d.contains("MIC/LINE"),
+            "lane guess should be outranked: {d}"
+        );
+        assert!(d.contains("4 -10 dBFS"), "readout must survive: {d}");
+    }
+
+    #[test]
+    fn post_at_zero_is_a_certain_silent_cause_but_pre_is_not() {
+        let post_zero = Usb3Strip {
+            mute: false,
+            fader: 0.0,
+            pre: false,
+        };
+        assert!(
+            usb3_silent_cause(&post_zero).is_some_and(|c| c.contains("POST") && c.contains("zero"))
+        );
+
+        // PRE is fader-independent — it explains nothing, so the lane hints speak.
+        let pre_zero = Usb3Strip {
+            pre: true,
+            ..post_zero
+        };
+        assert!(usb3_silent_cause(&pre_zero).is_none());
+        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.3], Some(&pre_zero));
+        assert!(d.contains("MIC/LINE"), "{d}");
+
+        // A clean strip never manufactures a cause.
+        let clean = Usb3Strip {
+            mute: false,
+            fader: 1.0,
+            pre: true,
+        };
+        assert!(usb3_silent_cause(&clean).is_none());
     }
 }
 
@@ -1004,7 +1118,7 @@ pub(crate) fn is_clipped_capture(samples: &[f32]) -> bool {
 /// save it as a 48 kHz mono f32 WAV — the real-DI side of `--stim-ab`. Reports
 /// peak (clip check — the dry tap has no limiter) and integrated LUFS.
 pub fn probe_capture_wav(path: &str, secs: f32) -> Result<String, String> {
-    let (mono, peak) = capture_dry_di(secs)?;
+    let (mono, peak) = capture_dry_di(secs, None)?;
     let lufs = lufs::measure_mono(&mono, 48_000)?.integrated_lufs;
     write_wav_mono(path, &mono, 48_000)?;
     Ok(format!(

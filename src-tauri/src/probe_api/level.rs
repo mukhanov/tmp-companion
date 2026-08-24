@@ -669,7 +669,10 @@ pub fn probe_capture_input(secs: f32) -> Result<String, String> {
     // stuck in re-amp reads as an all-silent take (both jacks muted, USB-Out 3/4
     // disabled) and would misdirect the very diagnosis this probe exists for.
     {
-        let mut s = Session::connect()
+        // `connect_lean` for the same reason as `capture_dry_di`: a bare setter needs
+        // no handshake payload, and the lean shape is the narrowest open onto a device
+        // whose exclusive-open lockout every failed attempt would restart.
+        let mut s = Session::connect_lean()
             .map_err(|e| format!("could not reach the device to switch re-amp OFF ({e})"))?;
         s.set_reamp_mode(false)
             .map_err(|e| format!("re-amp OFF was not accepted by the device ({e})"))?;
