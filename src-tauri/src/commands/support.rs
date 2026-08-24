@@ -172,7 +172,7 @@ fn append_bundle_members<R: tauri::Runtime, W: std::io::Write>(
         "app": info.name,
         "version": info.version,
         "firmware": firmware,
-        "macos": macos_product_version(),
+        "os": os_description(),
         "created": iso,
         "preset_name": preset_name,
     });
@@ -218,6 +218,29 @@ fn append_text<W: std::io::Write>(
         .map_err(|e| format!("tar append {name}: {e}"))
 }
 
+/// Host OS identity for the support bundle — e.g. `"macos 14.5"` or
+/// `"linux Debian GNU/Linux forky/sid"`, falling back to the bare OS name when the
+/// version is unreadable. Never fails the bundle.
+///
+/// This replaced a bare `sw_vers` call reported under a `"macos"` key. Off macOS
+/// that yielded nothing AND labelled the result `macos`, so a Linux bundle claimed
+/// an empty macOS version — worse than useless during triage, since the one field
+/// that identifies the host lies about it.
+fn os_description() -> String {
+    let os = std::env::consts::OS;
+    let detail = match os {
+        "macos" => macos_product_version(),
+        "linux" => std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|c| parse_os_release_pretty_name(&c)),
+        _ => None,
+    };
+    match detail {
+        Some(d) => format!("{os} {d}"),
+        None => os.to_string(),
+    }
+}
+
 /// `sw_vers -productVersion` (e.g. "14.5"); best-effort `None` on any failure.
 fn macos_product_version() -> Option<String> {
     let out = std::process::Command::new("sw_vers")
@@ -244,6 +267,26 @@ fn scrub_home(content: &str, home: &str) -> String {
         return content.to_string();
     }
     content.replace(home, "~")
+}
+
+/// `PRETTY_NAME` from an `/etc/os-release` body (e.g. `Debian GNU/Linux forky/sid`).
+/// The value is optionally double-quoted per the os-release spec, so strip one
+/// matched pair. Returns `None` when the key is absent or its value is empty —
+/// an empty string would render as a trailing space in `os_description`.
+fn parse_os_release_pretty_name(content: &str) -> Option<String> {
+    let raw = content
+        .lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))?
+        .trim();
+    let unquoted = raw
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(raw);
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
 }
 
 /// Keep only the LAST `cap` bytes of `bytes` (all of it when shorter).
@@ -285,6 +328,39 @@ fn fmt_utc(secs: u64) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn os_release_pretty_name_unquotes_and_rejects_empties() {
+        // Real Debian shape: quoted value among other keys.
+        let debian = "ID=debian\nPRETTY_NAME=\"Debian GNU/Linux forky/sid\"\nVERSION_ID=14\n";
+        assert_eq!(
+            parse_os_release_pretty_name(debian).as_deref(),
+            Some("Debian GNU/Linux forky/sid")
+        );
+        // Unquoted is legal per the os-release spec.
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=Alpine Linux v3.20").as_deref(),
+            Some("Alpine Linux v3.20")
+        );
+        // Absent key, and empty values (quoted or not) → None, so `os_description`
+        // falls back to the bare OS name instead of emitting "linux ".
+        assert_eq!(parse_os_release_pretty_name("ID=debian\n"), None);
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME=\"\""), None);
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME="), None);
+    }
+
+    #[test]
+    fn os_description_names_the_running_host() {
+        // Whatever the host, the description always LEADS with the OS name — the
+        // property triage depends on (the old "macos" key lied off macOS).
+        let d = os_description();
+        assert!(
+            d.starts_with(std::env::consts::OS),
+            "expected {d:?} to start with {:?}",
+            std::env::consts::OS
+        );
+        assert!(!d.ends_with(' '), "no dangling separator: {d:?}");
+    }
 
     #[test]
     fn scrub_replaces_home_and_no_ops_without_it() {

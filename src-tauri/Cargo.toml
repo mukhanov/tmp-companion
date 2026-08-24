@@ -52,6 +52,13 @@ core-foundation = "0.10"
 core-foundation-sys = "0.8"
 libc = "0.2"
 
+# Linux-only: the TMP is reached through hidraw (`/dev/hidraw*`), found by walking
+# sysfs — no udev crate, no C hidapi. libc supplies open/read/write/poll/close.
+# Same crate and version the macOS target already pulls, so this widens an existing
+# dependency rather than introducing one.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["custom-protocol", "dev-bins"]
 custom-protocol = ["tauri/custom-protocol"]

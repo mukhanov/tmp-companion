@@ -23,7 +23,6 @@ export function PickInlineMenu({ onClose, children }: PickInlineMenuProps) {
         style={{ position: "fixed", inset: 0, zIndex: 60 }}
       />
       <div
-        data-pick-menu=""
         style={{
           ...s.menuCard,
           position: "absolute",

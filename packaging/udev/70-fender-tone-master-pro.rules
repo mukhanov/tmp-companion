@@ -1,0 +1,17 @@
+# Fender Tone Master Pro — hidraw access for TMP Companion (Linux).
+#
+# /dev/hidraw* is root-only by default, so without this rule the app fails to open
+# the device with EACCES. TAG+="uaccess" hands the node to whoever is logged in at
+# the seat, via systemd-logind — no group to create and no user to add, and access
+# follows the active session rather than being granted permanently to a group.
+#
+# Install:
+#   sudo cp packaging/udev/70-fender-tone-master-pro.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then unplug and replug the unit (the rule applies when the node is created).
+#
+# The unit enumerates TWO USB interfaces — 1ed8:0044 and 1ed8:0047. Only 0044 carries
+# the control protocol this app speaks (hid.rs PID); 0047 is matched as well so the
+# whole device is consistently owned by the logged-in user rather than half of it.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1ed8", ATTRS{idProduct}=="0044", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1ed8", ATTRS{idProduct}=="0047", TAG+="uaccess"

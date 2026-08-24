@@ -10,7 +10,16 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: macos-14 # the Rust crate is macOS-only (IOKit/CoreAudio)
+    # macOS is the shipping platform (IOKit HID + CoreAudio re-amp). Linux runs the
+    # same gates to hold the platform boundary: everything above the `HidTransport`
+    # seam must stay portable, and a stray `target_os` assumption elsewhere in the
+    # crate should fail HERE rather than during a port. `fail-fast: false` so one
+    # platform's failure never hides the other's result.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,6 +34,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.os }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+            librsvg2-dev libasound2-dev
+        # webkit2gtk/xdo/appindicator/rsvg are Tauri's Linux webview stack; asound is
+        # for cpal, which is an unconditional dependency and must compile even though
+        # the re-amp paths are macOS-only today.
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
@@ -32,6 +53,11 @@ jobs:
       - name: Build frontend (also produces dist/ for tauri-build)
         run: bun run build
 
+      # Every gate runs on both legs. The frontend ones are mostly platform-agnostic,
+      # but the typecheck and build are not: Linux filesystems are case-sensitive
+      # where macOS is not, so a wrong-case import (`./Foo` for `foo.ts`) passes on
+      # macOS and fails only here. Keeping the leg uniform costs little (the Vitest
+      # suite is ~20 s) and leaves nothing to explain about why a step is skipped.
       - name: Lint
         run: bun run lint
 
@@ -70,7 +96,16 @@ jobs:
         run: cargo fmt --check
 
   e2e:
-    runs-on: macos-14 # exclusive-seize HID + CoreAudio; offline uses the SimDevice fake
+    # The offline suite needs no device — it drives the real UI in headless Chromium
+    # through the HTTP bridge into a windowless Rust backend against SimDevice. That
+    # makes it the strongest cross-platform signal available: it exercises the whole
+    # command surface, so a backend path that only compiles (but does not RUN) off
+    # macOS fails here rather than in someone's port.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,15 +119,45 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.os }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+            librsvg2-dev libasound2-dev
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      # --with-deps pulls Chromium's shared libraries on Linux; it is a no-op-ish
+      # extra on macOS, so the flag is scoped rather than applied to both.
       - name: Install Playwright Chromium
-        run: bunx playwright install chromium
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            bunx playwright install --with-deps chromium
+          else
+            bunx playwright install chromium
+          fi
 
+      # Linux runners are CPU-constrained enough that the default 3-worker offline
+      # suite intermittently blows level-fs-preset24's 240 s test timeout (reproduced
+      # on GitHub's own ubuntu-latest hardware, not just underpowered local boxes);
+      # macos-14 has no such issue at the default worker count. Serializing on Linux
+      # trades CI minutes for reliability rather than touching the shared spec/config.
+      #
+      # The non-Linux branch is deliberately EMPTY, not "3": `bun run e2e` is
+      # scripts/e2e.sh, whose `WORKERS="${TMP_E2E_WORKERS:-3}"` substitutes on empty as
+      # well as unset and re-exports the resolved value before Playwright ever starts.
+      # So empty means "take e2e.sh's default" and there is exactly one place that
+      # default lives; hardcoding 3 here would let macOS CI silently diverge from a
+      # local run if it ever changed.
       - name: Offline e2e (SimDevice)
         run: bun run e2e
+        env:
+          TMP_E2E_WORKERS: ${{ runner.os == 'Linux' && '1' || '' }}
 
   commitlint:
     if: github.event_name == 'pull_request'

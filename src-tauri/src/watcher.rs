@@ -18,7 +18,14 @@ use std::sync::{Arc, Mutex};
 use crate::session::Session;
 
 /// Event names the frontend listens for (`@tauri-apps/api/event`).
+///
+/// Only the macOS `imp` emits these today, so off macOS they are genuinely dead
+/// until a platform watcher exists to fire them. The allow is scoped to exactly
+/// that case rather than blanket-applied to the module, so a constant going
+/// unused ON macOS still surfaces as a warning.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const EVT_ATTACHED: &str = "tmp://device-attached";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const EVT_DETACHED: &str = "tmp://device-detached";
 
 /// Spawn the watcher thread. Lives for the whole process; never joined.

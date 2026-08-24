@@ -73,6 +73,21 @@ fn fold_frame_open(reports: &[Vec<u8>], mut open: bool) -> bool {
     open
 }
 
+/// Extract `(vendor_id, product_id)` from a sysfs `uevent` body.
+///
+/// The kernel writes `HID_ID=<bus>:<vendor>:<product>` with each field zero-padded
+/// uppercase hex (e.g. `HID_ID=0003:00001ED8:00000044` for the TMP). Pure so the
+/// hidraw lookup is testable without sysfs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_hid_id(uevent: &str) -> Option<(i32, i32)> {
+    let line = uevent.lines().find_map(|l| l.strip_prefix("HID_ID="))?;
+    let mut parts = line.trim().split(':');
+    let _bus = parts.next()?;
+    let vid = i32::from_str_radix(parts.next()?, 16).ok()?;
+    let pid = i32::from_str_radix(parts.next()?, 16).ok()?;
+    Some((vid, pid))
+}
+
 /// Handle to the HID worker thread. Dropping it closes the device.
 pub struct Hid {
     cmd_tx: Sender<Cmd>,
@@ -114,7 +129,12 @@ pub trait HidTransport: Send {
     /// Send `body` as chunked output reports (`0x33/0x34*/0x35`) for bodies over
     /// `MAX_BODY`, then pump `pump_ms` and return the raw input reports.
     fn transact_chunked(&self, body: &[u8], pump_ms: u64) -> Result<Vec<Vec<u8>>, String>;
-    /// Pump without sending — collects reports that land after a prior send.
+    /// Pump without sending — collects reports that land after a prior send. An implementation
+    /// MAY return before `pump_ms` elapses (the sim returns instantly) — this is not a promise
+    /// of wall-clock duration, only of "however long this pump took, here's what arrived". A
+    /// caller that needs actual wall-clock pacing across a wait loop (spacing retries, not just
+    /// collecting) must measure elapsed time itself rather than counting nominal pump slices;
+    /// see `leveller::ensure_fresh_load_paced`'s wait loop for the pattern.
     fn pump(&self, pump_ms: u64) -> Result<Vec<Vec<u8>>, String>;
     /// Like [`Self::transact`], but returns EARLY once the response framing is complete
     /// and the line has gone quiet (`max_ms` stays the hard cap, so the worst case equals
@@ -579,11 +599,324 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux hidraw transport.
+///
+/// Why hidraw and not the `hidapi` crate: hidraw needs no C dependency and no udev
+/// crate — the device node is found by walking sysfs (see [`parse_hid_id`]) — which
+/// keeps this a zero-new-dependency port.
+///
+/// There is no seize here, and none is needed. `kIOHIDOptionsTypeSeizeDevice` exists
+/// on macOS to lock Pro Control out of the device; Fender ships no Pro Control for
+/// Linux, so nothing competes for the unit. The macOS open-retry tuning (the
+/// `0xe00002c5` lockout, the 8 s quiet backoff) describes IOKit exclusive-open
+/// behaviour and is deliberately NOT copied: there is no evidence the same lockout
+/// exists here, and inventing retries for an unobserved failure mode would just make
+/// a real error slow to surface.
+///
+/// Threading mirrors the macOS side so [`Hid`] behaves identically: one worker thread
+/// owns the fd for its whole life and other threads issue commands over a channel.
+/// The blocking `poll`/`read` loop replaces `CFRunLoopRunInMode` and is a good deal
+/// simpler — no run loop, no C callback, no shared receive buffer.
+///
+/// # Inbound framing needs no fixup (measured, fw 1.8.58)
+///
+/// Inbound frames are parsed as `[0x00, magic, _, body_len, …]` while OUTBOUND frames
+/// put the magic at index 0 (`proto::make_envelope`). That asymmetry looks like a
+/// report-ID artifact of the reading API, which would differ per HID backend and force
+/// this module to re-add or strip a byte.
+///
+/// It is not. Every inbound report reads as **64 bytes beginning with a literal
+/// `0x00`** — the leading byte is part of the device's report, not something IOKit
+/// prepends. Confirmed on hardware over a full preset-list harvest: 668/668 reports
+/// `n=64`, first bytes `00 35 …` / `00 33 …` / `00 34 …`, and zero in the bare
+/// `[magic, …]` shape.
+///
+/// So reports go up RAW, exactly as the macOS input callback pushes them, and
+/// `proto.rs` plus its golden vectors stay byte-identical across platforms. Reports
+/// that are not frames need no filtering here either — `proto::reassemble_streams`
+/// already skips anything failing `len >= 4 && data[0] == 0x00`.
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::ffi::CString;
+    use std::io::Error as IoError;
+    use std::os::raw::c_void;
+    use std::time::{Duration, Instant};
+
+    /// Locate the TMP's `/dev/hidraw*` node via sysfs.
+    fn find_hidraw() -> Result<CString, String> {
+        let dir = std::fs::read_dir("/sys/class/hidraw")
+            .map_err(|e| format!("cannot list /sys/class/hidraw ({e}) — is hidraw available?"))?;
+        let mut seen = 0usize;
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("hidraw") {
+                continue;
+            }
+            seen += 1;
+            let Ok(body) = std::fs::read_to_string(entry.path().join("device/uevent")) else {
+                continue;
+            };
+            if parse_hid_id(&body) == Some((VID, PID)) {
+                return CString::new(format!("/dev/{name}")).map_err(|e| e.to_string());
+            }
+        }
+        Err(format!(
+            "no TMP found (VID 0x{VID:04X} / PID 0x{PID:02X}) among {seen} HID device(s) — is it plugged in?"
+        ))
+    }
+
+    fn open_device() -> Result<i32, String> {
+        let path = find_hidraw()?;
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let err = IoError::last_os_error();
+            // EACCES is the overwhelmingly common first-run failure: the node defaults
+            // to root-only. Name the fix rather than surfacing a bare errno.
+            let hint = if err.raw_os_error() == Some(libc::EACCES) {
+                " — no permission for the hidraw node; install the udev rule (see CONTRIBUTING.md), then unplug and replug the unit"
+            } else {
+                ""
+            };
+            return Err(format!("open {}: {err}{hint}", path.to_string_lossy()));
+        }
+
+        // hidraw has no equivalent of IOKit's exclusive seize: two processes can open
+        // the same node and interleave reads and writes on it. Verified — two `probe`
+        // runs opened this device concurrently and both proceeded, where the second
+        // would have failed 0xe00002c5 on macOS. The rest of the codebase assumes that
+        // cannot happen (the write-safety rules in particular), so restore the
+        // invariant with an advisory whole-file lock: every path into the device goes
+        // through here, so our own processes mutually exclude. It is advisory, which is
+        // enough — Fender ships no Pro Control for Linux, so nothing else contends.
+        // The lock releases on close, including on abnormal exit.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+            let err = IoError::last_os_error();
+            unsafe { libc::close(fd) };
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(
+                    "the Tone Master Pro is already in use by another TMP Companion process (app or probe) — close it and retry"
+                        .into(),
+                );
+            }
+            return Err(format!("lock {}: {err}", path.to_string_lossy()));
+        }
+        Ok(fd)
+    }
+
+    /// hidraw takes the report ID as the first byte written. The TMP uses unnumbered
+    /// reports, so that byte is `0x00` and the device receives exactly the 63-byte
+    /// frame — the same bytes IOKit puts on the wire via `SetReport(reportID = 0)`.
+    fn write_frame(fd: i32, frame: &[u8]) -> Result<(), String> {
+        let mut pkt = Vec::with_capacity(frame.len() + 1);
+        pkt.push(0x00);
+        pkt.extend_from_slice(frame);
+        let n = unsafe { libc::write(fd, pkt.as_ptr() as *const c_void, pkt.len()) };
+        if n < 0 {
+            return Err(format!("hidraw write: {}", IoError::last_os_error()));
+        }
+        if n as usize != pkt.len() {
+            return Err(format!("hidraw short write: {n} of {}", pkt.len()));
+        }
+        Ok(())
+    }
+
+    fn send_body(fd: i32, body: &[u8]) -> Result<(), String> {
+        for pkt in proto::make_chunked_envelopes(body) {
+            write_frame(fd, &pkt)?;
+        }
+        Ok(())
+    }
+
+    /// Collect reports for up to `ms`, then return — the same "burn the budget" shape
+    /// as `CFRunLoopRunInMode`, so callers reassemble cumulatively across pumps.
+    fn pump_into(fd: i32, ms: u64, out: &mut Vec<Vec<u8>>) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc =
+                unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) };
+            if rc < 0 {
+                // A signal is not a failure; anything else ends the pump.
+                if IoError::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if rc == 0 || pfd.revents & libc::POLLIN == 0 {
+                return; // budget expired, or POLLERR/POLLHUP — the device is gone
+            }
+            let mut buf = [0u8; 64];
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+            if n <= 0 {
+                return;
+            }
+            // Pushed RAW, exactly as the macOS input callback does — see the module
+            // note on inbound framing for why no report-id fixup is needed here.
+            #[allow(clippy::cast_sign_loss)] // n > 0 checked immediately above
+            out.push(buf[..n as usize].to_vec());
+        }
+    }
+
+    fn pump(fd: i32, ms: u64) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        pump_into(fd, ms, &mut out);
+        out
+    }
+
+    /// [`Cmd::TransactEager`]: pump in slices and return once the framing is complete
+    /// and the line has gone quiet. Identical policy to the macOS path — it reuses the
+    /// same pure [`fold_frame_open`] — with `max_ms` as the hard cap.
+    fn pump_eager(fd: i32, max_ms: u64) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut elapsed = 0u64;
+        let mut open = false;
+        let mut scanned = 0usize;
+        let mut quiet = 0u64;
+        while elapsed < max_ms {
+            let slice = EAGER_SLICE_MS.min(max_ms - elapsed);
+            pump_into(fd, slice, &mut out);
+            elapsed += slice;
+            if out.len() > scanned {
+                open = fold_frame_open(&out[scanned..], open);
+                scanned = out.len();
+                quiet = 0;
+            } else {
+                quiet += slice;
+            }
+            if scanned > 0 && !open && quiet >= EAGER_QUIET_MS {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn open() -> Result<Hid, String> {
+        let (ready_tx, ready_rx) = bounded::<Result<(), String>>(1);
+        let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
+
+        let join = std::thread::Builder::new()
+            .name("tmp-hid".into())
+            .spawn(move || {
+                let fd = match open_device() {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+
+                for cmd in cmd_rx.iter() {
+                    match cmd {
+                        Cmd::Send(body, reply) => {
+                            let _ = reply.send(send_body(fd, &body));
+                        }
+                        // Chunking is inside send_body, so plain and chunked transacts
+                        // are the same operation here (as on macOS).
+                        Cmd::Transact(body, ms, reply) | Cmd::TransactChunked(body, ms, reply) => {
+                            match send_body(fd, &body) {
+                                Ok(()) => {
+                                    let _ = reply.send(Ok(pump(fd, ms)));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            }
+                        }
+                        Cmd::Pump(ms, reply) => {
+                            let _ = reply.send(Ok(pump(fd, ms)));
+                        }
+                        Cmd::TransactEager(body, max_ms, reply) => match send_body(fd, &body) {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(pump_eager(fd, max_ms)));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        },
+                        Cmd::Close => break,
+                    }
+                }
+
+                if unsafe { libc::close(fd) } < 0 {
+                    log::warn!("hidraw close failed: {}", IoError::last_os_error());
+                }
+            })
+            .map_err(|e| format!("spawn HID thread: {e}"))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Hid {
+                cmd_tx,
+                join: Some(join),
+            }),
+            Ok(Err(e)) => {
+                let _ = join.join();
+                Err(e)
+            }
+            Err(_) => Err("HID thread exited before reporting status".into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        // A child module, not a sibling of the outer `tests`: `pump_into` is private to
+        // `imp`, and only a child can reach it. That access is the whole point — the
+        // property under test belongs to the transport, not to a helper beside it.
+        use super::*;
+
+        /// Pins the measured hidraw wire shape (see the Linux `imp` module note): a real
+        /// inbound report is 64 bytes led by a literal `0x00`, and reaches the parsers
+        /// RAW. If a future change ever re-adds a report-id fixup, this is the assertion
+        /// that should have stopped it.
+        ///
+        /// Driven through the real [`pump_into`] over a pipe rather than over a buffer
+        /// built in the test: a fixup would live inside `pump_into`, so a test that
+        /// constructs its own report and inspects it can never observe one.
+        #[test]
+        fn a_real_inbound_report_needs_no_report_id_fixup() {
+            // Byte-for-byte head of a report captured from a TMP on fw 1.8.58 (the 0x35
+            // single-frame reply that opens a preset-list harvest), zero-padded to 64.
+            let mut raw = vec![0u8; 64];
+            raw[..4].copy_from_slice(&[0x00, 0x35, 0x00, 0x06]);
+
+            // A pipe is fd-compatible with the poll/read loop and needs no hardware.
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+            let (rd, wr) = (fds[0], fds[1]);
+            let written = unsafe { libc::write(wr, raw.as_ptr() as *const c_void, raw.len()) };
+            assert_eq!(written, 64, "write()");
+            // Close the write end so the pump sees EOF instead of burning its budget.
+            assert_eq!(unsafe { libc::close(wr) }, 0, "close(wr)");
+
+            let mut out = Vec::new();
+            pump_into(rd, 250, &mut out);
+            assert_eq!(unsafe { libc::close(rd) }, 0, "close(rd)");
+
+            // Exactly one report, byte-identical to the wire: no byte stripped, none
+            // inserted, no re-framing.
+            assert_eq!(out, vec![raw.clone()]);
+            // And what came out folds as a CLOSED single frame, so the parsers' own
+            // admission test (`len >= 4 && data[0] == 0x00`) passes on it as-is.
+            assert!(!fold_frame_open(&out, false));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod imp {
     use super::*;
     pub fn open() -> Result<Hid, String> {
-        Err("TMP Companion requires macOS (IOKit HID)".into())
+        Err("TMP Companion supports macOS (IOKit HID) and Linux (hidraw)".into())
     }
 }
 
@@ -599,6 +932,21 @@ mod tests {
         r[1] = magic;
         r[3] = 4; // body_len (irrelevant to the fold)
         r
+    }
+
+    #[test]
+    fn hid_id_parses_the_kernels_zero_padded_hex() {
+        // Real shape from /sys/class/hidraw/hidrawN/device/uevent — the TMP.
+        let tmp = "DRIVER=hid-generic\nHID_ID=0003:00001ED8:00000044\nHID_NAME=Tone Master Pro\n";
+        assert_eq!(parse_hid_id(tmp), Some((VID, PID)));
+        // A different device must not match (this is the whole point of the lookup).
+        let mouse = "HID_ID=0003:0000046D:0000C077\nHID_NAME=Logitech USB Optical Mouse\n";
+        assert_eq!(parse_hid_id(mouse), Some((0x046D, 0xC077)));
+        assert_ne!(parse_hid_id(mouse), Some((VID, PID)));
+        // Absent / malformed lines yield None rather than a bogus id.
+        assert_eq!(parse_hid_id("DRIVER=hid-generic\n"), None);
+        assert_eq!(parse_hid_id("HID_ID=0003:notahex:00000044"), None);
+        assert_eq!(parse_hid_id("HID_ID=0003:00001ED8"), None);
     }
 
     #[test]
