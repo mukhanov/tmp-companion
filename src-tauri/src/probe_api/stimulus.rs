@@ -824,19 +824,72 @@ pub(crate) fn capture_dry_di(
     std::thread::sleep(std::time::Duration::from_millis(300));
     let cap = audio::capture_input(secs.clamp(2.0, 30.0), 48_000)?;
     let mono = cap.require_channel(audio::DRY_INSTRUMENT_IN_CH)?;
-    let peak = cap.channel_peak(audio::DRY_INSTRUMENT_IN_CH);
-    if peak < DRY_AUDIBLE_PEAK {
-        let peaks: Vec<f32> = (0..cap.channels).map(|c| cap.channel_peak(c)).collect();
-        return Err(silent_dry_diagnosis(&peaks, strip));
+    let lanes: Vec<DryLane> = (0..cap.channels)
+        .map(|c| DryLane::of(&cap.channel(c), 48_000))
+        .collect();
+    if let Some(fault) = dry_take_fault(&lanes, strip) {
+        return Err(fault);
     }
+    let peak = lanes
+        .get(audio::DRY_INSTRUMENT_IN_CH)
+        .map_or(0.0, |l| l.peak);
     Ok((mono, peak))
 }
 
-/// Peak floor below which a dry-DI lane counts as silent (−80 dBFS).
-const DRY_AUDIBLE_PEAK: f32 = 1e-4;
+/// One capture lane as the dry-take guards see it: its peak — for the dBFS
+/// readout only — and whether it carries MEASURABLE audio.
+///
+/// `measurable` is the load-bearing field, and it is deliberately NOT an amplitude
+/// threshold. A tuned peak floor cannot separate "no signal" from "quiet signal"
+/// across units: the dev unit (fw 1.8.45) idles at −74.6 dBFS on the dry lane and
+/// −71.5 on the processed pair, BOTH above the −80 dBFS floor this replaced — so a
+/// not-playing take there cleared the gate entirely and surfaced as the terse
+/// non-finite-LUFS error, never reaching [`silent_dry_diagnosis`]. Moving that same
+/// peak test later would have been worse than leaving it: the processed pair's own
+/// floor clears the threshold too, so the lane hint would have blamed a MUTED USB 3
+/// on a perfectly clean unit. Integrated loudness settles both with no tunable at
+/// all: BS.1770's −70 LUFS ABSOLUTE gate makes any floor below it non-finite, and
+/// both measured floors sit well under it (a floor loud enough to integrate ABOVE
+/// −70 LUFS is signal to any silence gate; the downstream active-window and
+/// spread checks own that case). That is why no constant is retuned here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DryLane {
+    /// Peak absolute amplitude (linear, 0..1). Display only.
+    pub peak: f32,
+    /// `true` when the lane has a FINITE integrated loudness.
+    pub measurable: bool,
+}
 
-/// Why a dry-DI take read silent on USB-Out 3, told from the OTHER lanes' peaks
-/// (index = capture channel: 0/1 processed, 2 dry instrument, 3 dry mic/line).
+impl DryLane {
+    fn of(samples: &[f32], sample_rate: u32) -> Self {
+        Self {
+            peak: samples.iter().fold(0.0f32, |m, &s| m.max(s.abs())),
+            // A meter that refuses the buffer outright (too short to gate) is
+            // "not measurable" in exactly the sense this guard means.
+            measurable: lufs::measure_mono(samples, sample_rate)
+                .is_ok_and(|l| l.integrated_lufs.is_finite()),
+        }
+    }
+}
+
+/// The ONE verdict on a dry-DI take: `Some(diagnosis)` when USB-Out 3 carried
+/// nothing measurable. Pure, so the whole guard is unit-testable without a device
+/// — [`capture_dry_di`] only builds the lanes and propagates.
+///
+/// Shared by BOTH callers on purpose (`calibrate_profile` and `probe --capture-wav`)
+/// so their silence guards can't drift. That does tighten `--capture-wav`: it now
+/// refuses an unmeasurable take instead of writing a WAV that later reads `-inf`
+/// LUFS. Deliberate — that WAV was never usable.
+pub(crate) fn dry_take_fault(lanes: &[DryLane], strip: Option<&Usb3Strip>) -> Option<String> {
+    let carried = lanes
+        .get(audio::DRY_INSTRUMENT_IN_CH)
+        .is_some_and(|l| l.measurable);
+    (!carried).then(|| silent_dry_diagnosis(lanes, strip))
+}
+
+/// Why a dry-DI take read silent on USB-Out 3, told from which OTHER lanes carried
+/// MEASURABLE audio (index = capture channel: 0/1 processed, 2 dry instrument,
+/// 3 dry mic/line). Reached only through [`dry_take_fault`].
 /// The lane that DID carry signal names the routing fault, so the error is
 /// self-diagnosing instead of blaming the player: signal on USB-Out 4 means the
 /// guitar is in the MIC/LINE jack; signal on 1/2 only means the unit IS
@@ -850,12 +903,25 @@ const DRY_AUDIBLE_PEAK: f32 = 1e-4;
 /// stale, and prepending it to EVERY `capture_dry_di` failure (the shape this
 /// replaced) turned unrelated faults — a mid-capture unplug, a channel-count
 /// mismatch — into a confident "USB 3 is MUTED" misdiagnosis.
-pub(crate) fn silent_dry_diagnosis(peaks: &[f32], strip: Option<&Usb3Strip>) -> String {
-    let lane = |i: usize| peaks.get(i).copied().unwrap_or(0.0);
-    let processed = lane(0).max(lane(1));
-    let dbfs = |v: f32| {
-        if v >= DRY_AUDIBLE_PEAK {
-            format!("{:.0} dBFS", 20.0 * v.log10())
+pub(crate) fn silent_dry_diagnosis(lanes: &[DryLane], strip: Option<&Usb3Strip>) -> String {
+    let lane = |i: usize| {
+        lanes.get(i).copied().unwrap_or(DryLane {
+            peak: 0.0,
+            measurable: false,
+        })
+    };
+    // USB-Out 1/2 is reported as one lane: either channel carrying audio means the
+    // unit IS processing, and the readout shows the louder of the pair.
+    let processed = DryLane {
+        peak: lane(0).peak.max(lane(1).peak),
+        measurable: lane(0).measurable || lane(1).measurable,
+    };
+    // A lane below the meter's gate prints as "silent" rather than as its noise
+    // floor's dBFS — an idle −74.6 dBFS lane carries nothing, and saying so beats
+    // printing a number that looks like signal.
+    let dbfs = |l: DryLane| {
+        if l.measurable {
+            format!("{:.0} dBFS", 20.0 * l.peak.log10())
         } else {
             "silent".to_string()
         }
@@ -863,10 +929,10 @@ pub(crate) fn silent_dry_diagnosis(peaks: &[f32], strip: Option<&Usb3Strip>) -> 
     let certain = strip.and_then(usb3_silent_cause);
     let hint = if let Some(cause) = certain.as_deref() {
         cause
-    } else if lane(3) >= DRY_AUDIBLE_PEAK {
+    } else if lane(3).measurable {
         "the signal is on USB-Out 4 (the MIC/LINE jack) — plug the guitar into the \
          front INSTRUMENT input"
-    } else if processed >= DRY_AUDIBLE_PEAK {
+    } else if processed.measurable {
         "the device is processing a signal but USB-Out 3 carries no dry instrument \
          send — the USB 3 channel is probably MUTED in the device mixer (on the unit: \
          Mixer → USB 3 → unmute M, fader up); also check Global Settings → I/O → USB \
@@ -1000,7 +1066,24 @@ mod usb3_strip_tests {
 
 #[cfg(test)]
 mod dry_diagnosis_tests {
-    use super::{silent_dry_diagnosis, usb3_silent_cause, Usb3Strip};
+    use super::{dry_take_fault, silent_dry_diagnosis, usb3_silent_cause, DryLane, Usb3Strip};
+
+    /// A lane carrying real audio at `peak`.
+    fn live(peak: f32) -> DryLane {
+        DryLane {
+            peak,
+            measurable: true,
+        }
+    }
+
+    /// A lane with nothing measurable on it — `peak` is its NOISE FLOOR, which on a
+    /// real unit is emphatically not zero (see the floor incident below).
+    fn floor(peak: f32) -> DryLane {
+        DryLane {
+            peak,
+            measurable: false,
+        }
+    }
 
     // The "calibration can't see the guitar" bug class, second report (fw 1.8.58):
     // the take read silent on USB-Out 3 and the old error only said "play louder".
@@ -1008,14 +1091,14 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn signal_on_the_mic_line_lane_points_at_the_wrong_jack() {
-        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3], None);
+        let d = silent_dry_diagnosis(&[live(0.2), live(0.2), floor(0.0), live(0.3)], None);
         assert!(d.contains("MIC/LINE"), "{d}");
         assert!(d.contains("4 -10 dBFS"), "{d}");
     }
 
     #[test]
     fn processed_only_points_at_the_usb_dry_send() {
-        let d = silent_dry_diagnosis(&[0.5, 0.4, 0.0, 0.0], None);
+        let d = silent_dry_diagnosis(&[live(0.5), live(0.4), floor(0.0), floor(0.0)], None);
         assert!(d.contains("USB 3") && d.contains("MUTED"), "{d}");
         assert!(d.contains("1/2 -6 dBFS"), "{d}");
         assert!(d.contains("3 silent"), "{d}");
@@ -1023,7 +1106,7 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn all_silent_names_the_muted_input() {
-        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.0], None);
+        let d = silent_dry_diagnosis(&[floor(0.0), floor(0.0), floor(0.0), floor(0.0)], None);
         assert!(
             d.contains("re-amp") && d.contains("muted in the device mixer"),
             "{d}"
@@ -1033,7 +1116,7 @@ mod dry_diagnosis_tests {
 
     #[test]
     fn a_short_capture_is_read_as_silent_lanes_not_a_panic() {
-        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0], None);
+        let d = silent_dry_diagnosis(&[floor(0.0), floor(0.0), floor(0.0)], None);
         assert!(d.contains("4 silent"), "{d}");
     }
 
@@ -1051,7 +1134,7 @@ mod dry_diagnosis_tests {
             pre: true,
         };
         // Lanes alone would blame the MIC/LINE jack; the strip knows better.
-        let d = silent_dry_diagnosis(&[0.2, 0.2, 0.0, 0.3], Some(&muted));
+        let d = silent_dry_diagnosis(&[live(0.2), live(0.2), floor(0.0), live(0.3)], Some(&muted));
         assert!(d.contains("MUTED"), "{d}");
         assert!(
             !d.contains("MIC/LINE"),
@@ -1077,7 +1160,10 @@ mod dry_diagnosis_tests {
             ..post_zero
         };
         assert!(usb3_silent_cause(&pre_zero).is_none());
-        let d = silent_dry_diagnosis(&[0.0, 0.0, 0.0, 0.3], Some(&pre_zero));
+        let d = silent_dry_diagnosis(
+            &[floor(0.0), floor(0.0), floor(0.0), live(0.3)],
+            Some(&pre_zero),
+        );
         assert!(d.contains("MIC/LINE"), "{d}");
 
         // A clean strip never manufactures a cause.
@@ -1087,6 +1173,90 @@ mod dry_diagnosis_tests {
             pre: true,
         };
         assert!(usb3_silent_cause(&clean).is_none());
+    }
+
+    // ── the noise-floor incident (fw 1.8.45, probe --capture-input, 2026-08-24) ──
+    // The dev unit idles at −74.6 dBFS on the dry lane and −71.5 on the processed
+    // pair. BOTH clear the −80 dBFS peak floor the guard used to key on, so a
+    // not-playing take there was classed as GOOD: it returned Ok and surfaced much
+    // later as the terse "too quiet to measure", never running this diagnosis.
+    // Guarding on integrated loudness instead fixes it with no tunable — and the
+    // second assertion is the reason the LANE test had to move too: the processed
+    // pair's floor clears the very same threshold, so a peak-keyed lane hint would
+    // have told a user on a spotless unit that USB 3 was muted.
+
+    /// −74.6 dBFS, the dev unit's idle dry lane.
+    const IDLE_DRY_PEAK: f32 = 1.86e-4;
+    /// −71.5 dBFS, the same unit's idle processed pair.
+    const IDLE_PROCESSED_PEAK: f32 = 2.66e-4;
+
+    #[test]
+    fn an_idle_lane_above_the_old_peak_floor_still_faults_and_blames_no_one() {
+        let lanes = [
+            floor(IDLE_PROCESSED_PEAK),
+            floor(IDLE_PROCESSED_PEAK),
+            floor(IDLE_DRY_PEAK),
+            floor(IDLE_DRY_PEAK),
+        ];
+        // It must be a fault at all — this is what the peak floor let through.
+        let d = dry_take_fault(&lanes, None).expect("an unmeasurable dry lane must fault");
+        assert!(d.contains("play continuously"), "{d}");
+        assert!(
+            !d.contains("processing a signal"),
+            "an idle processed pair is not signal: {d}"
+        );
+        assert!(d.contains("1/2 silent") && d.contains("3 silent"), "{d}");
+    }
+
+    #[test]
+    fn a_measurable_dry_lane_is_no_fault() {
+        assert!(dry_take_fault(&[live(0.2), live(0.2), live(0.1), floor(0.0)], None).is_none());
+    }
+
+    #[test]
+    fn a_capture_that_lacks_the_dry_lane_faults_rather_than_passing() {
+        assert!(dry_take_fault(&[live(0.2), live(0.2)], None).is_some());
+    }
+
+    /// Deterministic pseudo-noise at `peak` — xorshift, so this can never flake.
+    fn noise(peak: f32, samples: usize) -> Vec<f32> {
+        let mut x = 0x2545_f491_4f6c_dd1d_u64;
+        (0..samples)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / 8_388_608.0 - 1.0) * peak
+            })
+            .collect()
+    }
+
+    // Every test above works on `DryLane` LITERALS, which proves the branching but
+    // assumes the mapping. This one runs real buffers through the meter, because
+    // "this unit's floors sit under the −70 LUFS absolute gate" is the empirical
+    // premise the whole guard rests on: if that gate did NOT kill this unit's
+    // −74.6 dBFS floor, the guard would pass exactly the takes it exists to catch,
+    // and every literal-based test above would still be green.
+    #[test]
+    fn the_meter_maps_a_noise_floor_to_unmeasurable_and_a_played_level_to_measurable() {
+        let floor = DryLane::of(&noise(IDLE_DRY_PEAK, 48_000 * 3), 48_000);
+        assert!(
+            !floor.measurable,
+            "a −74.6 dBFS floor must fall under the −70 LUFS absolute gate"
+        );
+        assert!(
+            floor.peak > 0.0 && floor.peak <= IDLE_DRY_PEAK,
+            "{:?}",
+            floor
+        );
+
+        // The processed pair's floor is louder and must ALSO stay unmeasurable —
+        // this is the half that keeps the lane hint from crying "MUTED".
+        assert!(!DryLane::of(&noise(IDLE_PROCESSED_PEAK, 48_000 * 3), 48_000).measurable);
+
+        // A normally played level measures, so the gate is not simply always-off.
+        let played = DryLane::of(&noise(0.2, 48_000 * 3), 48_000);
+        assert!(played.measurable, "{:?}", played);
     }
 }
 

@@ -154,6 +154,60 @@ impl Drop for TempDb {
     }
 }
 
+/// Write the extracted DB to a temp file this process has just CREATED, and return
+/// its path ([`TempDb`] unlinks it on drop).
+///
+/// `create_new(true)` is where the safety lives, not the name: it is `O_EXCL`, so the
+/// open FAILS on an existing path — including a symlink someone planted to redirect
+/// our write onto a file of their choosing. The old path was `<pid>-<blob len>`,
+/// which any local process could predict and pre-create, and which two concurrent
+/// reads of the same backup also collided on. The suffix below only makes a retry
+/// converge; the guarantee comes from `O_EXCL` refusing to reuse a path, so a
+/// collision is answered by taking a different one rather than by trusting entropy.
+/// `0600` keeps the preset library — a user's own work — unreadable by other local
+/// accounts while it sits in a shared temp dir.
+fn create_private_temp_db(bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+
+    let dir = std::env::temp_dir();
+    let mut collided = 0usize;
+    for attempt in 0..32u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(
+            "tmp-companion-backup-{}-{nanos:09}-{attempt}.db3",
+            std::process::id()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = match opts.open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                collided += 1;
+                continue;
+            }
+            Err(e) => return Err(format!("create temp db ({}): {e}", path.display())),
+        };
+        if let Err(e) = f.write_all(bytes) {
+            // Nothing owns the file yet (no `TempDb`), so unlink it here.
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("write temp db: {e}"));
+        }
+        return Ok(path);
+    }
+    Err(format!(
+        "could not create a temp db in {} — 32 candidate paths all already existed \
+         ({collided} collisions); something is pre-creating them",
+        dir.display()
+    ))
+}
+
 /// One `sqlite3 -json` query against an extracted backup DB. An empty result set is
 /// `[]`, not an error.
 fn run_sql(db: &TempDb, sql: &str) -> Result<serde_json::Value, String> {
@@ -258,12 +312,7 @@ fn extract_backup_entries(blob: &[u8]) -> Result<BackupEntries, String> {
         )
     })?;
 
-    let db_path = std::env::temp_dir().join(format!(
-        "tmp-companion-backup-{}-{}.db3",
-        std::process::id(),
-        blob.len()
-    ));
-    std::fs::write(&db_path, &db_bytes).map_err(|e| format!("write temp db: {e}"))?;
+    let db_path = create_private_temp_db(&db_bytes)?;
     Ok(BackupEntries {
         db: TempDb(db_path),
         members,
