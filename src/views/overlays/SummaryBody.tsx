@@ -193,7 +193,7 @@ function ResultRow({ it, restore }: ResultRowProps) {
   } else if (it.outcome === "skipped") {
     icon = <Icon name="x" size={12} stroke={t.mutedInk} strokeWidth={2} />;
     statusColor = t.mutedInk;
-    status = "read failed";
+    status = it.skipReason ?? "read failed";
   } else {
     icon = <Icon name="x" size={12} stroke={t.mutedInk} strokeWidth={2} />;
     statusColor = t.mutedInk;
