@@ -10,8 +10,8 @@ import type {
   ActiveGraph,
   BackupReadResult,
   FootswitchInfo,
+  GraphNode,
 } from "../lib/types";
-import type { ActiveGraph, BackupReadResult, GraphNode } from "../lib/types";
 import {
   ensureLibraryScan,
   getLibraryScan,

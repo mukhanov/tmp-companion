@@ -162,6 +162,7 @@ function sound(p: DoctorTonePlan | null): DoctorSoundResult {
     bandLabels: LABELS,
     cutThrough: null,
     plan: p,
+    skippedBandCount: 0,
     error: null,
   };
 }

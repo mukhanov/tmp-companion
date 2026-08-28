@@ -89,6 +89,7 @@ fn saved_bypass_map(nodes: &[doctor::DoctorNode]) -> std::collections::HashMap<S
 /// the measured footswitch's `param`-function engaged `valueA` writes (a footswitch
 /// SOUND is its on-off flips PLUS its param jumps — without the latter a param-only
 /// switch would capture the base sound).
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SoundIsolation {
     pub(crate) bypass: Vec<(String, String, bool)>,
     pub(crate) params: Vec<(String, String, String, f32)>,
@@ -285,7 +286,8 @@ pub(crate) fn analyze_doctor_capture(
     // what the device actually produced, not what the input stimulus
     // carried, so amp-created HF (fizz/harsh distortion) isn't gated out
     // just because the DI input never had it.
-    let cov = doctor::output_coverage_with_body(samples, rate, onset.signal_start, family, &body_psd);
+    let cov =
+        doctor::output_coverage_with_body(samples, rate, onset.signal_start, family, &body_psd);
     let balance = doctor::balance(&profile.bands);
     Ok((profile, cov, balance))
 }
@@ -918,9 +920,8 @@ fn apply_capture_balance(
     rate: u32,
     family: doctor::Family,
 ) -> Option<(Vec<f64>, f64)> {
-    let (onset, confident) = audio::estimate_onset(stim, samples, rate);
-    let signal_start = leveller::doctor_signal_start(onset, confident);
-    let psd = doctor::body_psd(samples, rate, signal_start);
+    let onset = leveller::doctor_onset(stim, samples, rate);
+    let psd = doctor::body_psd(samples, rate, onset.signal_start);
     let bands = psd.band_powers(family.bands());
     if bands.iter().any(|b| !(b.is_finite() && *b > 0.0)) {
         return None;
@@ -1207,24 +1208,19 @@ pub(crate) fn doctor_save_witness(
 ) -> Option<leveller::SaveWitness> {
     ops.iter().find_map(|op| match op {
         doctor::DoctorOp::Param {
-            group_id,
             node_id,
             param,
             value,
+            ..
         } => Some(leveller::SaveWitness::Param {
-            group: group_id.clone(),
             node: node_id.clone(),
             param: param.clone(),
             value: *value as f32,
             scene,
         }),
         doctor::DoctorOp::InsertNode {
-            group_id,
-            fender_id,
-            params,
-            ..
+            fender_id, params, ..
         } => params.first().map(|(p, v)| leveller::SaveWitness::Param {
-            group: group_id.clone(),
             node: fender_id.clone(),
             param: p.clone(),
             value: *v as f32,

@@ -96,6 +96,7 @@ function mockPresetWithBothFootswitches() {
               scenes: [],
               blocks: [],
               footswitches: [SOLO_FOOTSWITCH, BARE_FOOTSWITCH],
+              scene_overlays: [],
             },
           ],
           song_presets: [],

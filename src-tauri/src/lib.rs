@@ -122,11 +122,10 @@ pub use saved_blocks::*;
 
 pub use session::PresetEntry;
 use session::Session;
-pub use session::{ActiveGraph, GraphNode, Stage};
 // The truncation-aware saved-preset read seam — re-exported at the crate root so the
 // ~20 probe_api call sites and the leveling commands keep addressing it as `crate::read_slot_preset_*`.
-pub(crate) use slot_read::*;
 pub use session::{ActiveGraph, GraphNode, SceneNodeOverlay, Stage};
+pub(crate) use slot_read::*;
 
 #[macro_use]
 mod commands;

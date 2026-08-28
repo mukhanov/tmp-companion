@@ -128,7 +128,8 @@ pub fn probe_doctor_knob_sweep(
     let (base, line) = measure(
         &stim,
         "saved",
-        leveller::doctor_capture(slot, None, &[], &stim, Some(0.5), tail_ms, false),
+        leveller::doctor_capture(slot, None, &[], &[], &stim, Some(0.5), tail_ms, false),
+        u32::try_from(tail_ms).unwrap_or(u32::MAX),
     )?;
     out_text += &line;
     let baseline = base.band_db.clone();
@@ -155,6 +156,7 @@ pub fn probe_doctor_knob_sweep(
                     &stim,
                     &label,
                     leveller::doctor_capture_current(&stim, None, &[], Some(0.5), tail_ms),
+                    u32::try_from(tail_ms).unwrap_or(u32::MAX),
                 )?;
                 *out_text += &format!("  [{}] {}", c.block_name, line.trim_start());
                 band_db.push(read.band_db);
@@ -308,10 +310,25 @@ pub fn probe_doctor_plan_dry(
         );
     }
 
-    let (samples, rate, loudness) =
-        leveller::doctor_capture_with_loudness(slot, scene, &[], &stim, Some(0.5), tail_ms, false)?;
+    let (samples, rate, loudness) = leveller::doctor_capture_with_loudness(
+        slot,
+        scene,
+        &[],
+        &[],
+        &stim,
+        Some(0.5),
+        tail_ms,
+        false,
+        None,
+    )?;
     let (profile, coverage, balance) = crate::commands::doctor::analyze_doctor_capture(
-        &samples, rate, loudness, &stim, family, &name,
+        &samples,
+        rate,
+        loudness,
+        &stim,
+        u32::try_from(tail_ms).unwrap_or(u32::MAX),
+        family,
+        &name,
     )?;
     out += &format!(
         "  balance dB {}\n  coverage {:?}\n",

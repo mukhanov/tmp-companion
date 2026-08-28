@@ -240,7 +240,7 @@ pub const DOCTOR_TAIL_DRY_MS: u32 = 300;
 // drops. Same cliff family as the idle re-amp-OFF drop (`reamp_off_guaranteed`).
 // So: keep EVERY pre-write idle gap ≤~300 ms, and never sleep a settle for a
 // command that wasn't sent (the conditional in `set_knobs`).
-const SETTLE_AFTER_SCENE_EDIT_MS: u64 = 300;
+pub(crate) const SETTLE_AFTER_SCENE_EDIT_MS: u64 = 300;
 // Gap between the `loadScene` recall and the next command (`SetNodeSceneEdit`, or the
 // value write itself when the enable is dropped). 150 (not the general 300
 // `SETTLE_AFTER_SET_MS`) keeps the gap far under the ~400–450 ms idle cliff above.
@@ -1466,6 +1466,28 @@ pub fn doctor_capture_on_session(
         ref_level,
         tail_ms,
     )?))
+}
+
+/// [`doctor_capture_on_session`] with the un-mixed 2-ch BS.1770 loudness alongside
+/// (the [`doctor_capture_with_loudness`] pairing, on a held session) — the tune
+/// loop's candidate round, whose reported `integrated_lufs` must match the
+/// baseline's measure.
+pub fn doctor_capture_on_session_with_loudness(
+    s: &mut Session,
+    force_bypass: &[(String, String, bool)],
+    fs_params: &[(String, String, String, f32)],
+    stimulus: &[f32],
+    ref_level: Option<f32>,
+    tail_ms: u64,
+) -> Result<(Vec<f32>, u32, lufs::Loudness), String> {
+    for (g, n, p, v) in fs_params {
+        s.change_parameter(g, n, p, *v)?;
+    }
+    let cap = capture_on_session(s, force_bypass, stimulus, ref_level, tail_ms)?;
+    let samples = cap.stereo_mix();
+    let sample_rate = cap.sample_rate;
+    let loudness = measure_processed(&cap)?;
+    Ok((samples, sample_rate, loudness))
 }
 
 /// STRICT-HARNESS measure (the online e2e's post-leveling audio gate,

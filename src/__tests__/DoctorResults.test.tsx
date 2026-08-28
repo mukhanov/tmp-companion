@@ -665,6 +665,7 @@ function baseSound(
     balanceDb: [0, 0, 0, 0, 0, 0],
     bandLabels: ["Lows", "Low-mids", "Mids", "High-mids", "Highs", "Air"],
     cutThrough: null,
+    plan: null,
     error: null,
     skippedBandCount: 0,
     ...overrides,

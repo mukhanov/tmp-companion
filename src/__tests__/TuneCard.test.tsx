@@ -144,6 +144,7 @@ const SOUND: DoctorSoundResult = {
   bandLabels: LABELS,
   cutThrough: null,
   plan: null,
+  skippedBandCount: 0,
   error: null,
 };
 

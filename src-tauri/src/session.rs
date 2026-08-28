@@ -3370,6 +3370,8 @@ pub(crate) fn extract_level_candidates(v: &serde_json::Value) -> Vec<LevelBlock>
         }
     }
     out
+}
+
 /// Doctor's `dspUnitParameters` allowlist (see [`GraphNode::params`]): reverb
 /// mix names + cab low/high cut (hpf/lpf) + graphic-EQ band gains + the
 /// tone-stack / parametric keys the balance plan drives

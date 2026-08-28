@@ -23,7 +23,7 @@ use crate::*;
 
 use super::doctor::{
     analyze_doctor_capture, doctor_fresh_load, family_of_topology, ops_session,
-    resolve_sound_isolation, ApplyMeasure, DoctorApplyJob,
+    resolve_sound_isolation, ApplyMeasure, DoctorApplyJob, SoundIsolation,
 };
 use crate::doctor_tune::{self, ProposalNote, Trial};
 
@@ -66,7 +66,7 @@ struct TuneSession {
     family: doctor::Family,
     kind: doctor::StimulusKind,
     stim: Vec<f32>,
-    fb: Vec<(String, String, bool)>,
+    iso: SoundIsolation,
     tail_ms: u64,
     nodes: Vec<doctor::DoctorNode>,
     baseline: Round,
@@ -140,7 +140,7 @@ fn session_key(
 struct CaptureCtx<'a> {
     job: &'a DoctorApplyJob,
     stim: &'a [f32],
-    fb: &'a [(String, String, bool)],
+    iso: &'a SoundIsolation,
     tail_ms: u64,
     family: doctor::Family,
     kind: doctor::StimulusKind,
@@ -161,18 +161,32 @@ fn measure_round(
         None => leveller::doctor_capture_with_loudness(
             cx.job.list_index,
             cx.job.scene,
-            cx.fb,
+            &cx.iso.bypass,
+            &cx.iso.params,
             cx.stim,
             None,
             cx.tail_ms,
             false,
+            None,
         )?,
-        Some(s) => {
-            leveller::doctor_capture_on_session_with_loudness(s, cx.fb, cx.stim, None, cx.tail_ms)?
-        }
+        Some(s) => leveller::doctor_capture_on_session_with_loudness(
+            s,
+            &cx.iso.bypass,
+            &cx.iso.params,
+            cx.stim,
+            None,
+            cx.tail_ms,
+        )?,
     };
-    let (profile, coverage, balance) =
-        analyze_doctor_capture(&samples, rate, loudness, cx.stim, cx.family, &cx.job.name)?;
+    let (profile, coverage, balance) = analyze_doctor_capture(
+        &samples,
+        rate,
+        loudness,
+        cx.stim,
+        u32::try_from(cx.tail_ms).unwrap_or(u32::MAX),
+        cx.family,
+        &cx.job.name,
+    )?;
     let clip = format!(
         "data:audio/wav;base64,{}",
         base64_encode(&wav_bytes(&samples, rate)?)
@@ -455,7 +469,7 @@ fn propose_and_measure(
         let cx = CaptureCtx {
             job,
             stim: &sess.stim,
-            fb: &sess.fb,
+            iso: &sess.iso,
             tail_ms: sess.tail_ms,
             family: sess.family,
             kind: sess.kind,
@@ -554,7 +568,7 @@ pub(crate) async fn doctor_tune_step<R: tauri::Runtime>(
                         doctor::StimulusKind::Synthetic
                     };
                     let family = family_of_topology(ctx.topology_id.as_deref());
-                    let fb = resolve_sound_isolation(
+                    let iso = resolve_sound_isolation(
                         &ctx.nodes,
                         &ctx.footswitches,
                         ctx.scene,
@@ -562,7 +576,7 @@ pub(crate) async fn doctor_tune_step<R: tauri::Runtime>(
                         ctx.list_index,
                         &mut std::collections::HashMap::new(),
                     );
-                    let nodes = doctor::effective_nodes(&ctx.nodes, &ctx.scene_overlay, &fb);
+                    let nodes = doctor::effective_nodes(&ctx.nodes, &ctx.scene_overlay, &iso.bypass);
                     let tail_ms = u64::from(doctor::doctor_tail_ms(&nodes));
                     doctor_fresh_load(ctx.list_index, || {
                         log::info!(
@@ -574,7 +588,7 @@ pub(crate) async fn doctor_tune_step<R: tauri::Runtime>(
                         &CaptureCtx {
                             job: ctx,
                             stim: &stim,
-                            fb: &fb,
+                            iso: &iso,
                             tail_ms,
                             family,
                             kind,
@@ -590,7 +604,7 @@ pub(crate) async fn doctor_tune_step<R: tauri::Runtime>(
                         family,
                         kind,
                         stim,
-                        fb,
+                        iso,
                         tail_ms,
                         nodes,
                         baseline,
