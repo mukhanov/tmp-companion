@@ -439,6 +439,7 @@ export function useLevelingFlow({
           } else if (status === "error") {
             entry.item.activeMessage = null;
             entry.item.outcome = "skipped";
+            entry.item.skipReason = message ?? null;
             finishItem(entry.item, entry.idx);
           }
         };
@@ -862,6 +863,7 @@ export function useLevelingFlow({
                 target.status = "result";
               } else if (item.status === "error") {
                 target.outcome = "skipped";
+                target.skipReason = item.message ?? null;
                 target.status = "result";
               }
               publish(work.indexOf(target), false);

@@ -5498,6 +5498,10 @@ pub fn redistribute_clamped_headroom(
         on_scene(job.scene_slot, None);
         let t0 = std::time::Instant::now();
         if let Some(reason) = &job.skip {
+            log::warn!(
+                "scene {} skipped before any capture: {reason}",
+                job.scene_slot
+            );
             let o = failed_scene_outcome(
                 job.scene_slot,
                 job.target_lufs,
@@ -5531,6 +5535,7 @@ pub fn redistribute_clamped_headroom(
                 break;
             }
             Err(e) => {
+                log::warn!("scene {} failed: {e}", job.scene_slot);
                 failed_scene_outcome(job.scene_slot, job.target_lufs, e, t0.elapsed().as_millis())
             }
         };
@@ -5657,6 +5662,10 @@ fn run_scene_jobs(
         // A skip job (unclassifiable scene: mic/split lane/no active amp/…) is reported
         // as a failed outcome and the run continues — never aborts the whole pass.
         if let Some(reason) = &job.skip {
+            log::warn!(
+                "scene {} skipped before any capture: {reason}",
+                job.scene_slot
+            );
             let outcome = failed_scene_outcome(
                 job.scene_slot,
                 job.target_lufs,
@@ -5702,6 +5711,7 @@ fn run_scene_jobs(
                 break;
             }
             Err(e) => {
+                log::warn!("scene {} failed: {e}", job.scene_slot);
                 failed_scene_outcome(job.scene_slot, job.target_lufs, e, t0.elapsed().as_millis())
             }
         };
