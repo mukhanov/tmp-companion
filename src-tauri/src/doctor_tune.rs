@@ -205,13 +205,14 @@ pub fn exclusions(rejected: &[&Trial], variant: u32) -> HashSet<String> {
     out
 }
 
-/// A move in units of its control's full cap (knob 0.35 / EQ 6 dB).
+/// A move in units of its control's full cap (knob 0.35 / EQ 6 dB / a cut
+/// corner's 1 octave).
 fn cap_units(m: &PlanMove) -> f64 {
-    let cap = match m.unit {
-        doctor_plan::ControlUnit::Knob => 0.35,
-        doctor_plan::ControlUnit::Db => 6.0,
-    };
-    (m.to - m.from) / cap
+    match m.unit {
+        doctor_plan::ControlUnit::Knob => (m.to - m.from) / 0.35,
+        doctor_plan::ControlUnit::Db => (m.to - m.from) / 6.0,
+        doctor_plan::ControlUnit::Hz => (m.to / m.from).log2(),
+    }
 }
 
 /// The tune loop's base move-cap multiplier: HALF the one-shot plan's cap, so
@@ -428,6 +429,7 @@ mod tests {
             hi: 1.0,
             response,
             cap: 1.0,
+            remedy: crate::doctor_plan::RemedyState::Free,
         }
     }
 
@@ -444,6 +446,7 @@ mod tests {
             to,
             from_label: format!("{:.1}", from * 10.0),
             to_label: format!("{:.1}", to * 10.0),
+            why: String::new(),
         }
     }
 

@@ -85,6 +85,7 @@ function stepResult(overrides: Partial<DoctorTuneStep> = {}): DoctorTuneStep {
           to: 0.4,
           fromLabel: "6.0",
           toLabel: "4.0",
+          why: "",
         },
       ],
       beforeDb: [0, 7, 0, 0, 0, 0],

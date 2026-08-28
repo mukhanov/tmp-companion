@@ -77,6 +77,18 @@ export function PlanMoves({ moves }: PlanMovesProps) {
                     <span style={{ color: t.ink, fontWeight: 600 }}>
                       {m.toLabel}
                     </span>
+                    {m.why !== "" && (
+                      <span
+                        style={{
+                          fontFamily: t.sans,
+                          color: t.mutedInk,
+                          whiteSpace: "normal",
+                        }}
+                      >
+                        {" "}
+                        — {m.why}
+                      </span>
+                    )}
                   </span>
                 ))}
               </div>

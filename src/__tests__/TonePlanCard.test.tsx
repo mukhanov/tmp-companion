@@ -76,6 +76,7 @@ function plan(overrides: Partial<DoctorTonePlan> = {}): DoctorTonePlan {
         to: 0.4,
         fromLabel: "6.0",
         toLabel: "4.0",
+        why: "",
       },
       {
         groupId: "G1",
@@ -89,6 +90,7 @@ function plan(overrides: Partial<DoctorTonePlan> = {}): DoctorTonePlan {
         to: 0.55,
         fromLabel: "5.0",
         toLabel: "5.5",
+        why: "",
       },
       {
         groupId: "G1",
@@ -102,6 +104,7 @@ function plan(overrides: Partial<DoctorTonePlan> = {}): DoctorTonePlan {
         to: 0.6,
         fromLabel: "5.0",
         toLabel: "6.0",
+        why: "",
       },
     ],
     beforeDb: [0, 7, 0, 0, 0, 0],

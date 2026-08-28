@@ -686,6 +686,7 @@ mod tests {
                 to: 0.4,
                 from_label: from.into(),
                 to_label: to.into(),
+                why: String::new(),
             };
         let line = moves_line(&[
             m("amp", "'65 Twin Reverb", "Bass", "6.0", "4.0"),

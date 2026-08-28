@@ -1075,7 +1075,7 @@ export interface DoctorLeveledKey {
   fromLevel: PlaybackLevel;
 }
 
-export type PlanControlUnit = "knob" | "db";
+export type PlanControlUnit = "knob" | "db" | "hz";
 
 /** One knob/band move of the balance plan (`doctor_plan::PlanMove`). `from`/`to`
  * are raw device values (0..1 for a knob, dB for an EQ band); the `*Label`
@@ -1094,6 +1094,9 @@ export interface DoctorPlanMove {
   to: number;
   fromLabel: string;
   toLabel: string;
+  /** The remedy rationale ("tames the 3–6 kHz excess that reads bright");
+   *  empty for an unconstrained move. */
+  why: string;
 }
 
 /** The "rebalance with the blocks you have" plan for one diagnosed sound

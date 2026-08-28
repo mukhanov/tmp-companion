@@ -59,6 +59,43 @@ pub enum ControlUnit {
     Knob,
     /// A dB gain (graphic/parametric EQ band).
     Db,
+    /// A cut-filter corner in Hz (the cab's low/high cut). The SOLVER moves it
+    /// in OCTAVES (`x` = log2 of the ratio to the current corner), because a
+    /// filter's band effect is linear in octaves, not in Hz; `Control::at`
+    /// converts back to the Hz value the device is written.
+    Hz,
+}
+
+/// Where a control does most of its work — the semantic band its response is
+/// largest in — so a remedy rule ("bright: cut the highs") can pick it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Region {
+    Lows,
+    LowMids,
+    Mids,
+    HighMids,
+    Highs,
+    Air,
+}
+
+/// What the remedy layer allows a control to do this round — see
+/// [`assign_remedies`] and the module doc's "remedy knowledge" section.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RemedyState {
+    /// Any direction (no fired finding constrains it — the fallback when NO
+    /// control on the chain matches a remedy).
+    Free,
+    /// Only moves whose sign is `dir` (+1 = raise the control, −1 = lower it),
+    /// ranked 1 (the textbook remedy) .. 3 (a last resort); `why` is the
+    /// player-facing rationale carried onto the plan's move row.
+    Only {
+        dir: f64,
+        rank: u8,
+        why: &'static str,
+    },
+    /// No remedy for the fired findings moves this way — held still.
+    Frozen,
 }
 
 /// A nominal tone-control shape: dB response as a function of frequency, per
@@ -317,15 +354,60 @@ pub struct Control {
     /// Multiplier on the per-control move cap ([`Control::max_move`]) — 1.0 for
     /// the one-shot plan; the tune loop halves it for a "smaller step" variant.
     pub cap: f64,
+    /// The remedy layer's verdict for this round ([`assign_remedies`]).
+    pub remedy: RemedyState,
 }
 
 impl Control {
     /// Per-unit regularizer scale: one dial step on a knob (0.1 of travel)
-    /// costs the same as 1.5 dB of EQ — see [`solve`]'s loss.
+    /// costs the same as 1.5 dB of EQ or a quarter-octave of a cut corner —
+    /// see [`solve`]'s loss.
     fn reg_unit(&self) -> f64 {
         match self.unit {
             ControlUnit::Knob => 0.1,
             ControlUnit::Db => 1.5,
+            ControlUnit::Hz => 0.25,
+        }
+    }
+    /// The solver's move `x` that lands the control on device value `to`.
+    pub fn travel(&self, to: f64) -> f64 {
+        match self.unit {
+            ControlUnit::Hz => (to / self.current).log2(),
+            _ => to - self.current,
+        }
+    }
+    /// The device value after a solver move `x`, clamped to the range and, for
+    /// a corner frequency, rounded to a value a player would dial (5 Hz steps
+    /// below 1 kHz, 100 Hz steps above).
+    pub fn at(&self, x: f64) -> f64 {
+        match self.unit {
+            ControlUnit::Hz => {
+                let hz = (self.current * 2f64.powf(x)).clamp(self.lo, self.hi);
+                let q = if hz >= 1000.0 { 100.0 } else { 5.0 };
+                ((hz / q).round() * q).clamp(self.lo, self.hi)
+            }
+            _ => (self.current + x).clamp(self.lo, self.hi),
+        }
+    }
+    /// The solver's room below/above the current value, in `x` units.
+    fn room(&self) -> (f64, f64) {
+        let (lo, hi) = (self.travel(self.lo), self.travel(self.hi));
+        (lo.max(-self.max_move()), hi.min(self.max_move()))
+    }
+    /// The remedy's move-cost multiplier: the textbook remedy is cheapest, a
+    /// last resort costs 4× — so the solver reaches for the right lever first.
+    fn rank_cost(&self) -> f64 {
+        match self.remedy {
+            RemedyState::Only { rank, .. } => f64::from(1u32 << rank.saturating_sub(1)),
+            _ => 1.0,
+        }
+    }
+    /// Player-facing value label ("5.0" dial, "+2.0 dB", "6.4 kHz").
+    pub fn value_label(&self, v: f64) -> String {
+        match self.unit {
+            ControlUnit::Knob => knob_dial(v),
+            ControlUnit::Db => db_label(v),
+            ControlUnit::Hz => hz_label(v),
         }
     }
     /// The largest move the plan may propose on this control — conservative,
@@ -337,6 +419,7 @@ impl Control {
             * match self.unit {
                 ControlUnit::Knob => 0.35,
                 ControlUnit::Db => 6.0,
+                ControlUnit::Hz => 1.0,
             }
     }
     /// Display/quantization step.
@@ -344,13 +427,16 @@ impl Control {
         match self.unit {
             ControlUnit::Knob => 0.05,
             ControlUnit::Db => 0.5,
+            ControlUnit::Hz => 0.25,
         }
     }
-    /// Below this, a move isn't worth a row (half a dial step / 1 dB).
+    /// Below this, a move isn't worth a row (half a dial step / 1 dB / a
+    /// quarter octave).
     pub fn min_move(&self) -> f64 {
         match self.unit {
             ControlUnit::Knob => 0.05,
             ControlUnit::Db => 1.0,
+            ControlUnit::Hz => 0.25,
         }
     }
 }
@@ -375,6 +461,48 @@ fn band_response(shapes: &[Shape], scale: f64, family: Family) -> Vec<f64> {
         })
         .collect()
 }
+
+/// 2nd-order (12 dB/oct) cut filter's own dB at `f` for corner `fc`: the cab
+/// block's `hpf` (`low_cut`) / `lpf`. Nominal — the device's slope is
+/// unpublished; a 12 dB/oct Butterworth is the modeler convention.
+fn cut_filter_db(f: f64, fc: f64, low_cut: bool) -> f64 {
+    let r = if low_cut { fc / f } else { f / fc };
+    -10.0 * (1.0 + r.powi(4)).log10()
+}
+
+/// The cab cut's per-band response in dB per +1 OCTAVE of corner move,
+/// linearized around the CURRENT corner `fc` (the +½- to −½-octave secant).
+/// Raising a high cut opens the top (positive Highs/Air); raising a low cut
+/// removes lows (negative Lows).
+fn cut_response(fc: f64, low_cut: bool, family: Family) -> Vec<f64> {
+    const POINTS: usize = 24;
+    let (up, down) = (fc * 2f64.sqrt(), fc / 2f64.sqrt());
+    family
+        .bands()
+        .iter()
+        .map(|&(lo, hi)| {
+            let (lo, hi) = (f64::from(lo), f64::from(hi));
+            let ratio = (hi / lo).ln();
+            let mean = |corner: f64| -> f64 {
+                (0..POINTS)
+                    .map(|i| {
+                        let f = lo * (ratio * (i as f64 + 0.5) / POINTS as f64).exp();
+                        cut_filter_db(f, corner, low_cut)
+                    })
+                    .sum::<f64>()
+                    / POINTS as f64
+            };
+            mean(up) - mean(down)
+        })
+        .collect()
+}
+
+/// Plan-side bounds for the cab cuts (Hz). The device accepts hpf 20–500 /
+/// lpf 1 k–20 k (schema-verified, `doctor::cut_move`); the plan keeps to the
+/// range players actually dial — a low cut above ~250 Hz or a high cut below
+/// ~3 kHz stops being "a cut" and becomes a re-voicing.
+const HPF_RANGE_HZ: (f64, f64) = (40.0, 250.0);
+const LPF_RANGE_HZ: (f64, f64) = (3000.0, 12000.0);
 
 /// Peak bandwidth in octaves for a parametric `q` (the standard
 /// `2·asinh(1/(2Q))/ln 2`).
@@ -475,10 +603,37 @@ pub fn discover_controls(nodes: &[DoctorNode], family: Family) -> Vec<Control> {
                 hi,
                 response,
                 cap: 1.0,
+                remedy: RemedyState::Free,
             });
         };
         let mut keys: Vec<&String> = n.params.keys().collect();
         keys.sort();
+        // The cab's cuts — on the standalone CabSim and on a CabIR amp (the same
+        // `hpf`/`lpf` keys ride the amp node). The most character-preserving
+        // remedy a modeler has for boom, mud and fizz, so they are drivable here.
+        let carries_cab = model == "ACD_CabSimTMS" || n.cab_sim_id.is_some();
+        if carries_cab {
+            for (key, low_cut, (lo, hi), label) in [
+                ("hpf", true, HPF_RANGE_HZ, "Low cut"),
+                ("lpf", false, LPF_RANGE_HZ, "High cut"),
+            ] {
+                let Some(&cur) = n.params.get(key) else {
+                    continue;
+                };
+                if !(lo..=hi).contains(&cur) {
+                    continue;
+                }
+                push(
+                    &mut out,
+                    key,
+                    label.to_string(),
+                    ControlUnit::Hz,
+                    cur,
+                    (lo, hi),
+                    cut_response(cur, low_cut, family),
+                );
+            }
+        }
         if crate::is_amp_model_id(model) {
             for key in keys {
                 if let Some(kind) = amp_kind(key) {
@@ -569,6 +724,236 @@ pub fn discover_controls(nodes: &[DoctorNode], family: Family) -> Vec<Control> {
     out
 }
 
+// ─── remedy knowledge ────────────────────────────────────────────────────────
+//
+// What a guitar sound's findings are FIXED with, in the order a mixer or a
+// modeler player reaches for the levers — the domain rules the solver is
+// constrained by. The spectrum regions follow the standard electric-guitar EQ
+// map (60–120 boom, 120–400 mud/warmth, 400–1 k body/voice, 1–3 k presence and
+// honk/harshness, 3–6 k bite/hiss, 6 k+ air/fizz) and the standing rule "cut
+// before you boost": brightness and harshness are tamed from the TOP (treble,
+// presence, the cab's high cut, an EQ cut at the offending band), never by
+// piling on bass — that evens the balance on paper while adding mud and level
+// (the HW round that motivated this: a bright Strat → JCM800 crunch where the
+// unconstrained solve proposed Bass +1.5 and a 144 Hz boost, and the player
+// heard "still bright"). See `notes/doctor.md` § "Remedy knowledge".
+
+/// One remedy: to address a finding, move a control whose dominant [`Region`]
+/// is `region` so its band goes DOWN (`cut`) or up. `rank` 1 is the textbook
+/// lever, 3 a last resort; `why` is the rationale the plan row shows.
+#[derive(Debug, Clone, Copy)]
+struct RemedyRule {
+    region: Region,
+    cut: bool,
+    rank: u8,
+    why: &'static str,
+}
+
+const fn rule(region: Region, cut: bool, rank: u8, why: &'static str) -> RemedyRule {
+    RemedyRule {
+        region,
+        cut,
+        rank,
+        why,
+    }
+}
+
+/// The remedies for one tonal finding key, best lever first.
+fn remedies_for(key: &str) -> Vec<RemedyRule> {
+    match key {
+        "bright" => vec![
+            rule(
+                Region::Highs,
+                true,
+                1,
+                "tames the 3–6 kHz excess that reads bright",
+            ),
+            rule(Region::Air, true, 1, "rolls off the fizz above 6 kHz"),
+            rule(Region::HighMids, true, 2, "eases the 1–3 kHz edge"),
+        ],
+        "harsh" => vec![
+            rule(
+                Region::HighMids,
+                true,
+                1,
+                "cuts the 1–3 kHz edge that reads harsh",
+            ),
+            rule(Region::Highs, true, 2, "smooths the 3–6 kHz hiss"),
+            rule(Region::Air, true, 3, "rolls off the top"),
+        ],
+        "fizzy" => vec![
+            rule(Region::Air, true, 1, "rolls off the fizz above 6 kHz"),
+            rule(Region::Highs, true, 2, "smooths the 3–6 kHz hiss"),
+        ],
+        "dark" => vec![
+            rule(Region::Highs, false, 1, "opens the 3–6 kHz bite"),
+            rule(Region::Air, false, 2, "adds air above 6 kHz"),
+            rule(Region::HighMids, false, 2, "adds 1–3 kHz presence"),
+            rule(Region::Lows, true, 2, "trims the low end so the top reads"),
+            rule(
+                Region::LowMids,
+                true,
+                3,
+                "clears low-mid weight so the top reads",
+            ),
+        ],
+        "muddy" => vec![
+            rule(Region::LowMids, true, 1, "clears the 120–400 Hz mud"),
+            rule(Region::Lows, true, 2, "tightens the low end"),
+            rule(Region::Highs, false, 3, "adds top-end clarity over the mud"),
+        ],
+        "boomy" => vec![
+            rule(Region::Lows, true, 1, "tightens the 60–120 Hz boom"),
+            rule(Region::LowMids, true, 2, "clears low-mid weight"),
+        ],
+        "thin" | "buried" => vec![
+            rule(Region::Lows, false, 1, "restores low-end body"),
+            rule(Region::LowMids, false, 2, "adds 120–400 Hz warmth"),
+        ],
+        "lost" => vec![
+            rule(Region::Mids, false, 1, "brings back the 400 Hz–1 kHz voice"),
+            rule(Region::LowMids, true, 3, "clears mud around the voice"),
+            rule(Region::Highs, true, 3, "trims the top so the mids read"),
+        ],
+        _ => vec![],
+    }
+}
+
+/// POLISH remedies (no finding fired): work from the measured balance itself —
+/// trim every body band sitting ABOVE the reference balance (rank 1, cut
+/// first), and only then lift one sitting below (rank 2).
+fn polish_remedy(region: Region, cut: bool) -> RemedyRule {
+    let (rank, why) = match (region, cut) {
+        (Region::Lows, true) => (1, "trims the low end above the reference balance"),
+        (Region::LowMids, true) => (1, "trims the low-mids above the reference balance"),
+        (Region::Mids, true) => (1, "trims the mids above the reference balance"),
+        (Region::HighMids, true) => (1, "trims the 1–3 kHz above the reference balance"),
+        (Region::Highs, true) => (1, "trims the 3–6 kHz above the reference balance"),
+        (Region::Air, true) => (1, "trims the air above the reference balance"),
+        (Region::Lows, false) => (2, "lifts the low end toward the reference balance"),
+        (Region::LowMids, false) => (2, "lifts the low-mids toward the reference balance"),
+        (Region::Mids, false) => (2, "lifts the mids toward the reference balance"),
+        (Region::HighMids, false) => (2, "lifts the 1–3 kHz toward the reference balance"),
+        (Region::Highs, false) => (2, "lifts the 3–6 kHz toward the reference balance"),
+        (Region::Air, false) => (2, "lifts the air toward the reference balance"),
+    };
+    rule(region, cut, rank, why)
+}
+
+/// The region a control's response is largest in, and the SIGN of that
+/// response per +1 unit of the control (a high cut's corner raised = +Air; a
+/// low cut's corner raised = −Lows; Vox Cut raised = −Highs).
+pub fn dominant_region(c: &Control, family: Family) -> (Region, f64) {
+    let mut best = (Region::Mids, 0.0f64);
+    for (region, v) in region_responses(c, family) {
+        if v.abs() > best.1.abs() {
+            best = (region, v);
+        }
+    }
+    (best.0, if best.1 < 0.0 { -1.0 } else { 1.0 })
+}
+
+/// A control's response per semantic region, `(region, dB per +1 unit)`.
+fn region_responses(c: &Control, family: Family) -> [(Region, f64); 6] {
+    let (lows, low_mids, mids, high_mids, highs, air) = family.semantic_bands();
+    let at = |i: usize| c.response.get(i).copied().unwrap_or(0.0);
+    [
+        (Region::Lows, at(lows)),
+        (Region::LowMids, at(low_mids)),
+        (Region::Mids, at(mids)),
+        (Region::HighMids, at(high_mids)),
+        (Region::Highs, at(highs)),
+        (Region::Air, at(air)),
+    ]
+}
+
+/// A control "works" a region when its response there is at least this share
+/// of its largest response — real tone knobs are wide (a Fender Mid moves the
+/// low-mids two-thirds as much as the mids), so a remedy can reach for them.
+const REGION_SHARE: f64 = 0.5;
+
+/// Every region a control works, with the sign of its response there.
+fn regions_of(c: &Control, family: Family) -> Vec<(Region, f64)> {
+    let rr = region_responses(c, family);
+    let peak = rr.iter().map(|(_, v)| v.abs()).fold(0.0, f64::max);
+    if peak <= 0.0 {
+        return Vec::new();
+    }
+    rr.iter()
+        .filter(|(_, v)| v.abs() >= REGION_SHARE * peak)
+        .map(|&(r, v)| (r, if v < 0.0 { -1.0 } else { 1.0 }))
+        .collect()
+}
+
+/// Stamp every control with the remedy layer's verdict for this round: the
+/// fired findings' [`remedies_for`] (or, with none fired, the
+/// [`polish_remedy`] of each body band outside ±`polish_tol_db`) decide which
+/// direction each control may move and how cheaply. A control no remedy names
+/// is FROZEN. If that would freeze the whole chain (no matching lever at all —
+/// say a bright sound with only a Bass knob), every control is left FREE
+/// instead: the old unconstrained search is still better than nothing, and the
+/// player judges the round.
+pub fn assign_remedies(
+    controls: &mut [Control],
+    fired: &[&str],
+    dev: &[f64],
+    family: Family,
+    polish_tol_db: Option<f64>,
+) {
+    let mut rules: Vec<RemedyRule> = fired.iter().flat_map(|k| remedies_for(k)).collect();
+    if rules.is_empty() {
+        if let Some(tol) = polish_tol_db {
+            let (lows, low_mids, mids, high_mids, highs, _) = family.semantic_bands();
+            let centered = doctor::centered_deviations(dev, family);
+            for (i, region) in [
+                (lows, Region::Lows),
+                (low_mids, Region::LowMids),
+                (mids, Region::Mids),
+                (high_mids, Region::HighMids),
+                (highs, Region::Highs),
+            ] {
+                let c = centered.get(i).copied().unwrap_or(0.0);
+                if c > tol {
+                    rules.push(polish_remedy(region, true));
+                } else if c < -tol {
+                    rules.push(polish_remedy(region, false));
+                }
+            }
+        }
+    }
+    let mut any = false;
+    for c in controls.iter_mut() {
+        // The best-ranked rule any of the control's worked regions satisfies;
+        // the move direction follows that region's response sign.
+        let pick = regions_of(c, family)
+            .into_iter()
+            .filter_map(|(region, sign)| {
+                rules
+                    .iter()
+                    .filter(|r| r.region == region)
+                    .min_by_key(|r| r.rank)
+                    .map(|r| (r, sign))
+            })
+            .min_by_key(|(r, _)| r.rank);
+        c.remedy = match pick {
+            Some((r, sign)) => {
+                any = true;
+                RemedyState::Only {
+                    dir: if r.cut { -sign } else { sign },
+                    rank: r.rank,
+                    why: r.why,
+                }
+            }
+            None => RemedyState::Frozen,
+        };
+    }
+    if !any {
+        for c in controls.iter_mut() {
+            c.remedy = RemedyState::Free;
+        }
+    }
+}
+
 // ─── the solve ───────────────────────────────────────────────────────────────
 
 /// One tonal rule's gate, in the rule's OWN space — a transcription of the
@@ -650,8 +1035,15 @@ const TILT_DB_PER_OCT_SCALE: f64 = 3.0;
 /// a tilt fix legitimately swings every band, so this stays light).
 const COLLATERAL_WEIGHT: f64 = 0.005;
 /// Move cost per (move / reg_unit)² — breaks ties toward the smaller move and
-/// pulls a move back to the gate edge once the excess is gone.
+/// pulls a move back to the gate edge once the excess is gone. Scaled per
+/// control by [`Control::rank_cost`] (the remedy's rank).
 const MOVE_WEIGHT: f64 = 0.01;
+/// "Cut before you boost": per dB² of POSITIVE band change, on top of the
+/// symmetric collateral — a boost that evens the balance on paper adds level
+/// and (in the lows) mud, so an equal-sized cut wins the tie. 4× the collateral.
+/// A boost that IS the textbook remedy (rank 1 — "dark: open the treble") is
+/// exempt: the rule is about equal alternatives, not about refusing the fix.
+const BOOST_WEIGHT: f64 = 0.02;
 const MAX_PASSES: usize = 30;
 
 /// Derive the solver's goal from the family thresholds and the findings that
@@ -919,13 +1311,24 @@ fn objective(goal: &Goal, family: Family, controls: &[Control], x: &[f64]) -> f6
         .sum();
     j += polish_excess(goal, family, &dev_after);
     j += COLLATERAL_WEIGHT * delta.iter().map(|d| d * d).sum::<f64>();
+    // The positive band change from every NON-exempt control (see BOOST_WEIGHT).
+    let mut boost = vec![0.0; delta.len()];
+    for (c, &xi) in controls.iter().zip(x) {
+        let exempt = matches!(c.remedy, RemedyState::Only { rank: 1, dir, .. } if dir * xi > 0.0);
+        if xi != 0.0 && !exempt {
+            for (b, r) in boost.iter_mut().zip(&c.response) {
+                *b += (r * xi).max(0.0);
+            }
+        }
+    }
+    j += BOOST_WEIGHT * boost.iter().map(|d| d * d).sum::<f64>();
     j += MOVE_WEIGHT
         * controls
             .iter()
             .zip(x)
             .map(|(c, xi)| {
                 let u = c.reg_unit();
-                (xi / u) * (xi / u)
+                c.rank_cost() * (xi / u) * (xi / u)
             })
             .sum::<f64>();
     j
@@ -948,11 +1351,19 @@ pub fn solve(goal: &Goal, family: Family, controls: &[Control]) -> Vec<f64> {
         .iter()
         .map(|c| {
             let step = c.step();
-            let lo = (c.lo - c.current).max(-c.max_move());
-            let hi = (c.hi - c.current).min(c.max_move());
+            let (lo, hi) = c.room();
             let k_lo = (lo / step - 1e-9).ceil() as i64;
             let k_hi = (hi / step + 1e-9).floor() as i64;
-            (k_lo..=k_hi).map(|k| k as f64 * step).collect()
+            (k_lo..=k_hi)
+                .map(|k| k as f64 * step)
+                // The remedy layer's direction: a frozen control stays put, a
+                // directed one only moves the way its remedy points.
+                .filter(|&v| match c.remedy {
+                    RemedyState::Free => true,
+                    RemedyState::Only { dir, .. } => v == 0.0 || v * dir > 0.0,
+                    RemedyState::Frozen => v == 0.0,
+                })
+                .collect()
         })
         .collect();
     let mut best = objective(goal, family, controls, &x);
@@ -1006,6 +1417,10 @@ pub struct PlanMove {
     /// Player-facing values ("5.0" → "3.5" on the dial; "+2.0" → "−1.0" dB).
     pub from_label: String,
     pub to_label: String,
+    /// The remedy rationale ("tames the 3–6 kHz excess that reads bright") —
+    /// empty for an unconstrained (fallback) move.
+    #[serde(default)]
+    pub why: String,
 }
 
 /// The balance plan for one diagnosed sound — see the module doc.
@@ -1101,6 +1516,12 @@ pub fn generate_plan_with(
 /// The polish tolerance the tune loop works to (dB around the authored
 /// balance, per body band).
 pub const POLISH_TOL_DB: f64 = 1.0;
+/// Below this severity a predicted new finding is a gate coin-flip, not an
+/// introduction the plan must refuse (see `generate_plan_mode`).
+const INTRODUCE_MIN_SEVERITY: f64 = 0.05;
+/// A remaining finding predicted at no more than this fraction of its current
+/// severity counts as EASED (see `generate_plan_mode`).
+const EASED_SEVERITY_RATIO: f64 = 0.5;
 
 /// Diagnostic (probe --doctor-plan-dry): run the solve and report the RAW
 /// per-control move it wanted (pre-quantize), the energy before/after, and the
@@ -1113,12 +1534,24 @@ pub fn dry_solve_report(
     coverage: Option<&[bool]>,
     diags: &[LeveledDiag],
 ) -> String {
-    let controls = discover_controls(nodes, family);
+    let mut controls = discover_controls(nodes, family);
     let bdb = doctor::band_db(&profile.bands);
     let dev = doctor::anchor_deviations(
         doctor::deviations(&bdb, family),
         profile.stim_bands.as_deref(),
         family,
+    );
+    let fired_keys: Vec<&str> = diags
+        .iter()
+        .map(|d| d.diag.key)
+        .filter(|k| is_tonal(k))
+        .collect();
+    assign_remedies(
+        &mut controls,
+        &fired_keys,
+        &dev,
+        family,
+        Some(POLISH_TOL_DB),
     );
     let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
     goal.polish_tol_db = Some(POLISH_TOL_DB);
@@ -1131,15 +1564,24 @@ pub fn dry_solve_report(
 "
     );
     for (c, x) in controls.iter().zip(&raw) {
+        let (lo, hi) = c.room();
+        let (region, sign) = dominant_region(c, family);
+        let remedy = match c.remedy {
+            RemedyState::Free => "free".to_string(),
+            RemedyState::Frozen => "frozen (no remedy names it)".to_string(),
+            RemedyState::Only { dir, rank, why } => format!(
+                "{} only, rank {rank} — {why}",
+                if dir > 0.0 { "raise" } else { "lower" }
+            ),
+        };
         out += &format!(
-            "    {} · {}: raw move {x:+.3} (cap ±{:.2}, min {:.2}, grid room lo {:.2} hi {:.2})
+            "    {} · {}: raw move {x:+.3} (cap ±{:.2}, min {:.2}, room lo {lo:.2} hi {hi:.2}) · {region:?}{} · {remedy}
 ",
             c.block_name,
             c.label,
             c.max_move(),
             c.min_move(),
-            (c.lo - c.current).max(-c.max_move()),
-            (c.hi - c.current).min(c.max_move()),
+            if sign > 0.0 { "+" } else { "−" },
         );
     }
     // Replicate generate_plan_mode's gate to show WHICH clause blocks it.
@@ -1147,13 +1589,13 @@ pub fn dry_solve_report(
         .iter()
         .enumerate()
         .filter(|(j, c)| raw[*j].abs() + 1e-9 >= c.min_move())
-        .map(|(j, c)| (j, (c.current + raw[j]).clamp(c.lo, c.hi)))
+        .map(|(j, c)| (j, c.at(raw[j])))
         .collect();
     let delta_db: Vec<f64> = (0..dev.len())
         .map(|i| {
             moves
                 .iter()
-                .map(|&(j, to)| controls[j].response[i] * (to - controls[j].current))
+                .map(|&(j, to)| controls[j].response[i] * controls[j].travel(to))
                 .sum()
         })
         .collect();
@@ -1212,7 +1654,7 @@ pub fn generate_plan_mode(
     kind: StimulusKind,
     coverage: Option<&[bool]>,
     diags: &[LeveledDiag],
-    controls: Vec<Control>,
+    mut controls: Vec<Control>,
     polish_tol_db: Option<f64>,
 ) -> Option<TonePlan> {
     let fired: Vec<&str> = diags
@@ -1229,6 +1671,9 @@ pub fn generate_plan_mode(
         profile.stim_bands.as_deref(),
         family,
     );
+    // The remedy layer decides WHICH way each lever may move for these findings
+    // before the search runs — see the "remedy knowledge" section.
+    assign_remedies(&mut controls, &fired, &dev, family, polish_tol_db);
     let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
     goal.polish_tol_db = polish_tol_db;
     let raw = solve(&goal, family, &controls);
@@ -1260,7 +1705,7 @@ pub fn generate_plan_mode(
             .iter()
             .enumerate()
             .filter(|(j, c)| vec[*j].abs() + 1e-9 >= c.min_move())
-            .map(|(j, c)| (j, (c.current + vec[j]).clamp(c.lo, c.hi)))
+            .map(|(j, c)| (j, c.at(vec[j])))
             .collect();
         if moves.is_empty() {
             return None;
@@ -1269,7 +1714,7 @@ pub fn generate_plan_mode(
             .map(|i| {
                 moves
                     .iter()
-                    .map(|&(j, to)| controls[j].response[i] * (to - controls[j].current))
+                    .map(|&(j, to)| controls[j].response[i] * controls[j].travel(to))
                     .sum()
             })
             .collect();
@@ -1297,9 +1742,18 @@ pub fn generate_plan_mode(
             .filter(|k| after_keys.contains(k))
             .map(|k| (*k).to_string())
             .collect();
+        // A finding predicted to appear at a severity that rounds to zero is a
+        // gate coin-flip (the median re-centering lands a band exactly on its
+        // gate), not a regression — MARGIN_DB can't cover the centered space.
         let introduces: Vec<String> = after_keys
             .iter()
             .filter(|k| !fired.contains(k))
+            .filter(|k| {
+                after
+                    .iter()
+                    .filter(|d| &d.diag.key == *k)
+                    .any(|d| d.diag.severity >= INTRODUCE_MIN_SEVERITY)
+            })
             .map(|k| (*k).to_string())
             .collect();
         // A HARD introduction is a CONFIDENT new finding (severity ≥ 1.0 — past
@@ -1318,12 +1772,18 @@ pub fn generate_plan_mode(
             })
             .cloned()
             .collect();
+        // EASED: the finding still fires, but only at a louder level than before,
+        // or at no more than half its severity — a capped move set (±3.5 dial
+        // steps, one octave of cut) legitimately takes a big tilt down in steps,
+        // and a plan that halves a finding is worth auditioning, not withholding.
         let eased: Vec<String> = remains
             .iter()
             .filter(|k| {
                 let before = diags.iter().find(|d| d.diag.key == k.as_str());
                 let aft = after.iter().find(|d| d.diag.key == k.as_str());
-                matches!((before, aft), (Some(b), Some(a)) if level_rank(a.from_level) > level_rank(b.from_level))
+                matches!((before, aft), (Some(b), Some(a))
+                    if level_rank(a.from_level) > level_rank(b.from_level)
+                        || a.diag.severity <= EASED_SEVERITY_RATIO * b.diag.severity)
             })
             .cloned()
             .collect();
@@ -1467,9 +1927,10 @@ pub fn generate_plan_mode(
         .iter()
         .map(|&(j, to)| {
             let c = &controls[j];
-            let (from_label, to_label) = match c.unit {
-                ControlUnit::Knob => (knob_dial(c.current), knob_dial(to)),
-                ControlUnit::Db => (db_label(c.current), db_label(to)),
+            let (from_label, to_label) = (c.value_label(c.current), c.value_label(to));
+            let why = match c.remedy {
+                RemedyState::Only { why, .. } => why.to_string(),
+                _ => String::new(),
             };
             PlanMove {
                 group_id: c.group_id.clone(),
@@ -1483,6 +1944,7 @@ pub fn generate_plan_mode(
                 to,
                 from_label,
                 to_label,
+                why,
             }
         })
         .collect();
@@ -1804,6 +2266,131 @@ mod tests {
             .find(|m| m.param == "treb")
             .expect("treble up");
         assert!(treb.to > treb.from, "{treb:?}");
+    }
+
+    fn cab(hpf: f64, lpf: f64) -> DoctorNode {
+        node("G3", "ACD_CabSimTMS", &[("hpf", hpf), ("lpf", lpf)])
+    }
+
+    /// A +4 dB/oct bright tilt across the body — the HW shape (a bright Strat →
+    /// JCM800 crunch, 2026-08-28) whose unconstrained solve boosted Bass and the
+    /// 144 Hz band to even the balance and left the player hearing "still bright".
+    fn bright_profile() -> SoundProfile {
+        let xs: Vec<f64> = Family::Guitar
+            .band_centers()
+            .iter()
+            .map(|c| c.log2())
+            .collect();
+        let mut delta = [0.0; 6];
+        for i in 0..6 {
+            delta[i] = 4.0 * (xs[i] - xs[2]);
+        }
+        profile_with(delta)
+    }
+
+    #[test]
+    fn a_bright_sound_is_tamed_from_the_top_never_by_a_bass_boost() {
+        let profile = bright_profile();
+        let nodes = vec![twin(0.5, 0.5, 0.6), cab(140.0, 9000.0)];
+        let diags = diags_for(&profile, &nodes);
+        assert!(keys(&diags).contains(&"bright"), "{:?}", keys(&diags));
+        for polish in [None, Some(POLISH_TOL_DB)] {
+            let controls = discover_controls(&nodes, Family::Guitar);
+            let plan = generate_plan_mode(
+                &profile,
+                &nodes,
+                Family::Guitar,
+                StimulusKind::Synthetic,
+                None,
+                &diags,
+                controls,
+                polish,
+            )
+            .expect("a bright Twin + cab gets a plan");
+            // Every move is a CUT of the top (treble down, high cut lowered, …) —
+            // never a bass boost to "even it out".
+            for m in &plan.moves {
+                match m.param.as_str() {
+                    "bass" | "hpf" => panic!("a bright fix must not touch the low end: {m:?}"),
+                    "treb" | "presence" | "tone" => assert!(m.to < m.from, "{m:?}"),
+                    "lpf" => assert!(m.to < m.from, "{m:?}"),
+                    _ => {}
+                }
+                assert!(
+                    !m.why.is_empty(),
+                    "every remedy move carries its rationale: {m:?}"
+                );
+            }
+            assert!(
+                plan.moves
+                    .iter()
+                    .any(|m| m.param == "treb" || m.param == "lpf"),
+                "{:?}",
+                plan.moves
+            );
+        }
+    }
+
+    #[test]
+    fn a_muddy_sound_reaches_for_the_cab_low_cut() {
+        let profile = profile_with([3.0, 7.0, 0.0, 0.0, 0.0, 0.0]);
+        let nodes = vec![twin(0.5, 0.5, 0.5), cab(80.0, 9000.0)];
+        let diags = diags_for(&profile, &nodes);
+        assert!(keys(&diags).contains(&"muddy"), "{:?}", keys(&diags));
+        let plan = generate_plan(
+            &profile,
+            &nodes,
+            Family::Guitar,
+            StimulusKind::Synthetic,
+            None,
+            &diags,
+        )
+        .expect("plan");
+        for m in &plan.moves {
+            match m.param.as_str() {
+                "hpf" => assert!(m.to > m.from, "the low cut is RAISED to tighten: {m:?}"),
+                "lpf" => panic!("mud is not fixed at the top: {m:?}"),
+                "bass" | "mid" => assert!(m.to < m.from, "{m:?}"),
+                _ => {}
+            }
+        }
+        // The cab's cut is discovered as a Hz control with an octave-scaled move
+        // that lands on a dial-able value.
+        let hpf = discover_controls(&nodes, Family::Guitar)
+            .into_iter()
+            .find(|c| c.param == "hpf")
+            .expect("hpf discovered");
+        assert_eq!(hpf.unit, ControlUnit::Hz);
+        assert!(
+            (hpf.travel(160.0) - 1.0).abs() < 1e-9,
+            "80 → 160 Hz is +1 octave"
+        );
+        assert_eq!(hpf.at(0.5), 115.0, "80·√2 = 113 rounds to a 5 Hz step");
+        assert!(
+            hpf.response[0] < 0.0 && hpf.response[5].abs() < 0.1,
+            "{:?}",
+            hpf.response
+        );
+    }
+
+    #[test]
+    fn the_remedy_layer_frees_every_control_when_none_matches() {
+        // A bright sound whose only lever is a Bass knob: nothing cuts the top, so
+        // the chain falls back to the unconstrained search rather than proposing
+        // nothing at all.
+        let profile = bright_profile();
+        let nodes = vec![node(
+            "G1",
+            "ACD_TwinReverb65NoFx",
+            &[("bass", 0.5), ("gain", 0.5), ("outputLevel", 0.5)],
+        )];
+        let diags = diags_for(&profile, &nodes);
+        let mut controls = discover_controls(&nodes, Family::Guitar);
+        assert_eq!(controls.len(), 1);
+        let fired: Vec<&str> = diags.iter().map(|d| d.diag.key).collect();
+        let dev = vec![0.0; 6];
+        assign_remedies(&mut controls, &fired, &dev, Family::Guitar, None);
+        assert_eq!(controls[0].remedy, RemedyState::Free);
     }
 
     #[test]

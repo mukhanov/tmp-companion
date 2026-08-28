@@ -63,13 +63,19 @@ struct Report {
 /// The two capture points for a control: `saved ± delta` clamped into range,
 /// collapsing to one side at an edge (a knob at 0 can only go up).
 fn sweep_points(c: &Control, delta: f64) -> Vec<f64> {
-    let d = match c.unit {
-        ControlUnit::Knob => delta,
+    let (lo, hi) = match c.unit {
+        ControlUnit::Knob => ((c.current - delta).max(c.lo), (c.current + delta).min(c.hi)),
         // EQ bands: the same fraction of their range (±3 dB for 0.25 of ±12).
-        ControlUnit::Db => delta * (c.hi - c.lo) / 2.0,
+        ControlUnit::Db => {
+            let d = delta * (c.hi - c.lo) / 2.0;
+            ((c.current - d).max(c.lo), (c.current + d).min(c.hi))
+        }
+        // Cut corners move in octaves: ±delta octaves around the current corner.
+        ControlUnit::Hz => (
+            (c.current / 2f64.powf(delta)).max(c.lo),
+            (c.current * 2f64.powf(delta)).min(c.hi),
+        ),
     };
-    let lo = (c.current - d).max(c.lo);
-    let hi = (c.current + d).min(c.hi);
     let mut pts = Vec::new();
     if lo < c.current - 1e-9 {
         pts.push(lo);
@@ -442,6 +448,7 @@ mod tests {
             hi,
             response: vec![0.0; 6],
             cap: 1.0,
+            remedy: crate::doctor_plan::RemedyState::Free,
         }
     }
 

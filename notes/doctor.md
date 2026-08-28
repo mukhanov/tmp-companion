@@ -270,6 +270,7 @@ only ("this switch changes X"), never "the old leveler damaged this", since a
 footswitch can legitimately sweep any parameter via Pro Control. Counted by
 `severity.ts::presetLookCount` so a preset whose ONLY finding is a damage
 advisory still surfaces under "Needs a look".
+
 ## Balance plan — rebalance with the blocks you have
 
 `doctor_plan.rs` (pure; called once per diagnosed sound from `commands/doctor.rs`,
@@ -334,6 +335,58 @@ tone controls the preset ALREADY carries — and what that is predicted to fix:
   outranks the prediction. Scene sounds inherit `apply_ops_under_scene`'s
   known overlay limitation; footswitch sounds get the shared-block caption
   when a plan move touches a block outside the switch's own set.
+
+### Remedy knowledge — which lever, which way
+
+The solver above is CONSTRAINED by a small table of guitar-tone remedies
+(`doctor_plan::remedies_for`), because an unconstrained balance solve is
+symmetric: a bright tilt is "fixed" just as well on paper by boosting the bass
+as by cutting the top — and on the unit it isn't (HW 2026-08-28, a bright
+Strat → JCM800 crunch on slot 196: the unconstrained search proposed Bass
+7.5 → 9.0 plus a 144 Hz boost in two variants, the player heard "still bright"
+and the loop gave up). The table encodes the standard electric-guitar EQ map and
+the mixing rule "cut before you boost":
+
+| Region (family band) | What lives there          | Finding | Textbook lever (rank 1) → fallbacks                                     |
+| -------------------- | ------------------------- | ------- | ----------------------------------------------------------------------- |
+| Lows 60–120 Hz       | boom, thump               | boomy   | cab low cut UP · Bass down                                              |
+| Low-mids 120–400 Hz  | warmth / mud              | muddy   | Bass / Mid down, cab low cut up · (last) a little treble                |
+| Mids 400 Hz–1 kHz    | body, the guitar's voice  | lost    | Mid up · (last) clear mud / trim top                                    |
+| High-mids 1–3 kHz    | presence, honk, harshness | harsh   | EQ / Mid down at 1–3 k · Treble & Presence down · (last) roll the top   |
+| Highs 3–6 kHz        | bite, hiss                | bright  | Treble & Presence down, cab high cut DOWN · (2) ease 1–3 k              |
+| Air 6 kHz+           | air, fizz                 | fizzy   | cab high cut down, Presence down · (2) smooth 3–6 k                     |
+| —                    | a dark tilt               | dark    | Treble & Presence UP · (2) air, 1–3 k up, Bass down · (3) low-mids down |
+| —                    | a thin low end            | thin    | Bass up, cab low cut down · (2) warmth                                  |
+
+Mechanics (`assign_remedies`): every discovered control is stamped with the
+regions it WORKS (any band whose response is ≥ 50 % of its largest — a Fender
+Mid works the low-mids too) and the fired findings' rules pick, per control, the
+best-ranked matching region: the control may then move ONLY in the direction
+that cuts/boosts that region, its move cost is scaled ×1/×2/×4 by rank, and a
+control no rule names is frozen for the round. With no finding fired (polish
+mode) the rules come from the measured balance itself — trim every body band
+above the reference first (rank 1), lift one below it second. If nothing on the
+chain matches (a bright sound with only a Bass knob) every control is freed and
+the old unconstrained search runs — the player judges. On top of that the
+objective carries a "cut before you boost" term (`BOOST_WEIGHT`, positive band
+change squared, exempting a rank-1 remedy boost such as "dark → open the
+treble"). Each proposed move carries its rule's `why` onto the card row.
+
+The cab's `hpf` / `lpf` are drivable controls now (`ControlUnit::Hz`, moved in
+OCTAVES with a nominal 12 dB/oct Butterworth response, plan-side range 40–250 Hz
+/ 3–12 kHz) — the most character-preserving remedy a modeler has for boom, mud
+and fizz. Two gate refinements landed with this: a predicted new finding at a
+severity that rounds to zero is a gate coin-flip, not an introduction
+(`INTRODUCE_MIN_SEVERITY`), and a remaining finding predicted at ≤ half its
+severity counts as EASED (`EASED_SEVERITY_RATIO`) — a capped move set takes a
+big tilt down in steps.
+
+Sources for the band map (standard mixing references, consistent with each
+other): [Producer Hive — Guitar EQ cheat sheet](https://producerhive.com/music-production-recording-tips/guitar-eq-cheat-sheet/),
+[Neural DSP — A guide to electric guitar EQ](https://neuraldsp.com/articles/electric-guitar-eq-guide),
+[Music Guy Mixing — Guitar frequency range](https://www.musicguymixing.com/guitar-frequency-range/),
+[Sweetwater — What does the Presence knob do](https://www.sweetwater.com/insync/what-does-the-presence-knob-on-a-guitar-amplifier-do/),
+[Fractal Audio forum — cab low/high cut practice](https://forum.fractalaudio.com/threads/low-cut-high-cut.212402/).
 
 ## Balance search — the round-by-round tune loop
 
