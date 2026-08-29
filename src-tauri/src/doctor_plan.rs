@@ -352,7 +352,7 @@ pub struct Control {
     /// dB change per unit of `param`, one entry per family band.
     pub response: Vec<f64>,
     /// Multiplier on the per-control move cap ([`Control::max_move`]) — 1.0 for
-    /// the one-shot plan; the tune loop halves it for a "smaller step" variant.
+    /// the plan; a caller wanting a gentler step (the knob sweep) can lower it.
     pub cap: f64,
     /// The remedy layer's verdict for this round ([`assign_remedies`]).
     pub remedy: RemedyState,
@@ -819,25 +819,18 @@ fn remedies_for(key: &str) -> Vec<RemedyRule> {
     }
 }
 
-/// POLISH remedies (no finding fired): work from the measured balance itself —
-/// trim every body band sitting ABOVE the reference balance (rank 1, cut
-/// first), and only then lift one sitting below (rank 2).
-fn polish_remedy(region: Region, cut: bool) -> RemedyRule {
-    let (rank, why) = match (region, cut) {
-        (Region::Lows, true) => (1, "trims the low end above the reference balance"),
-        (Region::LowMids, true) => (1, "trims the low-mids above the reference balance"),
-        (Region::Mids, true) => (1, "trims the mids above the reference balance"),
-        (Region::HighMids, true) => (1, "trims the 1–3 kHz above the reference balance"),
-        (Region::Highs, true) => (1, "trims the 3–6 kHz above the reference balance"),
-        (Region::Air, true) => (1, "trims the air above the reference balance"),
-        (Region::Lows, false) => (2, "lifts the low end toward the reference balance"),
-        (Region::LowMids, false) => (2, "lifts the low-mids toward the reference balance"),
-        (Region::Mids, false) => (2, "lifts the mids toward the reference balance"),
-        (Region::HighMids, false) => (2, "lifts the 1–3 kHz toward the reference balance"),
-        (Region::Highs, false) => (2, "lifts the 3–6 kHz toward the reference balance"),
-        (Region::Air, false) => (2, "lifts the air toward the reference balance"),
-    };
-    rule(region, cut, rank, why)
+/// A control's response per semantic region, `(region, dB per +1 unit)`.
+fn region_responses(c: &Control, family: Family) -> [(Region, f64); 6] {
+    let (lows, low_mids, mids, high_mids, highs, air) = family.semantic_bands();
+    let at = |i: usize| c.response.get(i).copied().unwrap_or(0.0);
+    [
+        (Region::Lows, at(lows)),
+        (Region::LowMids, at(low_mids)),
+        (Region::Mids, at(mids)),
+        (Region::HighMids, at(high_mids)),
+        (Region::Highs, at(highs)),
+        (Region::Air, at(air)),
+    ]
 }
 
 /// The region a control's response is largest in, and the SIGN of that
@@ -851,20 +844,6 @@ pub fn dominant_region(c: &Control, family: Family) -> (Region, f64) {
         }
     }
     (best.0, if best.1 < 0.0 { -1.0 } else { 1.0 })
-}
-
-/// A control's response per semantic region, `(region, dB per +1 unit)`.
-fn region_responses(c: &Control, family: Family) -> [(Region, f64); 6] {
-    let (lows, low_mids, mids, high_mids, highs, air) = family.semantic_bands();
-    let at = |i: usize| c.response.get(i).copied().unwrap_or(0.0);
-    [
-        (Region::Lows, at(lows)),
-        (Region::LowMids, at(low_mids)),
-        (Region::Mids, at(mids)),
-        (Region::HighMids, at(high_mids)),
-        (Region::Highs, at(highs)),
-        (Region::Air, at(air)),
-    ]
 }
 
 /// A control "works" a region when its response there is at least this share
@@ -885,42 +864,14 @@ fn regions_of(c: &Control, family: Family) -> Vec<(Region, f64)> {
         .collect()
 }
 
-/// Stamp every control with the remedy layer's verdict for this round: the
-/// fired findings' [`remedies_for`] (or, with none fired, the
-/// [`polish_remedy`] of each body band outside ±`polish_tol_db`) decide which
-/// direction each control may move and how cheaply. A control no remedy names
-/// is FROZEN. If that would freeze the whole chain (no matching lever at all —
-/// say a bright sound with only a Bass knob), every control is left FREE
-/// instead: the old unconstrained search is still better than nothing, and the
-/// player judges the round.
-pub fn assign_remedies(
-    controls: &mut [Control],
-    fired: &[&str],
-    dev: &[f64],
-    family: Family,
-    polish_tol_db: Option<f64>,
-) {
-    let mut rules: Vec<RemedyRule> = fired.iter().flat_map(|k| remedies_for(k)).collect();
-    if rules.is_empty() {
-        if let Some(tol) = polish_tol_db {
-            let (lows, low_mids, mids, high_mids, highs, _) = family.semantic_bands();
-            let centered = doctor::centered_deviations(dev, family);
-            for (i, region) in [
-                (lows, Region::Lows),
-                (low_mids, Region::LowMids),
-                (mids, Region::Mids),
-                (high_mids, Region::HighMids),
-                (highs, Region::Highs),
-            ] {
-                let c = centered.get(i).copied().unwrap_or(0.0);
-                if c > tol {
-                    rules.push(polish_remedy(region, true));
-                } else if c < -tol {
-                    rules.push(polish_remedy(region, false));
-                }
-            }
-        }
-    }
+/// Stamp every control with the remedy layer's verdict: the fired findings'
+/// [`remedies_for`] decide which direction each control may move and how
+/// cheaply. A control no remedy names is FROZEN. If that would freeze the whole
+/// chain (no matching lever at all — say a bright sound with only a Bass knob),
+/// every control is left FREE instead: the old unconstrained search is still
+/// better than nothing, and the player auditions the result.
+pub fn assign_remedies(controls: &mut [Control], fired: &[&str], family: Family) {
+    let rules: Vec<RemedyRule> = fired.iter().flat_map(|k| remedies_for(k)).collect();
     let mut any = false;
     for c in controls.iter_mut() {
         // The best-ranked rule any of the control's worked regions satisfies;
@@ -999,23 +950,11 @@ pub struct Goal {
     air_minus_highs_db: f64,
     rules: Vec<Rule>,
     coverage: Option<Vec<bool>>,
-    /// POLISH: beyond the rule gates, pull every body band's centered
-    /// deviation inside ±tol dB of the authored target and the Theil–Sen
-    /// slope inside ±[`POLISH_TILT_DB_PER_OCT`] — the tune loop's "keep
-    /// improving" objective once (or even before) the coarse rules are quiet.
-    /// `None` = the one-shot plan (rules only).
-    polish_tol_db: Option<f64>,
 }
 
-/// The polish tilt tolerance (dB/oct) — a third of the dark/bright gate.
-pub const POLISH_TILT_DB_PER_OCT: f64 = 1.0;
-/// Weight of a polish band excess² (dB²) — below a fired rule (4) so a real
-/// finding is always cleared first, above collateral so it is worth moving for.
-const POLISH_WEIGHT: f64 = 1.0;
-/// The smallest drop in the polish [`polish_energy`] (dB²) worth a round — a
-/// low bar, because the player is the arbiter: any move that measurably
-/// evens the spectrum toward target is worth auditioning.
-pub const POLISH_MIN_ENERGY: f64 = 0.5;
+/// The balance report's tilt tolerance (dB/oct) — a third of the dark/bright
+/// gate; see [`balance_error_db`].
+pub const BALANCE_TILT_DB_PER_OCT: f64 = 1.0;
 
 /// Safety margin (dB) inside every gate, so a predicted "clear" isn't a
 /// boundary coin-flip.
@@ -1179,7 +1118,6 @@ fn goal_for(
         air_minus_highs_db: bdb[air] - bdb[highs],
         rules,
         coverage: coverage.map(<[bool]>::to_vec),
-        polish_tol_db: None,
     }
 }
 
@@ -1195,8 +1133,9 @@ fn outside(v: f64, lo: f64, hi: f64) -> f64 {
 }
 
 /// The balance error of a deviation vector (dB): the largest centered body-band
-/// deviation beyond `tol`, and the Theil–Sen slope beyond the polish tilt
-/// tolerance scaled to band dB — 0 when the balance sits inside the tolerance.
+/// deviation beyond `tol`, and the Theil–Sen slope beyond the tilt tolerance
+/// scaled to band dB — 0 when the balance sits inside the tolerance. A
+/// REPORT for the card ("distance to the reference balance"), not a solver term.
 pub fn balance_error_db(dev: &[f64], family: Family, tol: f64, coverage: Option<&[bool]>) -> f64 {
     let (lows, _, _, _, highs, _) = family.semantic_bands();
     let centered = doctor::centered_deviations(dev, family);
@@ -1205,54 +1144,9 @@ pub fn balance_error_db(dev: &[f64], family: Family, tol: f64, coverage: Option<
         .fold(0.0, f64::max);
     let (slope, _) = doctor::tilt_split(dev, family, coverage);
     let tilt = slope.map_or(0.0, |s| {
-        outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT).abs() * TILT_DB_PER_OCT_SCALE
+        outside(s, -BALANCE_TILT_DB_PER_OCT, BALANCE_TILT_DB_PER_OCT).abs() * TILT_DB_PER_OCT_SCALE
     });
     band.max(tilt)
-}
-
-/// The polish OBJECTIVE energy of a deviation vector (dB²): the SAME weighted
-/// sum the solver minimizes — Σ over body bands of the centered deviation past
-/// ±`tol`, squared, plus the Theil–Sen slope past ±[`POLISH_TILT_DB_PER_OCT`]
-/// squared. This is the "how far is it worth going" metric — unlike
-/// [`balance_error_db`] (a MAX, which a chain's undrivable dominant band pins
-/// high forever), the energy DROPS whenever any band moves toward target, so
-/// "a round that helps" and "the solver found a move" agree.
-pub fn polish_energy(dev: &[f64], family: Family, tol: f64, coverage: Option<&[bool]>) -> f64 {
-    let (lows, _, _, _, highs, _) = family.semantic_bands();
-    let centered = doctor::centered_deviations(dev, family);
-    let mut j: f64 = (lows..=highs)
-        .map(|i| {
-            let e = outside(centered[i], -tol, tol);
-            e * e
-        })
-        .sum();
-    let (slope, _) = doctor::tilt_split(dev, family, coverage);
-    if let Some(s) = slope {
-        let e = outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT) * TILT_DB_PER_OCT_SCALE;
-        j += e * e;
-    }
-    j
-}
-
-/// The polish objective term — see [`Goal::polish_tol_db`].
-fn polish_excess(goal: &Goal, family: Family, dev_after: &[f64]) -> f64 {
-    let Some(tol) = goal.polish_tol_db else {
-        return 0.0;
-    };
-    let (lows, _, _, _, highs, _) = family.semantic_bands();
-    let centered = doctor::centered_deviations(dev_after, family);
-    let mut j: f64 = (lows..=highs)
-        .map(|i| {
-            let e = outside(centered[i], -tol, tol);
-            e * e
-        })
-        .sum();
-    let (slope, _) = doctor::tilt_split(dev_after, family, goal.coverage.as_deref());
-    if let Some(s) = slope {
-        let e = outside(s, -POLISH_TILT_DB_PER_OCT, POLISH_TILT_DB_PER_OCT) * TILT_DB_PER_OCT_SCALE;
-        j += e * e;
-    }
-    POLISH_WEIGHT * j
 }
 
 /// Per-rule excess (dB past the gate, + the safety margin; 0 when safely
@@ -1309,7 +1203,6 @@ fn objective(goal: &Goal, family: Family, controls: &[Control], x: &[f64]) -> f6
         .zip(&excess)
         .map(|(r, e)| r.weight * e * e)
         .sum();
-    j += polish_excess(goal, family, &dev_after);
     j += COLLATERAL_WEIGHT * delta.iter().map(|d| d * d).sum::<f64>();
     // The positive band change from every NON-exempt control (see BOOST_WEIGHT).
     let mut boost = vec![0.0; delta.len()];
@@ -1397,9 +1290,8 @@ pub fn solve(goal: &Goal, family: Family, controls: &[Control]) -> Vec<f64> {
 
 // ─── plan assembly ───────────────────────────────────────────────────────────
 
-/// One knob/band move the plan proposes. `Deserialize` for the tune loop's
-/// trial history (`doctor_tune::Trial`), which the frontend echoes back.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+/// One knob/band move the plan proposes.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanMove {
     pub group_id: String,
@@ -1443,9 +1335,8 @@ pub struct TonePlan {
     /// Predicted broadband loudness change (dB, band-power sum) — a plan
     /// that moves tone knobs moves level too; the Level tab re-levels.
     pub loudness_delta_db: f64,
-    /// [`balance_error_db`] (±1 dB polish tolerance) before and predicted
-    /// after — the distance to the authored balance the tune loop drives down
-    /// once the coarse findings are quiet.
+    /// [`balance_error_db`] (±1 dB tolerance) before and predicted after — the
+    /// distance to the authored balance, for the card.
     pub balance_error_before_db: f64,
     pub balance_error_after_db: f64,
     /// The one-click: every move as a `DoctorOp::Param`, through the standard
@@ -1494,33 +1385,14 @@ pub fn generate_plan(
     generate_plan_with(profile, nodes, family, kind, coverage, diags, controls)
 }
 
-/// [`generate_plan`] over a caller-supplied control set — the tune loop's entry
-/// (`doctor_tune`): the same discovery, but with responses re-scaled by what the
-/// device MEASURED on earlier rounds, controls the player rejected excluded, and
-/// a tighter move cap for a "smaller step" variant. The one-shot plan calls it
-/// with the raw nominal discovery.
-pub fn generate_plan_with(
-    profile: &SoundProfile,
-    nodes: &[DoctorNode],
-    family: Family,
-    kind: StimulusKind,
-    coverage: Option<&[bool]>,
-    diags: &[LeveledDiag],
-    controls: Vec<Control>,
-) -> Option<TonePlan> {
-    generate_plan_mode(
-        profile, nodes, family, kind, coverage, diags, controls, None,
-    )
-}
-
-/// The polish tolerance the tune loop works to (dB around the authored
-/// balance, per body band).
-pub const POLISH_TOL_DB: f64 = 1.0;
+/// The balance report's per-band tolerance (dB around the authored balance) —
+/// see [`balance_error_db`].
+pub const BALANCE_TOL_DB: f64 = 1.0;
 /// Below this severity a predicted new finding is a gate coin-flip, not an
-/// introduction the plan must refuse (see `generate_plan_mode`).
+/// introduction the plan must refuse (see `generate_plan_with`).
 const INTRODUCE_MIN_SEVERITY: f64 = 0.05;
 /// A remaining finding predicted at no more than this fraction of its current
-/// severity counts as EASED (see `generate_plan_mode`).
+/// severity counts as EASED (see `generate_plan_with`).
 const EASED_SEVERITY_RATIO: f64 = 0.5;
 
 /// Diagnostic (probe --doctor-plan-dry): run the solve and report the RAW
@@ -1546,21 +1418,14 @@ pub fn dry_solve_report(
         .map(|d| d.diag.key)
         .filter(|k| is_tonal(k))
         .collect();
-    assign_remedies(
-        &mut controls,
-        &fired_keys,
-        &dev,
-        family,
-        Some(POLISH_TOL_DB),
-    );
-    let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
-    goal.polish_tol_db = Some(POLISH_TOL_DB);
+    assign_remedies(&mut controls, &fired_keys, family);
+    let goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
     let raw = solve(&goal, family, &controls);
     let (dev_after, _) = apply_moves(&goal, &controls, &raw);
-    let e0 = polish_energy(&dev, family, POLISH_TOL_DB, coverage);
-    let e1 = polish_energy(&dev_after, family, POLISH_TOL_DB, coverage);
+    let e0 = balance_error_db(&dev, family, BALANCE_TOL_DB, coverage);
+    let e1 = balance_error_db(&dev_after, family, BALANCE_TOL_DB, coverage);
     let mut out = format!(
-        "  dry solve: energy {e0:.2} → {e1:.2}
+        "  dry solve: balance error {e0:.2} → {e1:.2} dB
 "
     );
     for (c, x) in controls.iter().zip(&raw) {
@@ -1584,7 +1449,7 @@ pub fn dry_solve_report(
             if sign > 0.0 { "+" } else { "−" },
         );
     }
-    // Replicate generate_plan_mode's gate to show WHICH clause blocks it.
+    // Replicate generate_plan_with's gate to show WHICH clause blocks it.
     let moves: Vec<(usize, f64)> = controls
         .iter()
         .enumerate()
@@ -1640,14 +1505,10 @@ pub fn dry_solve_report(
     out
 }
 
-/// [`generate_plan_with`] plus an optional POLISH objective: with `polish_tol_db`
-/// the plan also pulls the balance inside ±tol of the target (and the tilt
-/// inside ±1 dB/oct) and is worth shipping when it drops the balance error by
-/// ≥ [`POLISH_MIN_ENERGY`] even with no finding fired — the tune loop's
-/// "keep improving" mode. Without it (the one-shot card) a plan needs a
-/// fired tonal finding and must clear or ease one.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_plan_mode(
+/// [`generate_plan`] over a caller-supplied control set (the knob sweep's
+/// dry-run and the tests): a plan needs a fired tonal finding and must clear
+/// or ease one; it never trades one finding for another.
+pub fn generate_plan_with(
     profile: &SoundProfile,
     nodes: &[DoctorNode],
     family: Family,
@@ -1655,14 +1516,13 @@ pub fn generate_plan_mode(
     coverage: Option<&[bool]>,
     diags: &[LeveledDiag],
     mut controls: Vec<Control>,
-    polish_tol_db: Option<f64>,
 ) -> Option<TonePlan> {
     let fired: Vec<&str> = diags
         .iter()
         .map(|d| d.diag.key)
         .filter(|k| is_tonal(k))
         .collect();
-    if (fired.is_empty() && polish_tol_db.is_none()) || nodes.is_empty() || controls.is_empty() {
+    if fired.is_empty() || nodes.is_empty() || controls.is_empty() {
         return None;
     }
     let bdb = doctor::band_db(&profile.bands);
@@ -1673,13 +1533,9 @@ pub fn generate_plan_mode(
     );
     // The remedy layer decides WHICH way each lever may move for these findings
     // before the search runs — see the "remedy knowledge" section.
-    assign_remedies(&mut controls, &fired, &dev, family, polish_tol_db);
-    let mut goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
-    goal.polish_tol_db = polish_tol_db;
+    assign_remedies(&mut controls, &fired, family);
+    let goal = goal_for(dev.clone(), &bdb, family, nodes, diags, coverage);
     let raw = solve(&goal, family, &controls);
-
-    let tol = polish_tol_db.unwrap_or(POLISH_TOL_DB);
-    let energy_before = polish_energy(&dev, family, tol, coverage);
 
     // One candidate at a fraction `scale` of the solved move: the quantized
     // surviving moves, their model delta, the re-diagnosed key sets, and whether
@@ -1691,9 +1547,7 @@ pub fn generate_plan_mode(
         clears: Vec<String>,
         remains: Vec<String>,
         introduces: Vec<String>,
-        hard_introduces: Vec<String>,
         eased: Vec<String>,
-        polishes: bool,
     }
     let level_rank = |l: crate::profiles::PlaybackLevel| match l {
         crate::profiles::PlaybackLevel::Quiet => 0,
@@ -1756,22 +1610,6 @@ pub fn generate_plan_mode(
             })
             .map(|k| (*k).to_string())
             .collect();
-        // A HARD introduction is a CONFIDENT new finding (severity ≥ 1.0 — past
-        // the "possible" cutoff, `severity.ts::POSSIBLE_MAX_SEVERITY`). In polish
-        // mode a near-threshold ("possible") nudge into a neighbouring band is a
-        // fair trade the PLAYER judges each round (it shows in the card's "New"
-        // row); only a confident new defect is a real regression the search must
-        // refuse. The one-shot plan (unattended) refuses ANY introduction.
-        let hard_introduces: Vec<String> = introduces
-            .iter()
-            .filter(|k| {
-                after
-                    .iter()
-                    .filter(|d| &d.diag.key == k)
-                    .any(|d| d.diag.severity >= 1.0)
-            })
-            .cloned()
-            .collect();
         // EASED: the finding still fires, but only at a louder level than before,
         // or at no more than half its severity — a capped move set (±3.5 dial
         // steps, one octave of cut) legitimately takes a big tilt down in steps,
@@ -1787,10 +1625,6 @@ pub fn generate_plan_mode(
             })
             .cloned()
             .collect();
-        let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
-        let polishes = polish_tol_db.is_some()
-            && energy_before - polish_energy(&dev_after, family, tol, coverage)
-                >= POLISH_MIN_ENERGY;
         Some(Candidate {
             moves,
             delta_db,
@@ -1798,9 +1632,7 @@ pub fn generate_plan_mode(
             clears,
             remains,
             introduces,
-            hard_introduces,
             eased,
-            polishes,
         })
     };
 
@@ -1839,13 +1671,8 @@ pub fn generate_plan_mode(
         let Some(c) = evaluate_from(&scaled) else {
             break;
         };
-        // Polish mode only DROPS on a HARD (confident) introduction; the one-shot
-        // plan drops on ANY introduction (unattended).
-        let block: Vec<String> = if polish_tol_db.is_some() {
-            c.hard_introduces.clone()
-        } else {
-            c.introduces.clone()
-        };
+        // The plan is unattended, so it drops on ANY introduction.
+        let block: Vec<String> = c.introduces.clone();
         if block.is_empty() {
             cand = Some(c);
             break;
@@ -1872,14 +1699,8 @@ pub fn generate_plan_mode(
             None => break,
         }
     }
-    let cand = cand.filter(|c| {
-        let blocked = if polish_tol_db.is_some() {
-            !c.hard_introduces.is_empty()
-        } else {
-            !c.introduces.is_empty()
-        };
-        !blocked && (!c.clears.is_empty() || !c.eased.is_empty() || c.polishes)
-    })?;
+    let cand =
+        cand.filter(|c| c.introduces.is_empty() && (!c.clears.is_empty() || !c.eased.is_empty()))?;
 
     let Candidate {
         moves,
@@ -1888,13 +1709,11 @@ pub fn generate_plan_mode(
         clears,
         remains,
         introduces: _,
-        hard_introduces: _,
         eased: _,
-        polishes: _,
     } = cand;
     let dev_after: Vec<f64> = dev.iter().zip(&delta_db).map(|(d, x)| d + x).collect();
-    let balance_error_before_db = balance_error_db(&dev, family, tol, coverage);
-    let balance_error_after_db = balance_error_db(&dev_after, family, tol, coverage);
+    let balance_error_before_db = balance_error_db(&dev, family, BALANCE_TOL_DB, coverage);
+    let balance_error_after_db = balance_error_db(&dev_after, family, BALANCE_TOL_DB, coverage);
     let mut predicted = profile.clone();
     predicted.bands = profile
         .bands
@@ -2294,9 +2113,9 @@ mod tests {
         let nodes = vec![twin(0.5, 0.5, 0.6), cab(140.0, 9000.0)];
         let diags = diags_for(&profile, &nodes);
         assert!(keys(&diags).contains(&"bright"), "{:?}", keys(&diags));
-        for polish in [None, Some(POLISH_TOL_DB)] {
+        {
             let controls = discover_controls(&nodes, Family::Guitar);
-            let plan = generate_plan_mode(
+            let plan = generate_plan_with(
                 &profile,
                 &nodes,
                 Family::Guitar,
@@ -2304,7 +2123,6 @@ mod tests {
                 None,
                 &diags,
                 controls,
-                polish,
             )
             .expect("a bright Twin + cab gets a plan");
             // Every move is a CUT of the top (treble down, high cut lowered, …) —
@@ -2388,8 +2206,7 @@ mod tests {
         let mut controls = discover_controls(&nodes, Family::Guitar);
         assert_eq!(controls.len(), 1);
         let fired: Vec<&str> = diags.iter().map(|d| d.diag.key).collect();
-        let dev = vec![0.0; 6];
-        assign_remedies(&mut controls, &fired, &dev, Family::Guitar, None);
+        assign_remedies(&mut controls, &fired, Family::Guitar);
         assert_eq!(controls[0].remedy, RemedyState::Free);
     }
 
@@ -2408,139 +2225,6 @@ mod tests {
             &diags
         )
         .is_none());
-    }
-
-    /// POLISH mode (the tune loop): with no finding fired but the balance 2.5 dB
-    /// off the target, the plan still proposes and drops the balance error.
-    #[test]
-    fn polish_mode_keeps_improving_past_the_rule_gates() {
-        // +1.8 dB on the high-mids: under the harsh gate (2.5 tilt-space, no
-        // playback offset), over the ±1 dB polish tolerance.
-        let profile = profile_with([0.0, 0.0, 0.0, 1.8, 0.0, 0.0]);
-        let nodes = vec![twin(0.6, 0.5, 0.5)];
-        let diags = diags_for(&profile, &nodes);
-        assert!(
-            keys(&diags).is_empty(),
-            "inside every gate: {:?}",
-            keys(&diags)
-        );
-        assert!(generate_plan(
-            &profile,
-            &nodes,
-            Family::Guitar,
-            StimulusKind::Synthetic,
-            None,
-            &diags
-        )
-        .is_none());
-        let controls = discover_controls(&nodes, Family::Guitar);
-        let plan = generate_plan_mode(
-            &profile,
-            &nodes,
-            Family::Guitar,
-            StimulusKind::Synthetic,
-            None,
-            &diags,
-            controls,
-            Some(POLISH_TOL_DB),
-        )
-        .expect("polish proposes");
-        assert!(plan.balance_error_before_db > 0.5, "{plan:?}");
-        // The MAX balance error can stay pinned by an undrivable band, but the
-        // solver's objective energy must drop for a plan to ship.
-        let dev = doctor::anchor_deviations(
-            doctor::deviations(&doctor::band_db(&profile.bands), Family::Guitar),
-            profile.stim_bands.as_deref(),
-            Family::Guitar,
-        );
-        let dev_after: Vec<f64> = (0..6)
-            .map(|i| dev[i] + plan.moves.iter().map(|_| 0.0).sum::<f64>())
-            .collect();
-        let _ = dev_after;
-        assert!(polish_energy(&dev, Family::Guitar, POLISH_TOL_DB, None) > POLISH_MIN_ENERGY);
-        assert!(plan.clears.is_empty() && plan.remains.is_empty());
-        // Already inside the tolerance → nothing to polish.
-        let flat = profile_with([0.3, -0.2, 0.1, 0.0, -0.3, 0.0]);
-        let controls = discover_controls(&nodes, Family::Guitar);
-        assert!(generate_plan_mode(
-            &flat,
-            &nodes,
-            Family::Guitar,
-            StimulusKind::Synthetic,
-            None,
-            &[],
-            controls,
-            Some(POLISH_TOL_DB),
-        )
-        .is_none());
-    }
-
-    /// The greedy back-off: a polish move whose low-boost lever would introduce
-    /// `muddy` keeps the character-preserving high/mid cuts and drops the
-    /// offending boost, so a plan still ships and introduces nothing (the
-    /// slot-196 bright-Strat "No further suggestion" HW bug, 2026-08-23).
-    #[test]
-    fn polish_drops_a_finding_introducing_move_and_still_ships() {
-        // A very bright ramp: no lows, hot highs (the badly-EQ'd scene shape).
-        let profile = profile_with([-11.0, -5.0, 0.0, 6.0, 8.0, 2.0]);
-        // Amp + a parametric peak the loop can cut.
-        let nodes = vec![DoctorNode {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            model: "ACD_JCM800TMS".into(),
-            bypassed: false,
-            cab_sim_id: None,
-            cab_sim2_enabled: None,
-            params: [
-                ("bass", 0.75),
-                ("mid", 0.5),
-                ("treb", 0.85),
-                ("presence", 0.5),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        }];
-        let diags = diags_for(&profile, &nodes);
-        let controls = discover_controls(&nodes, Family::Guitar);
-        let plan = generate_plan_mode(
-            &profile,
-            &nodes,
-            Family::Guitar,
-            StimulusKind::Synthetic,
-            None,
-            &diags,
-            controls,
-            Some(POLISH_TOL_DB),
-        );
-        if let Some(plan) = plan {
-            // Whatever it proposes, the re-diagnosis introduced nothing (empty
-            // `clears`/`remains` on a no-finding baseline; the guard is that the
-            // ship-gate already refused any introduced finding).
-            assert!(
-                plan.balance_error_after_db <= plan.balance_error_before_db,
-                "{plan:?}"
-            );
-            // It leans on cuts (Treble down / a positive-band EQ cut), not a
-            // muddy-ward low boost as the ONLY move.
-            let re_diagnosed = doctor::diagnose_kind(
-                &{
-                    let mut p = profile.clone();
-                    // apply the plan's ops to the model for a sanity re-check
-                    p.bands = profile.bands.clone();
-                    p
-                },
-                Some(&nodes),
-                Family::Guitar,
-                StimulusKind::Synthetic,
-                None,
-                doctor::PlaybackOffsets::NONE,
-            );
-            let _ = re_diagnosed;
-        }
-        // The point of the test: no PANIC / no false "muddy" trade — the greedy
-        // back-off path is exercised (the full solve introduces muddy on this
-        // shape; a plan that ships must have dropped it).
     }
 
     #[test]

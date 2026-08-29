@@ -363,11 +363,9 @@ regions it WORKS (any band whose response is ≥ 50 % of its largest — a Fende
 Mid works the low-mids too) and the fired findings' rules pick, per control, the
 best-ranked matching region: the control may then move ONLY in the direction
 that cuts/boosts that region, its move cost is scaled ×1/×2/×4 by rank, and a
-control no rule names is frozen for the round. With no finding fired (polish
-mode) the rules come from the measured balance itself — trim every body band
-above the reference first (rank 1), lift one below it second. If nothing on the
-chain matches (a bright sound with only a Bass knob) every control is freed and
-the old unconstrained search runs — the player judges. On top of that the
+control no rule names is frozen. If nothing on the chain matches (a bright
+sound with only a Bass knob) every control is freed and the old unconstrained
+search runs — the player auditions the result. On top of that the
 objective carries a "cut before you boost" term (`BOOST_WEIGHT`, positive band
 change squared, exempting a rank-1 remedy boost such as "dark → open the
 treble"). Each proposed move carries its rule's `why` onto the card row.
@@ -387,75 +385,6 @@ other): [Producer Hive — Guitar EQ cheat sheet](https://producerhive.com/music
 [Music Guy Mixing — Guitar frequency range](https://www.musicguymixing.com/guitar-frequency-range/),
 [Sweetwater — What does the Presence knob do](https://www.sweetwater.com/insync/what-does-the-presence-knob-on-a-guitar-amplifier-do/),
 [Fractal Audio forum — cab low/high cut practice](https://forum.fractalaudio.com/threads/low-cut-high-cut.212402/).
-
-## Balance search — the round-by-round tune loop
-
-`doctor_tune.rs` (pure search) + `commands/doctor_tune.rs` (device rounds +
-the per-sound session) + `TuneCard` ("Search for a better balance", under every
-sound with findings). Where the one-shot plan predicts from a nominal model, the
-loop MEASURES: each round proposes moves from the current baseline, applies
-them live (cumulative absolute ops from the saved preset — never saved),
-captures on the same session, diagnoses, and shows the candidate's moves, the
-A/B (baseline vs candidate), the measured band change and which findings
-cleared / remain / appeared. The player decides: **better** (the candidate
-becomes the baseline; the next round starts from it), **not better** (rejected;
-the next round proposes a different variant), **save** (`doctor_save` with the
-step's cumulative ops — the same overlay-aware write + commit witness as every
-Doctor save, then the scan store is patched), **stop** (`doctor_tune_end`
-with discard → the stored preset is reloaded).
-
-- **Calibration** (`doctor_tune::calibrate`): every measured round (accepted
-  or not) is a data point `Δbalance ≈ Σ_c s_c·(r_c − mean r_c)·Δx_c`; a
-  ridge-regularized least squares (λ = 30, prior 1.0, clamp [0.25, 4]) yields
-  per-control scale factors on the nominal responses, so round 2 already moves
-  with this amp's real sensitivities. The card prints what was learned
-  ("'65 Twin Reverb · Bass ×0.56").
-- **Variants after a rejection** (`exclusions` / `cap_for_variant`): streak 1
-  excludes the rejected round's biggest control; 2 excludes every control the
-  rejected rounds moved; 3 halves the move cap; `MAX_VARIANTS` = 4 → "no
-  further suggestion" (keep what was kept, or stop). An acceptance resets the
-  streak.
-- **Polish mode** (`doctor_plan::generate_plan_mode` with `POLISH_TOL_DB` = 1):
-  the coarse rule gates are ±3–4 dB wide, so "no finding" is not "balanced".
-  The objective adds a term pulling every body band's centered deviation inside
-  ±1 dB of the authored target and the Theil–Sen slope inside ±1 dB/oct (weight
-  1, below a fired rule's 4). The "worth a round" test is the drop in
-  `polish_energy` — the SAME weighted SUM the solver minimizes — by ≥
-  `POLISH_MIN_ENERGY` (0.5 dB²), NOT the `balance_error_db` MAX: an
-  intentionally-voiced preset has one undrivable dominant band (e.g. a bright
-  Strat's −17 dB Lows) that pins the MAX high forever while the other bands
-  still even out, and deciding on the MAX made the loop stop with "no move
-  helps" though every round it did help (HW 2026-08-23). Rounds are GENTLE
-  (`doctor_tune::TUNE_BASE_CAP` = half the one-shot cap): a big imbalance is
-  evened over several auditioned steps, not one lurch. The player is the
-  arbiter of taste — a polish move that erodes the preset's character gets
-  "not better" and is excluded.
-- **Greedy back-off** (`generate_plan_mode`): the solved move can fix the
-  balance along one lever while another over-corrects and INTRODUCES a finding
-  (HW 2026-08-23: a bright Strat's polish CUT the harsh top — good — AND
-  boosted the low end into `muddy`; scaling the whole vector down shrinks the
-  useful cut too, so the plan was refused and the loop looked stuck at "no
-  suggestion"). So the ship path keeps the full move, then while the
-  re-diagnosis shows an introduced finding, DROPS the single move that pushes
-  hardest into that finding's band and re-diagnoses — the character-preserving
-  cut survives, the offending boost is dropped. Diagnostic: `probe
---doctor-plan-dry <slot> [scene]` prints the effective chain, the capture
-  balance, the discovered controls, the raw solve, the polish energy and the
-  ship-gate verdict (why a round does or doesn't propose).
-- **Termination**: `converged` when the baseline has no tonal finding
-  (`TONAL_KEYS`) left AND the polish energy is under `POLISH_MIN_ENERGY`;
-  `exhausted` when no proposal exists — and when that is "no finding, no move
-  evens it further", the message names it as the preset's own VOICING (a cab
-  or amp swap is the bigger change), not a defect the knobs can fix. Both
-  offer "Save what I kept" when the baseline carries edits.
-- **Device discipline**: round 1 captures the SAVED sound after the
-  lazy-commit barrier (`doctor_fresh_load`); every round = `restore_saved_preset`
-  → `ops_session` (cumulative ops, overlay-aware) → `doctor_capture_on_session
-_with_loudness` → `reamp_off_guaranteed`; ~15 s per round. The session
-  (profiles, clips, trials) lives in one process-wide slot keyed on sound +
-  stimulus; a different sound restarts it. The card holds the app-wide apply
-  lock while a candidate sits unsaved, and ends the loop with a discard on
-  unmount.
 
 ## Cut-through estimate + reference match (flagship)
 

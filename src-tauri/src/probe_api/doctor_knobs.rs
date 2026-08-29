@@ -249,14 +249,12 @@ pub fn probe_doctor_knob_sweep(
     Ok(out_text)
 }
 
-/// `probe --doctor-plan-dry <slot> [<scene>]` — the tune loop's ONE round,
-/// read-only and NEVER writing/saving: capture the sound (base, or a 0-based
-/// wire scene) exactly as the app does (effective scene chain, synthetic
-/// guitar-humbucker stimulus), diagnose, discover every drivable tone control,
-/// and print the polish proposal — the moves, the objective energy before, and,
-/// when nothing is proposed, WHY (no control / energy already low / no move
-/// helps). Diagnostic instrument for "the balance search says No further
-/// suggestion but the sound is clearly off". Ends re-amp OFF.
+/// `probe --doctor-plan-dry <slot> [<scene>]` — the balance plan, read-only
+/// and NEVER writing/saving: capture the sound (base, or a 0-based wire scene)
+/// exactly as the app does (effective scene chain, synthetic guitar-humbucker
+/// stimulus), diagnose, discover every drivable tone control with its remedy
+/// verdict, and print the proposal — the moves and, when nothing is proposed,
+/// WHY (no finding / no lever / the gate refused it). Ends re-amp OFF.
 pub fn probe_doctor_plan_dry(
     slot: u32,
     scene: Option<u32>,
@@ -396,16 +394,18 @@ pub fn probe_doctor_plan_dry(
         family,
     );
     out += &format!(
-        "  anchored deviation {}\n  polish energy {:.2} dB²  ·  balance-error MAX {:.1} dB (tol ±{:.0})\n",
-        dev.iter().map(|v| format!("{v:+.1}")).collect::<Vec<_>>().join(","),
-        doctor_plan::polish_energy(&dev, family, doctor_plan::POLISH_TOL_DB, Some(&coverage)),
-        doctor_plan::balance_error_db(&dev, family, doctor_plan::POLISH_TOL_DB, Some(&coverage)),
-        doctor_plan::POLISH_TOL_DB,
+        "  anchored deviation {}\n  balance-error MAX {:.1} dB (tol ±{:.0})\n",
+        dev.iter()
+            .map(|v| format!("{v:+.1}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        doctor_plan::balance_error_db(&dev, family, doctor_plan::BALANCE_TOL_DB, Some(&coverage)),
+        doctor_plan::BALANCE_TOL_DB,
     );
 
     out += &doctor_plan::dry_solve_report(&profile, &nodes, family, Some(&coverage), &diags);
 
-    match doctor_plan::generate_plan_mode(
+    match doctor_plan::generate_plan_with(
         &profile,
         &nodes,
         family,
@@ -413,7 +413,6 @@ pub fn probe_doctor_plan_dry(
         Some(&coverage),
         &diags,
         controls,
-        Some(doctor_plan::POLISH_TOL_DB),
     ) {
         Some(plan) => {
             out += &format!(
@@ -425,7 +424,7 @@ pub fn probe_doctor_plan_dry(
                 plan.remains.len(),
             );
         }
-        None => out += "  PROPOSAL: none (no finding to clear/ease and no move drops the polish energy by ≥ POLISH_MIN_ENERGY)\n",
+        None => out += "  PROPOSAL: none (no tonal finding, no drivable lever, or no move clears/eases a finding without introducing one)\n",
     }
     Ok(out)
 }

@@ -62,8 +62,6 @@ import {
   doctorSave,
   doctorDiscard,
   toFootswitchJobWire,
-  doctorTuneStep,
-  doctorTuneEnd,
   cmd,
 } from "../lib/invoke";
 import type {
@@ -408,11 +406,7 @@ describe("camelCase top-level arg keys (Tauri auto-converts to snake_case)", () 
     await doctorDiscard(3);
     expectCall("doctor_discard", { listIndex: 3 });
     invokeMock.mockClear();
-    await doctorTuneStep(job, "start");
-    expectCall("doctor_tune_step", { job: { ctx: job, decision: "start" } });
     invokeMock.mockClear();
-    await doctorTuneEnd(3, true);
-    expectCall("doctor_tune_end", { listIndex: 3, discard: true });
   });
 
   it("level_footswitches_apply passes footswitch jobs with a progress channel", async () => {
@@ -570,12 +564,11 @@ describe("device-backed song/setlist CRUD (Songs page)", () => {
 });
 
 describe("cmd namespace mirrors the named exports", () => {
-  it("cmd exposes exactly the 41 contract commands", () => {
+  it("cmd exposes exactly the 39 contract commands", () => {
     // Pins the wire-contract surface: bump this when a command is added or removed
     // (the count guards against an accidental export slip in the cmd registry).
-    // 41 = the prior 39 (38 + `listFootswitchSceneContexts`, D3's scene-context picker)
-    // + `doctorTuneStep` / `doctorTuneEnd` (the Doctor's balance-search loop).
-    expect(Object.keys(cmd).length).toBe(41);
+    // 39 = the prior 38 + `listFootswitchSceneContexts` (D3's scene-context picker).
+    expect(Object.keys(cmd).length).toBe(39);
   });
 });
 

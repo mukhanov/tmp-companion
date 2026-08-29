@@ -1468,28 +1468,6 @@ pub fn doctor_capture_on_session(
     )?))
 }
 
-/// [`doctor_capture_on_session`] with the un-mixed 2-ch BS.1770 loudness alongside
-/// (the [`doctor_capture_with_loudness`] pairing, on a held session) — the tune
-/// loop's candidate round, whose reported `integrated_lufs` must match the
-/// baseline's measure.
-pub fn doctor_capture_on_session_with_loudness(
-    s: &mut Session,
-    force_bypass: &[(String, String, bool)],
-    fs_params: &[(String, String, String, f32)],
-    stimulus: &[f32],
-    ref_level: Option<f32>,
-    tail_ms: u64,
-) -> Result<(Vec<f32>, u32, lufs::Loudness), String> {
-    for (g, n, p, v) in fs_params {
-        s.change_parameter(g, n, p, *v)?;
-    }
-    let cap = capture_on_session(s, force_bypass, stimulus, ref_level, tail_ms)?;
-    let samples = cap.stereo_mix();
-    let sample_rate = cap.sample_rate;
-    let loudness = measure_processed(&cap)?;
-    Ok((samples, sample_rate, loudness))
-}
-
 /// STRICT-HARNESS measure (the online e2e's post-leveling audio gate,
 /// `level.online.spec.ts`): re-measure one leveled sound of `slot` AS-IS on the
 /// production capture path and the LEVELING metric (2-ch BS.1770 over the

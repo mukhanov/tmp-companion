@@ -1117,7 +1117,7 @@ export interface DoctorTonePlan {
   loudnessDeltaDb: number;
   /** Distance to the authored balance beyond the ±1 dB polish tolerance
    *  (`doctor_plan::balance_error_db`), before and after — 0 = inside it. The
-   *  tune loop drives this down past the coarse rule gates. */
+   *  card shows it as the distance to the reference balance. */
   balanceErrorBeforeDb: number;
   balanceErrorAfterDb: number;
   rx: DoctorRx;
@@ -1203,52 +1203,6 @@ export interface DoctorPresetResult {
 export interface DoctorCheckResult {
   presets: DoctorPresetResult[];
   stopped: boolean;
-}
-
-// ─── Doctor tune loop ────────────────────────────────────────────────────────
-
-/** The player's decision that starts the next tune round
- * (`commands::doctor_tune::TuneDecision`). */
-export type TuneDecision = "start" | "better" | "worse";
-
-/** Where the loop stands after a step (`TuneStatus`): `candidate` = a
- * candidate is applied (unsaved) and measured; `converged` = the baseline has
- * no tonal finding left; `exhausted` = no further variant from this baseline. */
-export type TuneStatus = "candidate" | "converged" | "exhausted";
-
-/** What a round's proposal rested on (`doctor_tune::ProposalNote`). */
-export interface TuneProposalNote {
-  /** `[label "Block · Knob", scale]` — controls whose response the loop has
-   *  re-scaled from measurements. */
-  learned: [string, number][];
-  /** Controls excluded for this variant (player rejections). */
-  excluded: string[];
-  /** Move-cap multiplier in force. */
-  cap: number;
-}
-
-/** One tune round's result (`DoctorTuneStep`). `ops` are the CUMULATIVE ops of
- * the candidate (what `doctorSave` must persist to keep it); `baselineOps`
- * those of the last accepted round. */
-export interface DoctorTuneStep {
-  round: number;
-  status: TuneStatus;
-  candidate: DoctorTonePlan | null;
-  note: TuneProposalNote | null;
-  ops: DoctorOp[];
-  baselineOps: DoctorOp[];
-  baselineClip: string;
-  candidateClip: string | null;
-  measured: DoctorApplyMeasure | null;
-  baselineDiags: DoctorDiag[];
-  candidateDiags: DoctorDiag[];
-  cleared: string[];
-  remained: string[];
-  introduced: string[];
-  bandLabels: string[];
-  baselineBalanceDb: number[];
-  candidateBalanceDb: number[] | null;
-  message: string;
 }
 
 /** One prescription's apply job (`lib::DoctorApplyJob`, camelCase wire).

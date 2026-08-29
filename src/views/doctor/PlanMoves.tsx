@@ -1,5 +1,5 @@
 // src/views/doctor/PlanMoves.tsx — the per-block knob-move table shared by the
-// one-shot balance plan (TonePlanCard) and the tune loop (TuneCard): one row per
+// balance plan (TonePlanCard): one row per
 // block (its art tile + catalog name) with every "Knob from → to" move on it.
 
 import { useTheme } from "../../theme/ThemeContext";

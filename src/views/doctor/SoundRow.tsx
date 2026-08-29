@@ -19,7 +19,6 @@ import { LevelIndicator } from "./LevelIndicator";
 import { MatchCard } from "./MatchCard";
 import { PrescriptionCard, type DoctorStimulus } from "./PrescriptionCard";
 import { TonePlanCard } from "./TonePlanCard";
-import { TuneCard } from "./TuneCard";
 import { bandLayoutsMatch } from "./matchModel";
 import { offbranchStatus } from "../level/leveling";
 import {
@@ -553,17 +552,6 @@ export function SoundRow({
             <TonePlanCard
               sound={sound}
               plan={sound.plan}
-              listIndex={listIndex}
-              presetName={presetName}
-              nodes={nodes}
-              footswitches={footswitches}
-              sceneOverlay={sceneOverlay}
-              stimulus={stimulus}
-            />
-          )}
-          {hasDiags && (
-            <TuneCard
-              sound={sound}
               listIndex={listIndex}
               presetName={presetName}
               nodes={nodes}

@@ -37,8 +37,6 @@ import type {
   FsSceneContext,
   BackupReadResult,
   SceneNodeOverlay,
-  DoctorTuneStep,
-  TuneDecision,
   CopyJob,
   CopyApplyItem,
   DoctorInputArg,
@@ -381,24 +379,6 @@ export const doctorSave = (
 export const doctorDiscard = (listIndex: number): Promise<void> =>
   invoke("doctor_discard", { listIndex });
 
-/** One round of the Doctor tune loop (`doctor_tune_step`): `start` captures the
- * saved sound as the baseline and runs round 1; `better`/`worse` judge the last
- * candidate and run the next round. `ctx` is the sound's apply context (its
- * `ops` are ignored — the loop owns the ops). Leaves the candidate applied but
- * UNSAVED; persist with `doctorSave(step.ops)`, end with `doctorTuneEnd`. */
-export const doctorTuneStep = (
-  ctx: DoctorApplyJob,
-  decision: TuneDecision,
-): Promise<DoctorTuneStep> =>
-  invoke("doctor_tune_step", { job: { ctx, decision } });
-
-/** End the tune loop: clear its session; `discard` reloads the stored preset
- * (drops the unsaved candidate). After a `doctorSave` end WITHOUT discard. */
-export const doctorTuneEnd = (
-  listIndex: number,
-  discard: boolean,
-): Promise<void> => invoke("doctor_tune_end", { listIndex, discard });
-
 // ─── Instrument profiles + persisted store (Settings window) ──────────────────
 
 /** Settings — profiles + per-slot assignment + named loudness targets. */
@@ -632,6 +612,4 @@ export const cmd = {
   doctorApply,
   doctorSave,
   doctorDiscard,
-  doctorTuneStep,
-  doctorTuneEnd,
 } as const;

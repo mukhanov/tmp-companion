@@ -232,7 +232,7 @@ pub(crate) fn floor_error_for(
 /// One Doctor capture → `(profile, output coverage, balance dB)`: the onset-
 /// aligned body PSD, the stimulus-anchored `SoundProfile`, and the output-side
 /// band coverage gate — the ONE analysis every Doctor path runs on a capture
-/// (`doctor_check`'s loop, the tune loop's baseline/candidate rounds), so a
+/// (`doctor_check`'s loop, the knob sweep's dry-run), so a
 /// measurement-space change can't drift between them. `label` only names the
 /// sound in the onset warning.
 pub(crate) fn analyze_doctor_capture(

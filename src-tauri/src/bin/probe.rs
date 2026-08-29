@@ -86,7 +86,7 @@
 //!                                  printing the diagnosis verdicts — the FS twin of the defect
 //!                                  sweep. Read-only; ends re-amp OFF.
 //!   probe --doctor-plan-dry <slot> [<scene>] [--stim <di.wav>]
-//!                                  READ-ONLY one-round dump of the balance search: capture the
+//!                                  READ-ONLY dump of the balance plan: capture the
 //!                                  sound (base or a 0-based scene; --stim injects a profile's DI
 //!                                  wav in CAPTURE space, else the synthetic humbucker), diagnose,
 //!                                  discover controls, run the solve + ship-gate and print WHY it
@@ -611,8 +611,8 @@ fn main() {
     }
 
     if let Some(i) = args.iter().position(|a| a == "--doctor-plan-dry") {
-        // --doctor-plan-dry <slot> [<scene>]  — read-only one-round dump of the
-        // balance search (why it does or doesn't propose). Never writes/saves.
+        // --doctor-plan-dry <slot> [<scene>]  — read-only dump of the balance
+        // plan (why it does or doesn't propose). Never writes/saves.
         let slot: u32 = match args.get(i + 1).and_then(|s| s.parse().ok()) {
             Some(s) => s,
             None => {

@@ -88,8 +88,6 @@ pub fn run() {
             doctor_apply,
             doctor_save,
             doctor_discard,
-            doctor_tune_step,
-            doctor_tune_end,
             cancel_preset_leveling,
             restore_preset_level,
             level_footswitches_apply,
