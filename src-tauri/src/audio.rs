@@ -690,7 +690,7 @@ struct ReampStreams {
 /// so the fix is the user's, and the error must say so.
 fn host_config_hint() -> &'static str {
     if cfg!(windows) {
-        " — in Windows Sound settings set the Tone Master Pro output to 4 channels (Speakers → Configure → Quadraphonic) and both its Speakers and Line endpoints to a 48000 Hz default format (Properties → Advanced), then retry"
+        " — in Windows Sound settings set the Tone Master Pro output to 4 channels (Speakers → Configure → Quadraphonic) and both its Speakers and Line endpoints to a 48000 Hz default format (Properties → Advanced), then retry. Windows FORGETS the Quadraphonic setting after a reboot or a device replug, so re-doing Configure is routinely needed even when it was set before"
     } else {
         ""
     }
