@@ -571,6 +571,147 @@ mod imp {
     }
 }
 
+/// Windows only: hold the TMP's OWN audio endpoints at unity volume for the
+/// LIFETIME of a re-amp session, restoring the user's values on drop. Shared-
+/// mode WASAPI applies the endpoint's Windows master volume (the system slider
+/// for "Speakers (Fender Tone Master Pro)") to everything a client plays into
+/// it — and the capture side's level to what it records — so a nudged slider
+/// silently attenuates the injected stimulus and every measurement derived
+/// from it. HW 2026-08-31: the render endpoint sat at 8% (-38 dB); the clean
+/// scene of a two-amp preset measured -34.6 LUFS through the inject while the
+/// identical live input produced -14.3, and only the driven scenes' compression
+/// masked the loss elsewhere. macOS/Linux have no such layer (`hw:`/CoreAudio
+/// bypass the desktop mixer), so this is a Windows-only seam.
+///
+/// RESTORE, not pin: the same slider can be the only thing keeping a Windows
+/// monitoring loop ("Listen to this device", a DAW echo) quiet in the player's
+/// rig — pinning 100% permanently doubled the user's live guitar the moment it
+/// landed. The hold touches ONLY endpoints whose friendly name matches the
+/// unit — never the user's speakers — and is best-effort: a COM failure logs
+/// and the measurement proceeds (it may then read low; the floor guards flag it).
+#[cfg(windows)]
+mod endpoint_volume {
+    use windows::core::GUID;
+    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{
+        eCapture, eRender, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+    };
+
+    /// One endpoint's pre-hold state, by identity (flow + friendly name — the
+    /// hold re-resolves on restore, so no COM object is stored and the hold can
+    /// travel with the stream structs across the capture).
+    struct Prev {
+        capture: bool,
+        name: String,
+        scalar: f32,
+        muted: bool,
+    }
+
+    /// RAII: TMP endpoints at 100%/unmuted until dropped, then restored.
+    pub(super) struct UnityHold {
+        prev: Vec<Prev>,
+    }
+
+    impl Drop for UnityHold {
+        fn drop(&mut self) {
+            for p in &self.prev {
+                if let Err(e) = with_tmp_endpoint(p.capture, &p.name, |vol| unsafe {
+                    vol.SetMasterVolumeLevelScalar(p.scalar, &GUID::zeroed())?;
+                    vol.SetMute(p.muted, &GUID::zeroed())
+                }) {
+                    log::warn!(
+                        "[audio] {}: failed to restore the Windows endpoint volume to {:.0}% ({e})",
+                        p.name,
+                        p.scalar * 100.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// Raise every TMP endpoint to unity, remembering what to restore.
+    pub(super) fn hold_tmp_unity() -> UnityHold {
+        let mut prev = Vec::new();
+        if let Err(e) = for_each_tmp_endpoint(|capture, name, vol| unsafe {
+            let scalar = vol.GetMasterVolumeLevelScalar()?;
+            let muted = vol.GetMute()?.as_bool();
+            if (scalar - 1.0).abs() > 0.001 || muted {
+                vol.SetMasterVolumeLevelScalar(1.0, &GUID::zeroed())?;
+                vol.SetMute(false, &GUID::zeroed())?;
+                log::warn!(
+                    "[audio] {name}: Windows endpoint volume was {:.0}%{} — holding it at 100% for this re-amp session (the system slider scales the inject/capture); it is restored afterwards",
+                    scalar * 100.0,
+                    if muted { " and MUTED" } else { "" }
+                );
+                prev.push(Prev {
+                    capture,
+                    name: name.to_string(),
+                    scalar,
+                    muted,
+                });
+            }
+            Ok(())
+        }) {
+            log::warn!("[audio] endpoint volume hold failed ({e}) — a nudged Windows volume slider on the Tone Master Pro endpoint will attenuate the re-amp inject");
+        }
+        UnityHold { prev }
+    }
+
+    /// Run `f` for one named TMP endpoint (restore path).
+    fn with_tmp_endpoint(
+        capture: bool,
+        target: &str,
+        f: impl Fn(&IAudioEndpointVolume) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        for_each_tmp_endpoint(|c, name, vol| {
+            if c == capture && name == target {
+                f(vol)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Enumerate the active render+capture endpoints whose friendly name names
+    /// the unit and hand each one's `IAudioEndpointVolume` to `f`.
+    fn for_each_tmp_endpoint(
+        mut f: impl FnMut(bool, &str, &IAudioEndpointVolume) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            // Per-thread; RPC_E_CHANGED_MODE just means the thread is already
+            // initialized in another mode — either way COM is usable.
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            for flow in [eRender, eCapture] {
+                let devices = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
+                for i in 0..devices.GetCount()? {
+                    let device = devices.Item(i)?;
+                    let store = device.OpenPropertyStore(STGM_READ)?;
+                    let value = store.GetValue(&PKEY_Device_FriendlyName)?;
+                    // VT_LPWSTR (31) carries the friendly name; anything else is
+                    // not an endpoint we can identify — skip it.
+                    let inner = &value.Anonymous.Anonymous;
+                    if inner.vt.0 != 31 {
+                        continue;
+                    }
+                    let name = inner.Anonymous.pwszVal.to_string().unwrap_or_default();
+                    if !name.to_lowercase().contains("tone master") {
+                        continue;
+                    }
+                    let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+                    f(flow == EDataFlow(1), &name, &vol)?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Pick a config on `target_rate` with at least `min_ch` channels, F32 or I32
 /// (falling back to I32 only when no F32 config exists). F32 is what CoreAudio
 /// always offers; Linux ALSA `hw:` devices are commonly integer-only — the TMP's
@@ -680,6 +821,10 @@ struct ReampStreams {
     in_dev: Device,
     out_cfg: SupportedStreamConfig,
     in_cfg: SupportedStreamConfig,
+    /// Holds the TMP's Windows endpoint volumes at unity for as long as the
+    /// session's streams live — see [`endpoint_volume`].
+    #[cfg(windows)]
+    volume_hold: endpoint_volume::UnityHold,
 }
 
 /// What to append to a "no config" error on hosts where the missing config is a
@@ -699,6 +844,10 @@ fn host_config_hint() -> &'static str {
 /// Find the TMP and pick a 48 kHz output config (≥3 ch for USB-In 3) + input
 /// config. Errors describe exactly which half is missing.
 fn resolve_reamp_streams(sample_rate: u32) -> Result<ReampStreams, String> {
+    // A nudged Windows volume slider on the unit's endpoints silently scales the
+    // inject/capture — hold unity for the session (restored when the streams drop).
+    #[cfg(windows)]
+    let volume_hold = endpoint_volume::hold_tmp_unity();
     let host = cpal::default_host();
     let out_dev = find_device(host.output_devices().map_err(|e| e.to_string())?, |d| {
         channels_rates_formats(d.supported_output_configs().ok()).0
@@ -741,6 +890,8 @@ fn resolve_reamp_streams(sample_rate: u32) -> Result<ReampStreams, String> {
         in_dev,
         out_cfg,
         in_cfg,
+        #[cfg(windows)]
+        volume_hold,
     })
 }
 
@@ -1336,6 +1487,9 @@ fn ring_append_raw(buf: &mut std::collections::VecDeque<f32>, data: &Data, cap: 
 /// stimulus forever and lets the caller measure recent capture windows after live
 /// parameter changes without rebuilding CoreAudio streams.
 pub struct LiveReamp {
+    /// See [`endpoint_volume`]: unity for the live session, restored on drop.
+    #[cfg(windows)]
+    _volume_hold: endpoint_volume::UnityHold,
     _out_stream: cpal::Stream,
     _in_stream: cpal::Stream,
     captured: Arc<Mutex<std::collections::VecDeque<f32>>>,
@@ -1357,6 +1511,8 @@ impl LiveReamp {
             in_dev,
             out_cfg,
             in_cfg,
+            #[cfg(windows)]
+            volume_hold,
         } = streams;
 
         let out_ch = out_cfg.channels() as usize;
@@ -1414,6 +1570,8 @@ impl LiveReamp {
         out_stream.play().map_err(|e| format!("play output: {e}"))?;
 
         Ok(Self {
+            #[cfg(windows)]
+            _volume_hold: volume_hold,
             _out_stream: out_stream,
             _in_stream: in_stream,
             captured,
@@ -1450,6 +1608,10 @@ impl LiveReamp {
 /// index — a sub-3-channel negotiation fails here, loudly, instead of letting
 /// `Capture::channel`'s zero-pad read as "the player played nothing".
 pub fn capture_input(secs: f32, sample_rate: u32) -> Result<Capture, String> {
+    // The capture endpoint's Windows level scales what we record (see
+    // `endpoint_volume`); calibration must read the instrument at unity.
+    #[cfg(windows)]
+    let _volume_hold = endpoint_volume::hold_tmp_unity();
     let host = cpal::default_host();
     let in_dev = find_device(host.input_devices().map_err(|e| e.to_string())?, |d| {
         channels_rates_formats(d.supported_input_configs().ok()).0

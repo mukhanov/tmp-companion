@@ -67,6 +67,19 @@ libc = "0.2"
 # `WriteFile`). `windows-sys` is the thin extern binding tauri/cpal already pull; only
 # the feature set widens.
 [target.'cfg(windows)'.dependencies]
+# COM endpoint-volume control (`audio::endpoint_volume`): shared-mode WASAPI
+# scales the app's inject/capture by the endpoint's Windows master volume, so
+# re-amp must force the TMP's endpoints to unity. Same crate family the tree
+# already pulls via tao/cpal.
+windows = { version = "0.61", features = [
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+] }
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Devices_HumanInterfaceDevice",
