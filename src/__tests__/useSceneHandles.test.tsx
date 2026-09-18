@@ -19,9 +19,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { ThemeProvider } from "../theme/ThemeProvider";
 import {
-  BlockLevelPick,
+  FlatLevelPick,
   type BlockLevelHandle,
-} from "../views/overlays/BlockLevelPick";
+} from "../views/level/FlatLevelPick";
 import { WithCard } from "./pickCardTestUtils";
 import { useSceneHandles } from "../views/level/useSceneHandles";
 import {
@@ -52,9 +52,11 @@ function backupRow(slot: number, name: string, sceneHandles: SceneHandleRow[]) {
   return {
     slot,
     name,
+    preset_id: null,
     scene_count: sceneHandles.length,
     scenes: sceneHandles.map(() => ({ name: "Scene", fs: null })),
     amp_candidates: [],
+    base_active_amp_count: 0,
     blocks: [],
     graph: emptyGraph,
     footswitches: [],
@@ -189,7 +191,7 @@ describe("useSceneHandles — instant-first with device fallback", () => {
     });
   });
 
-  it("never reaches BlockLevelPick's 'Loading controls…' state on the backup path", async () => {
+  it("never reaches FlatLevelPick's 'Loading controls…' state on the backup path", async () => {
     await seedScan([
       backupRow(1, "Friedman HBE", [
         {
@@ -218,7 +220,7 @@ describe("useSceneHandles — instant-first with device fallback", () => {
             }
           : { status: st.status };
       return (
-        <BlockLevelPick
+        <FlatLevelPick
           pseudoLabel="Amp output level"
           handle={handle}
           onHandleChange={setHandle}
@@ -241,13 +243,11 @@ describe("useSceneHandles — instant-first with device fallback", () => {
 
     await user.click(screen.getByText("Amp output level"));
     // The candidate is already resolved by open time — the skeleton never shows,
-    // and the BLOCK dropdown's one row (the Boost's catalog full name) is there
-    // immediately.
+    // and the flattened list's one candidate row (block + param name) is there
+    // immediately, in a single click (no separate block/control stage).
     expect(screen.queryByText("Loading controls…")).toBeNull();
-    const blockRow = await screen.findByText("BOOST");
-    await user.click(blockRow);
-    // Picking the (only, hence best-ranked) block auto-picks its candidate, landing
-    // on the CONTROL dropdown's trigger.
-    expect(screen.getByText("Gain")).toBeInTheDocument();
+    const row = await screen.findByText("BOOST — Gain");
+    await user.click(row);
+    expect(screen.getByText("BOOST — Gain")).toBeInTheDocument();
   });
 });

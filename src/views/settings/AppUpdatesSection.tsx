@@ -14,6 +14,12 @@ import type { UpdaterApi } from "../../lib/useUpdater";
 
 const UPTODATE_MS = 2600;
 
+/** Where a Linux user actually gets a newer build. Plain text, not a link: the
+ *  app has no external-link capability (no opener plugin), and adding one is a
+ *  dependency decision that belongs in its own change. */
+const RELEASES_URL =
+  "https://github.com/pcavadas/tmp-companion/releases/latest";
+
 interface AppUpdatesSectionProps {
   updater: UpdaterApi;
 }
@@ -22,6 +28,9 @@ export function AppUpdatesSection({ updater }: AppUpdatesSectionProps) {
   const { t } = useTheme();
   const s = useStyles();
   const [check, setCheck] = useState<"idle" | "checking" | "uptodate">("idle");
+  // Null while `appInfo()` is in flight — treat only an explicit false as "no
+  // channel", so the normal UI is what renders during that first tick.
+  const noChannel = updater.hasUpdateChannel === false;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
@@ -59,72 +68,106 @@ export function AppUpdatesSection({ updater }: AppUpdatesSectionProps) {
           Version {updater.currentVersion ?? DASH}
         </div>
 
-        {check === "idle" && (
-          <Button
-            variant="ghost"
-            small
-            onClick={() => {
-              void runCheck();
-            }}
-          >
-            Check for updates
-          </Button>
-        )}
-        {check === "checking" && (
+        {/* No update channel (Linux): the check can only ever come back
+            empty, and reporting that as "up to date" is a lie — the .deb/.rpm
+            really are updated by hand. Say so, and drop the two affordances
+            that cannot work here. */}
+        {noChannel ? (
           <div
             style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: t.space3,
-              fontFamily: t.mono,
-              fontSize: t.fsData2,
-              color: t.sevWarn,
+              fontFamily: t.sans,
+              fontSize: t.fsUi,
+              color: t.ink2,
+              lineHeight: 1.5,
             }}
           >
-            <Spinner
-              name="refresh"
-              size={12}
-              stroke={t.sevWarn}
-              strokeWidth={2}
-            />
-            checking…
+            Linux packages update by downloading the latest .deb or .rpm from
+            the project’s releases page:
+            <div
+              style={{
+                fontFamily: t.mono,
+                fontSize: t.fsData2,
+                color: t.ink,
+                marginTop: t.space2,
+                userSelect: "text",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {RELEASES_URL}
+            </div>
           </div>
-        )}
-        {check === "uptodate" && (
-          <div
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: t.space3,
-              fontFamily: t.mono,
-              fontSize: t.fsData2,
-              color: t.good,
-            }}
-          >
-            <Icon name="check" size={11} stroke={t.good} strokeWidth={2} />
-            up to date
-          </div>
-        )}
+        ) : (
+          <>
+            {check === "idle" && (
+              <Button
+                variant="ghost"
+                small
+                onClick={() => {
+                  void runCheck();
+                }}
+              >
+                Check for updates
+              </Button>
+            )}
+            {check === "checking" && (
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: t.space3,
+                  fontFamily: t.mono,
+                  fontSize: t.fsData2,
+                  color: t.sevWarn,
+                }}
+              >
+                <Spinner
+                  name="refresh"
+                  size={12}
+                  stroke={t.sevWarn}
+                  strokeWidth={2}
+                />
+                checking…
+              </div>
+            )}
+            {check === "uptodate" && (
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: t.space3,
+                  fontFamily: t.mono,
+                  fontSize: t.fsData2,
+                  color: t.good,
+                }}
+              >
+                <Icon name="check" size={11} stroke={t.good} strokeWidth={2} />
+                up to date
+              </div>
+            )}
 
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: t.space5,
-            marginTop: t.space2,
-          }}
-        >
-          <span style={{ fontFamily: t.sans, fontSize: t.fsUi, color: t.ink2 }}>
-            Install updates automatically
-          </span>
-          <Toggle
-            on={updater.autoInstall}
-            onClick={() => {
-              updater.setAutoInstall(!updater.autoInstall);
-            }}
-          />
-        </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: t.space5,
+                marginTop: t.space2,
+              }}
+            >
+              <span
+                style={{ fontFamily: t.sans, fontSize: t.fsUi, color: t.ink2 }}
+              >
+                Install updates automatically
+              </span>
+              <Toggle
+                on={updater.autoInstall}
+                onClick={() => {
+                  updater.setAutoInstall(!updater.autoInstall);
+                }}
+              />
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

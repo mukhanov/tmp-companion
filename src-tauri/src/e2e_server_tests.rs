@@ -13,7 +13,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 /// How many presets `e2e/fixtures/scenario-presets.json` ships (= the offline snapshot list
 /// + the backup-fixture row count). One constant so adding a scenario preset is one edit.
-const SCENARIO_PRESETS: usize = 10;
+const SCENARIO_PRESETS: usize = 11;
 
 /// Invoke a command through the SAME IPC path the HTTP bridge uses: a JSON body in,
 /// the command's JSON response out (or its error value).
@@ -48,6 +48,28 @@ fn test_stim() -> Vec<f32> {
 /// Point the offline capture model + seed at the committed fixtures. Each entry is
 /// (env var, path relative to `CARGO_MANIFEST_DIR`) — folds the scenario/sidecar/backup/
 /// stimulus var setup that the physics gates share into one call (no style fork).
+/// The scenario physics env: preset fixtures, the authored C table, the backup blob, stimulus.
+fn scenario_env() {
+    set_e2e_env(&[
+        (
+            "TMP_E2E_SCENARIO_PRESETS",
+            "/../e2e/fixtures/scenario-presets.json",
+        ),
+        (
+            "TMP_E2E_LOUDNESS_SIDECAR",
+            "/../e2e/fixtures/scenario-loudness.json",
+        ),
+        (
+            "TMP_E2E_BACKUP_FIXTURE",
+            "/../e2e/fixtures/backup-fixture.bin",
+        ),
+        (
+            "TMP_E2E_STIMULUS",
+            "/resources/samples/guitar-humbucker.wav",
+        ),
+    ]);
+}
+
 fn set_e2e_env(pairs: &[(&str, &str)]) {
     for (k, v) in pairs {
         std::env::set_var(k, format!("{}{v}", env!("CARGO_MANIFEST_DIR")));
@@ -78,7 +100,7 @@ fn offline_copy_journey_through_real_backend() {
         ),
     );
     // Pre-fill the startup snapshot so connect/list serve it with no monitor thread —
-    // the 10 scenario presets at slots 400-409 (matching the backup fixture).
+    // the 11 scenario presets at slots 400-410 (matching the backup fixture).
     let presets = vec![
         crate::session::PresetEntry {
             slot: 400,
@@ -119,6 +141,10 @@ fn offline_copy_journey_through_real_backend() {
         crate::session::PresetEntry {
             slot: 409,
             name: "E2E Hiwatt Min".into(),
+        },
+        crate::session::PresetEntry {
+            slot: 410,
+            name: "E2E Friedman 3S".into(),
         },
     ];
     MONITOR_ENABLED.store(true, SeqCst);
@@ -437,24 +463,7 @@ fn level_defaults_base_clamps_and_the_split_lane_footswitch_is_offbranch() {
 #[test]
 fn the_fs_prepass_announces_every_row_before_any_row_finishes() {
     let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
     let sf = sim.clone();
@@ -481,11 +490,13 @@ fn the_fs_prepass_announces_every_row_before_any_row_finishes() {
         .build()
         .expect("wv");
 
-    // The four drive pedals, in switch order — Rat's handle is `volume`, the others' `level`.
+    // The four drive pedals, in switch order — ObsessiveDrive and Rat's handle is `volume`,
+    // the others' `level` (HW-confirmed from a field-8 read of the real device; ObsessiveDrive
+    // has no `level` parameter at all).
     let switches: [(u32, &str, &str); 4] = [
         (5, "ACD_Plumes", "level"),
         (6, "ACD_BluesDriver", "level"),
-        (7, "ACD_ObsessiveDrive", "level"),
+        (7, "ACD_ObsessiveDrive", "volume"),
         (8, "ACD_Rat", "volume"),
     ];
     let jobs: Vec<serde_json::Value> = switches
@@ -570,24 +581,7 @@ fn the_fs_prepass_announces_every_row_before_any_row_finishes() {
 #[test]
 fn the_scene_prepass_captions_its_own_phase_and_the_solve_does_not() {
     let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
     let sf = sim.clone();
@@ -659,7 +653,9 @@ fn the_scene_prepass_captions_its_own_phase_and_the_solve_does_not() {
 /// Slot 405's Plumes switch (5) is the fixture: its block is OFF in base, so engaging it puts
 /// the saturated-amp curve in charge, and the ceiling must equal that curve AT THE HANDLE'S
 /// TOP BOUND (`saturated_pedal_lufs(1.0)`), not at its authored 0.5. A prepass that forgot to
-/// pin the handle, or that measured the disengaged sound, both fail here.
+/// pin the handle, or that measured the disengaged sound, both fail here. (Not perturbed by
+/// 405's Plumes-regression `presetLevel` amendment — see the `expected` computation below for
+/// why.)
 ///
 /// It must also WRITE NOTHING PERSISTENT: every write lands on the throwaway capture
 /// connection's working copy, which is what makes a ceiling read safe to take before the run
@@ -708,6 +704,15 @@ fn the_fs_prepass_reads_the_ceiling_at_the_handles_top_bound() {
     // the_ceiling_probe_pins_the_handle_at_its_top_bound_and_writes_it_last`.)
     let (_, hi) = handle.bounds();
     let ceiling = crate::leveller::measure_fs_ceiling(&probe, &stim, None).expect("ceiling read");
+    // NOT `saturated_pedal_lufs(hi) + 20*log10(presetLevel)`, even though the curve DOES fold
+    // in `preset_term` in general (`sim_device::model_lufs`'s `Contribution::Absolute` arm).
+    // `SimState::load_preset` only overwrites the ambient `preset_level` from the fixture's own
+    // committed value once this run has SAVED that slot at least once (`ever_saved` — the
+    // lazy-commit corruption model, `sim_device.rs`'s own doc). This test's plain load never
+    // saves 405 first, so the sim's ambient `preset_level` stays at its process-default 1.0
+    // regardless of 405's authored 0.27 — confirmed empirically (measured -14.00, exactly
+    // `saturated_pedal_lufs(1.0)` with a ZERO preset term) after the Plumes-regression
+    // amendment, so the fixture change does NOT perturb this particular gate.
     let expected = crate::sim_device::saturated_pedal_lufs(hi).unwrap();
     assert!(
         (ceiling.integrated_lufs - expected).abs() < 0.3,
@@ -960,7 +965,12 @@ fn bake_path_footswitch_writes_the_block_directly_and_persists_its_value() {
 /// `bake_path_footswitch_writes_the_block_directly_and_persists_its_value`, a different
 /// fixture/switch). Its `level` knob rides the sim's `saturated_pedal_lufs` curve, so a target
 /// off the AUTHORED 0.5 (→ -16.14 LUFS at that curve) forces run 1 to actually solve and write —
-/// a fixture that already sat on target would make run 2's skip prove nothing.
+/// a fixture that already sat on target would make run 2's skip prove nothing. (405's own
+/// `presetLevel` does NOT fold into this reading: `SimState::load_preset` only re-syncs the
+/// sim's ambient `preset_level` from a slot's committed doc once that slot has been SAVED at
+/// least once this run — see the `ever_saved` gate in `sim_device.rs`'s own doc — and this
+/// test's first load of 405 predates any save, so the ambient value stays at the process
+/// default of 1.0 throughout, exactly as before the Plumes-regression amendment.)
 ///
 /// `Saved` (not `ChangeParameter`) is the discriminator because the ceiling prepass engages once
 /// per row on EVERY run regardless of the fix (a known, accepted cost — see `CLAUDE.md`'s
@@ -1002,9 +1012,15 @@ fn bake_path_footswitch_rerun_skips_the_persist_when_already_at_target() {
     const SWITCH: u32 = 5;
     const NODE: &str = "ACD_Plumes";
     const PARAM: &str = "level";
-    // Reachable (the handle's top-bound ceiling reads ~ -14 LUFS on this curve) and >1 LU off
-    // the authored 0.5's -16.14, so run 1 truly solves rather than trivially matching already.
-    const TARGET: f64 = -15.0;
+    // Reachable (the handle's top-bound ceiling reads ~ -14 LUFS on this curve — see the doc
+    // comment above on why 405's own presetLevel does not shift it here) and well off the
+    // authored 0.5's -16.14, so run 1 truly solves rather than trivially matching already.
+    // -26.0 (moved from this gate's original -15.0 during the Plumes-regression fixture
+    // amendment, out of an abundance of caution before the `ever_saved` mechanics above were
+    // understood) sits on the curve's steep cliff segment and remains a valid, comfortably
+    // reachable, off-authored target — kept as-is rather than reverted, since it is verified
+    // passing and a numeric target choice here carries no assertion-strength cost either way.
+    const TARGET: f64 = -26.0;
 
     let spec_json = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
     let p24 = spec_json
@@ -1096,10 +1112,7 @@ fn bake_path_footswitch_rerun_skips_the_persist_when_already_at_target() {
         "run 1 must move the value off the authored 0.5, or run 2's skip proves nothing: {r1:?}"
     );
     let events1 = sim.events();
-    let saved_events_after_run1 = events1
-        .iter()
-        .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(_)))
-        .count();
+    let saved_events_after_run1 = saved_event_count(&events1);
     assert_eq!(
         saved_events_after_run1,
         1,
@@ -1132,11 +1145,7 @@ fn bake_path_footswitch_rerun_skips_the_persist_when_already_at_target() {
         "the skip must return the CURRENT value verbatim, not re-solve/re-randomize it: \
          run1={final_value_1} run2={final_value_2}"
     );
-    let saved_events_after_run2 = sim
-        .events()
-        .iter()
-        .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(_)))
-        .count();
+    let saved_events_after_run2 = saved_event_count(&sim.events());
     assert_eq!(
         saved_events_after_run2,
         saved_events_after_run1,
@@ -1760,6 +1769,62 @@ fn footswitch_assignment_set_and_clear_edit_the_working_copy_and_survive_only_a_
     );
 }
 
+/// The preset-28 ("Friedman HBE") first-run class: a scene whose live field-3 doc arrives cut
+/// before the amp nodes must still level ITS OWN amp, from the saved preset. HW 2026-09-01, two
+/// of four scenes pushed unanswerable docs and were silently SKIPPED — one of them swaps amps.
+///
+/// Paired with BASE, not a second scene: base's push is whole so `scene_jobs::structure_graph`
+/// still resolves, and base moves `presetLevel`, not a fader, leaving "`BASE_AMP` never written"
+/// clean. Asserted on write IDENTITY because `SimState::scene_output_level` matches
+/// node-agnostically — a wrong-amp solve converges to target exactly like a right one.
+#[test]
+fn a_truncated_swap_scene_levels_its_own_amp_not_the_base_one() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _cancel_reset = SceneCancelReset;
+    scenario_env();
+    crate::leveller::clear_slot_save_registry();
+    let sim = crate::sim_device::SimDevice::new().with_truncated_scene_push(SWAP_SCENE, BASE_AMP);
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let (_app, webview) = batched_scene_app();
+
+    let candidates = serde_json::json!([
+        {"groupId": "G1", "nodeId": BASE_AMP, "parameterId": "outputLevel", "value": 0.35},
+        {"groupId": "G1", "nodeId": SWAP_AMP, "parameterId": "outputLevel", "value": 0.35}
+    ]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": SWAP_SLOT,
+            "jobs": [
+                {"sceneSlot": 8, "targetLufs": -25.0},
+                {"sceneSlot": SWAP_SCENE, "targetLufs": -25.0}
+            ],
+            "candidates": candidates,
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    let rows = res.as_array().expect("results array").clone();
+    scene_row(&rows, Some(u64::from(SWAP_SCENE)))
+        .unwrap_or_else(|| panic!("the cut scene must come back leveled, not skipped: {rows:?}"));
+
+    let events = sim.events();
+    assert!(
+        wrote_output_level(&events, SWAP_AMP),
+        "the cut scene's OWN amp is what gets written, not {BASE_AMP}: {rows:?}"
+    );
+    assert!(
+        !wrote_output_level(&events, BASE_AMP),
+        "{BASE_AMP} is bypassed here and base's row moves presetLevel: {rows:?}"
+    );
+}
+
 /// The SCENE-leveling physics for slot 403 through the REAL `level_scenes_apply_batched`
 /// command over mock IPC — the same path the offline UI drives, minus the Channel-streaming
 /// seam (`.claude/rules/e2e.md`'s "The Channel-streaming seam"): this gate asserts the
@@ -1773,24 +1838,7 @@ fn footswitch_assignment_set_and_clear_edit_the_working_copy_and_survive_only_a_
 #[test]
 fn level_defaults_403_scenes_solve_and_offbranch() {
     let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
     let sf = sim.clone();
@@ -1851,237 +1899,6 @@ fn level_defaults_403_scenes_solve_and_offbranch() {
             "solvable scene lands near -23: {r:?}"
         );
     }
-}
-
-/// Gain-budget redistribution (PR5) end-to-end through the real command against the offline
-/// physics: slot 400 (E2E Rig) is the loud class — Base C=-15 solves, and scene 2
-/// ("Ceiling", C=-14 with its amp saved at `outputLevel` 1.0) clamps at EVERY shipped
-/// default because it has no boost headroom at all. `redistribute_headroom` raises
-/// presetLevel by the solved delta and re-levels the base amp + BOTH scenes back to −23, so the
-/// previously-clamped scene 2 reaches target (done, not clamped) and every sound lands near −23
-/// — AND it records the pre-values (presetLevel + touched knobs) for the Summary's Restore.
-/// This is the offline half of "clamped run →
-/// redistribute → all done"; the base-scene skip + save-persistence idempotency are online
-/// (the sim models no field-8 read-back / saved-state reload, same limit as `level.spec.ts`'s
-/// idempotency test).
-#[test]
-fn redistribute_400_gives_the_clamped_scene_headroom() {
-    let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
-    let sim = crate::sim_device::SimDevice::new();
-    crate::sim_device::set_live(&sim);
-    let sf = sim.clone();
-    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
-    let app = tauri::test::mock_builder()
-        .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![redistribute_headroom])
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("app");
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
-        .build()
-        .expect("wv");
-    let amp = serde_json::json!([{
-        "groupId": "G1", "nodeId": "ACD_JC120",
-        "parameterId": "outputLevel", "value": 0.35
-    }]);
-    // Base (wire slot 8) + scene 2 (the clamped "Ceiling" one) + scene 1, all to −23 (PR2
-    // re-baseline: +3 from the mono-era −26). `worstClampedDeficitDb` 6.0 is more than
-    // enough to rescue scene 2's ~0.9 dB deficit.
-    let jobs = serde_json::json!([
-        {"sceneSlot": 8, "targetLufs": -23.0},
-        {"sceneSlot": 2, "targetLufs": -23.0},
-        {"sceneSlot": 1, "targetLufs": -23.0}
-    ]);
-    let res = invoke(
-        &webview,
-        "redistribute_headroom",
-        serde_json::json!({
-            "slot": 400, "jobs": jobs, "candidates": amp, "worstClampedDeficitDb": 6.0,
-            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
-            "onResult": "__CHANNEL__:0"
-        }),
-    )
-    .expect("redistribute_headroom");
-    let results = res["results"].as_array().expect("results array");
-    assert_eq!(results.len(), 3, "one result per sound: {res}");
-    for r in results {
-        let lufs = r["measured_lufs"].as_f64().expect("lufs");
-        assert!(
-            (lufs + 23.0).abs() < 1.0,
-            "every sound (incl. the once-clamped scene 0) reaches −23: {r}"
-        );
-        assert_eq!(
-            r["clamped"],
-            serde_json::json!(false),
-            "no clamp remains: {r}"
-        );
-    }
-    // presetLevel was raised by a positive delta, and the pre-values are recorded for Restore.
-    let delta = res["deltaDb"].as_f64().expect("deltaDb");
-    assert!(delta > 0.0, "a positive redistribution delta: {res}");
-    assert!(
-        res["newPresetLevel"].as_f64().unwrap() > res["previousPresetLevel"].as_f64().unwrap(),
-        "presetLevel rose: {res}"
-    );
-    let prev = res["previousKnobs"].as_array().expect("previousKnobs");
-    assert!(
-        prev.iter().any(|k| k["sceneSlot"].is_null()),
-        "the base amp knob (sceneSlot null) is recorded for Restore: {res}"
-    );
-    assert!(
-        prev.iter().filter(|k| k["sceneSlot"].is_number()).count() >= 2,
-        "both scene overlays are recorded for Restore: {res}"
-    );
-    // The other half of the atomicity contract: exactly ONE deferred save persisted it all.
-    assert_eq!(
-        sim.events()
-            .iter()
-            .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(_)))
-            .count(),
-        1,
-        "exactly one deferred save persists the redistribution: {:?}",
-        sim.events()
-    );
-}
-
-/// Redistribution ATOMICITY: a capture fault (one sound reads silence) makes that
-/// compensating solve fail, so the whole redistribution is a PARTIAL — it aborts PRE-save,
-/// reloads to discard the raise, and persists NOTHING (no `saveCurrentPreset`). The command
-/// returns an error; the fake records zero `Saved` events.
-#[test]
-fn redistribute_aborts_and_saves_nothing_on_a_dropped_capture() {
-    let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
-    let sim = crate::sim_device::SimDevice::new();
-    crate::sim_device::set_live(&sim);
-    let sf = sim.clone();
-    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
-    // Fault the NEXT capture for slot 400 → the first compensating solve fails.
-    crate::sim_device::arm_capture_fault(400);
-    let app = tauri::test::mock_builder()
-        .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![redistribute_headroom])
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("app");
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
-        .build()
-        .expect("wv");
-    let amp = serde_json::json!([{
-        "groupId": "G1", "nodeId": "ACD_JC120",
-        "parameterId": "outputLevel", "value": 0.35
-    }]);
-    let jobs = serde_json::json!([
-        {"sceneSlot": 8, "targetLufs": -23.0},
-        {"sceneSlot": 0, "targetLufs": -23.0}
-    ]);
-    let res = invoke(
-        &webview,
-        "redistribute_headroom",
-        serde_json::json!({
-            "slot": 400, "jobs": jobs, "candidates": amp, "worstClampedDeficitDb": 6.0,
-            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
-            "onResult": "__CHANNEL__:0"
-        }),
-    );
-    assert!(
-        res.is_err(),
-        "a faulted redistribution must return an error: {res:?}"
-    );
-    assert!(
-        !sim.events()
-            .iter()
-            .any(|e| matches!(e, crate::sim_device::SimEvent::Saved(_))),
-        "an aborted redistribution saves NOTHING: {:?}",
-        sim.events()
-    );
-    // And the working copy is discarded: the abort reloads the stored preset AFTER the last
-    // live write, so nothing unsaved can linger on the unit.
-    let events = sim.events();
-    let last_write = events
-        .iter()
-        .rposition(|e| matches!(e, crate::sim_device::SimEvent::PresetLevel(_)));
-    let last_reload = events
-        .iter()
-        .rposition(|e| matches!(e, crate::sim_device::SimEvent::Loaded(400)));
-    assert!(
-        matches!((last_write, last_reload), (Some(w), Some(l)) if l > w),
-        "the abort's discard-reload follows the last live write: {events:?}"
-    );
-}
-
-/// Reachable-common-target derivation (PR6) through the real command: given a finished run's
-/// ALREADY-measured ceilings, `common_reachable_target` returns `min(C − offset) − headroom`
-/// (guitar offset 0 → `min(C) − 1`). This is the quiet-preset clamp fallback's target, and it
-/// re-captures NOTHING — the frontend re-levels every sound to this value via the run loop. The
-/// offset-space + min math is unit-gated in `leveller`; this pins the command wiring.
-#[test]
-fn common_reachable_target_returns_min_ceiling_minus_headroom() {
-    let app = tauri::test::mock_builder()
-        .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![common_reachable_target])
-        .build(tauri::test::mock_context(tauri::test::noop_assets()))
-        .expect("app");
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
-        .build()
-        .expect("wv");
-    let res = invoke(
-        &webview,
-        "common_reachable_target",
-        serde_json::json!({
-            "ceilings": [
-                { "cLufs": -25.0, "topologyId": null },
-                { "cLufs": -20.0, "topologyId": "guitar-humbucker" }
-            ]
-        }),
-    )
-    .expect("common_reachable_target");
-    let t = res.as_f64().expect("target f64");
-    assert!(
-        (t - -26.0).abs() < 1e-9,
-        "min(-25,-20) − 1 headroom = -26 (PR2 re-baseline: +3 from the mono-era -28/-23 → -29): {t}"
-    );
-
-    // No finite ceiling → an error (an all-silent run has nothing to derive from).
-    let err = invoke(
-        &webview,
-        "common_reachable_target",
-        serde_json::json!({ "ceilings": [] }),
-    );
-    assert!(err.is_err(), "empty ceilings must error: {err:?}");
 }
 
 /// Instrument-profile stimulus resolution + re-level smoke: a profile-driven level run resolves
@@ -2254,24 +2071,7 @@ const HIWATT_AMP: &str = "ACD_HiwattDR103CanMod";
 /// stimulus), plus a live SimDevice wired as the transport factory. Returns the fake so the
 /// caller can read its event log.
 fn hiwatt_sim() -> crate::sim_device::SimDevice {
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
     let sf = sim.clone();
@@ -2457,13 +2257,13 @@ fn hiwatt_base_leveling_measures_base_not_the_saved_scene() {
 /// `ACD_Boost`, `ACD_TMSpring63`) and one owns a block saved OFF (`ACD_CryBabyQ535`). A base run
 /// must force EVERY one of them off, whatever its saved state.
 ///
-/// SCOPE HONESTY: this pins the device-visible CAUSE — the same standard
-/// `hiwatt_scene_leveling_never_reseeds_an_existing_overlay` documents — not the LU delta. No
-/// shipped fixture declares a base-ENGAGED block in the sidecar's `leveledParams`, so the
-/// loudness the isolation costs is not expressible against this fixture set (which is also why
-/// the C assertion below is unchanged at -15: forcing these blocks off moves no modeled
-/// loudness offline); that half is the hardware measurement quoted above. The C assertion is a
-/// non-vacuity guard — the capture really went through the physics model — not the discriminator.
+/// SCOPE: this pins the device-visible CAUSE — the same standard
+/// `hiwatt_scene_leveling_never_reseeds_an_existing_overlay` documents — not the LU delta. The
+/// C assertion below is a non-vacuity guard (the capture really went through the physics model),
+/// not the discriminator. The LU delta itself — RETIRED here as of the Plumes leveling-
+/// regression fixture amendment, which gave 405 ("E2E Preset24") a base-ENGAGED block
+/// (`ACD_Rat`) in the sidecar's `leveledParams` — is now expressible offline and pinned by
+/// `base_isolation_on_a_base_engaged_pedal_costs_the_measured_lu_delta` (E4, below).
 #[test]
 fn base_leveling_forces_every_footswitch_owned_block_off_not_the_preset_as_saved() {
     let _serial = serial();
@@ -2575,6 +2375,643 @@ fn base_leveling_forces_every_footswitch_owned_block_off_not_the_preset_as_saved
     assert!(
         forced_on.is_empty(),
         "the base isolation may only force footswitch-owned blocks OFF: {forced_on:?}"
+    );
+}
+
+// ============================================================================
+// PHASE 2 GATES E1-E9 — the joint (presetLevel, base-amp fader) BOOST regime: the
+// plumes/BD2/OCD-class leveling regression fix (`notes/leveling.md`'s BOOST section,
+// `headroom_trade::plan_level_pair`, `leveller::level_preset_impl`'s routing).
+//
+// Fixture 405 ("E2E Preset24") is the PLUMES shape after its Phase 4 amendment:
+// presetLevel 0.27, the Twin's outputLevel 0.28, Rat base-engaged (bypass:false,
+// volume 0.62), sidecar base C = -28. Fixture 410 ("E2E Friedman 3S") is the HEALTHY
+// companion: presetLevel 0.5, Plexi outputLevel 1.0, 3 full-overlay scenes, sidecar
+// base C = -18, no `leveledParams` (a plain flat-C/`ol_term` fixture). E1 + E3 are the
+// PAIRED SEE-SAW GATE this regression is named for ("fixing 27 breaks 28 and vice
+// versa") — both shapes are asserted in this ONE suite and must always run together.
+// ============================================================================
+
+const PLUMES: u32 = 405;
+const PLUMES_TWIN: &str = "ACD_TwinReverb65NoFx";
+const FRIEDMAN: u32 = 410;
+const FRIEDMAN_AMP: &str = "ACD_MarshallPlexi";
+
+/// The wire body `level_preset` expects, with every optional field nulled except the three
+/// the boost gates actually vary — mirrors the job shape already used by
+/// `hiwatt_base_leveling_measures_base_not_the_saved_scene` and its 405 siblings above.
+fn base_job(slot: u32, target_lufs: f64, save: bool) -> serde_json::Value {
+    serde_json::json!({
+        "slot": slot, "target_lufs": target_lufs, "save": save,
+        "topology_id": null, "calibration_lufs": null, "stimulus_path": null, "profile_id": null,
+        "block_group_id": null, "block_node_id": null, "block_parameter_id": null,
+        "block_value": null
+    })
+}
+
+/// A mock app + webview wired for the `level_preset` command alone — every E1-E8 gate below
+/// drives base leveling through exactly this one command.
+fn level_preset_app() -> (tauri::App<MockRuntime>, WebviewWindow<MockRuntime>) {
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![level_preset])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    (app, webview)
+}
+
+/// Run `level_preset` for `slot` at `target_lufs`/`save` through `webview` and return the
+/// decoded JSON result — the ONE invocation shape every E1-E8 gate below shares.
+fn run_base_level(
+    webview: &WebviewWindow<MockRuntime>,
+    slot: u32,
+    target_lufs: f64,
+    save: bool,
+) -> serde_json::Value {
+    invoke(
+        webview,
+        "level_preset",
+        serde_json::json!({ "job": base_job(slot, target_lufs, save) }),
+    )
+    .unwrap_or_else(|e| panic!("level_preset {slot}: {e}"))
+}
+
+/// Did any `ChangeParameter` write land on `node`'s `outputLevel`? The shared non-vacuity /
+/// never-touched check across every E1-E8 gate.
+fn wrote_output_level(events: &[crate::sim_device::SimEvent], node: &str) -> bool {
+    events.iter().any(|e| {
+        matches!(e, crate::sim_device::SimEvent::ChangeParameter { node: n, param, .. }
+            if n == node && param == "outputLevel")
+    })
+}
+
+/// How many times a `ChangeParameter` write landed on `node`'s `outputLevel` — E8's own
+/// "written exactly N times across both runs" count.
+fn output_level_write_count(events: &[crate::sim_device::SimEvent], node: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(e, crate::sim_device::SimEvent::ChangeParameter { node: n, param, .. }
+                if n == node && param == "outputLevel")
+        })
+        .count()
+}
+
+/// How many `saveCurrentPreset` commits an event log carries. Snapshotted at a run BOUNDARY and
+/// compared as a delta, so a gate pins "this run added none" rather than a total that re-keys
+/// itself whenever an earlier run's save choreography changes. Takes a SLICE, like
+/// [`output_level_write_count`] — `SimDevice::events` clones the whole vector under a lock, so
+/// one snapshot must be able to feed every counter a gate runs against the same moment.
+fn saved_event_count(events: &[crate::sim_device::SimEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(_)))
+        .count()
+}
+
+/// `slot`'s SAVED `presetLevel` + `node`'s SAVED `outputLevel`, off a fresh field-8 read — the
+/// post-run pair every E1-E8 gate re-reads to confirm what actually persisted.
+fn saved_pl_and_output_level(slot: u32, node: &str) -> (f64, f64) {
+    let doc = crate::read_saved_preset(slot).expect("post-run field-8 read");
+    let pl = crate::audiograph::preset_level(&doc).expect("presetLevel");
+    let fader = crate::commands::level_footswitch::node_param_f64(&doc, node, "outputLevel")
+        .unwrap_or_else(|| panic!("{node} outputLevel must be present in the saved doc: {doc}"));
+    (pl, fader)
+}
+
+/// A run that must never touch `node`'s fader: no wire write, and the SAVED fader still reads
+/// `expected_fader` — shared by every E-gate that asserts a no-op on the amp. `expected_pl`
+/// additionally pins the stored `presetLevel` when the caller cares.
+fn assert_fader_untouched(
+    sim: &crate::sim_device::SimDevice,
+    slot: u32,
+    node: &str,
+    expected_fader: f64,
+    expected_pl: Option<f64>,
+) {
+    let events = sim.events();
+    assert!(
+        !wrote_output_level(&events, node),
+        "must never write the amp's outputLevel: {events:?}"
+    );
+    let (pl, fader) = saved_pl_and_output_level(slot, node);
+    if let Some(expected_pl) = expected_pl {
+        assert!(
+            (pl - expected_pl).abs() < 1e-3,
+            "the stored presetLevel must be unchanged: {pl}"
+        );
+    }
+    assert!(
+        (fader - expected_fader).abs() < 1e-3,
+        "the amp's own fader must be left exactly as authored: {fader}"
+    );
+}
+
+/// E1 + E3 — THE PAIRED SEE-SAW GATE. BUG→GATE (2026-08-31 investigation): 405's base
+/// (Rat isolated off, presetLevel 0.27, Twin outputLevel 0.28) cannot reach -23 LUFS at
+/// `presetLevel`'s own ceiling (P_up ≈ 11.37 dB short of the ≈16.4 LU deficit implied by
+/// the sidecar's base C = -28 at this fixture's authored fader) — `plan_level_pair` must
+/// therefore choose the BOOST regime: pin `presetLevel` at 1.0 and raise the Twin's
+/// `outputLevel` fader for the remaining ≈5 dB (`headroom_trade.rs`'s U2 unit gate pins the
+/// same numbers off `plan_level_pair` alone; this is the device-facing half — the actual
+/// write + save on the real command path).
+#[test]
+fn a_base_row_that_cannot_reach_target_at_preset_level_max_raises_the_active_amp() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    let (_app, webview) = level_preset_app();
+
+    let r = run_base_level(&webview, PLUMES, -23.0, true);
+
+    assert_eq!(
+        r["clamped"], false,
+        "the joint boost must land base exactly on target, not a device-honest clamp: {r}"
+    );
+    let verify = r["verify_lufs"].as_f64().expect("verify_lufs");
+    assert!(
+        (verify - (-23.0)).abs() < 0.5,
+        "the verified capture must land near target: {r}"
+    );
+    assert!(
+        (r["final_level"].as_f64().expect("final_level") - 1.0).abs() < 1e-3,
+        "presetLevel is pinned at its ceiling in the Boost regime: {r}"
+    );
+    let boost = &r["base_boost"];
+    assert_eq!(
+        boost["applied"], true,
+        "a save run on a scene-less preset must actually apply the boost: {r}"
+    );
+    let amp = &boost["base_amps"][0];
+    assert!(
+        (amp["previous_value"].as_f64().expect("previous_value") - 0.28).abs() < 0.01,
+        "the amp's own authored fader was 0.28: {r}"
+    );
+    let value = amp["value"]
+        .as_f64()
+        .expect("the applied boost must report a solved value");
+    assert!(
+        (value - 0.498).abs() < 0.02,
+        "the fader must solve to ~0.498 (0.28 * 10^(5.00/20)): {r}"
+    );
+
+    // NON-VACUITY: the boost really did write the amp's outputLevel on the wire, not just
+    // presetLevel — the whole point of the fix is that a fader move actually happens.
+    let events = sim.events();
+    assert!(
+        wrote_output_level(&events, PLUMES_TWIN),
+        "the boost must write the Twin's outputLevel on the wire: {events:?}"
+    );
+}
+
+/// E1's PAIRED companion (see the block header above): 410's own base deficit fits
+/// comfortably inside `presetLevel`'s own room, so `plan_level_pair` must choose TRADE with
+/// a bit-exact zero fader move (`headroom_trade.rs`'s U3 pins the same numbers) — this run
+/// must therefore behave BYTE-FOR-BYTE like the pre-Phase-1 plain solve: no `base_boost`
+/// summary at all, no fader write, and the preset's own `lastLoadedScene` untouched. This is
+/// the historical regression's OTHER half: a fix that always raises the fader (or always
+/// leaves it alone) breaks one of these two shapes.
+#[test]
+fn a_healthy_base_row_never_moves_the_amp_fader() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    let (_app, webview) = level_preset_app();
+
+    let r = run_base_level(&webview, FRIEDMAN, -23.0, true);
+
+    assert!(
+        r["base_boost"].is_null(),
+        "410's own G fits inside presetLevel's own room — TRADE, never Boost, so no summary \
+         at all: {r}"
+    );
+    assert_eq!(r["clamped"], false, "{r}");
+    let final_level = r["final_level"].as_f64().expect("final_level");
+    assert!(
+        (final_level - 0.5623).abs() < 0.001,
+        "the plain solve off C=-18 lands at ~0.5623: {r}"
+    );
+
+    let events = sim.events();
+    assert!(
+        !wrote_output_level(&events, FRIEDMAN_AMP),
+        "a healthy base must NEVER write the amp's own outputLevel — the see-saw regression \
+         this pair of gates exists to catch: {events:?}"
+    );
+
+    let doc = crate::read_saved_preset(FRIEDMAN).expect("post-save field-8 read");
+    assert_eq!(
+        doc["lastLoadedScene"].as_u64(),
+        Some(1),
+        "lastLoadedScene must be unchanged: {doc}"
+    );
+}
+
+/// BUG→GATE (Phase 2 save-path guards, `notes/leveling.md`'s Phase 2 section): the pre-save
+/// base recall must re-assert BOTH the raised `presetLevel` and the solved fader, and the save
+/// must persist both together — no same-slot load may ever see a half-old, half-new pair. Seeds
+/// `ever_saved` with a plain unedited save first (`sim_device.rs`'s lazy-commit doc), so the
+/// boost's own save is the slot's SECOND save this run — the shape a broken guard would leave
+/// stale bytes behind on.
+#[test]
+fn the_base_boost_saves_both_halves_of_the_pair_and_undoes_the_isolation() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _sim = hiwatt_sim();
+
+    {
+        let mut s = crate::session::Session::connect_lean().expect("connect");
+        s.load_preset(PLUMES).expect("load 405");
+        s.save_current_preset(PLUMES)
+            .expect("seed ever_saved with an unedited save");
+    }
+
+    let (_app, webview) = level_preset_app();
+    let r = run_base_level(&webview, PLUMES, -23.0, true);
+    assert_eq!(r["base_boost"]["applied"], true, "{r}");
+    assert_eq!(r["saved"], true, "{r}");
+
+    // The save's own witness registered — the stale-load barrier a same-slot load waits on.
+    assert!(
+        crate::leveller::slot_save_pending_commit(PLUMES),
+        "the boost's save must register a witness for the stale-load barrier: {r}"
+    );
+
+    // POST-SAVE FIELD-8 RE-READ: both halves of the pair actually landed TOGETHER.
+    let (pl, fader) = saved_pl_and_output_level(PLUMES, PLUMES_TWIN);
+    assert!(
+        (pl - 1.0).abs() < 1e-3,
+        "presetLevel must persist at its ceiling: {pl}"
+    );
+    assert!(
+        (fader - 0.498).abs() < 0.02,
+        "the solved fader must persist alongside presetLevel: {fader}"
+    );
+
+    // ISOLATION UNDONE: every forced pedal's bypass is back at its OWN authored value —
+    // never left forced off, never re-engaged past what the player actually saved.
+    let doc = crate::read_saved_preset(PLUMES).expect("post-save field-8 read");
+    let bypass_of = |node: &str| -> bool {
+        doc.pointer("/audioGraph/guitarNodes/G1")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|n| n.get("nodeId").and_then(|v| v.as_str()) == Some(node))
+            })
+            .and_then(|n| n.pointer("/dspUnitParameters/bypass"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| panic!("{node} bypass must be present in the saved doc: {doc}"))
+    };
+    assert!(
+        bypass_of("ACD_Plumes"),
+        "Plumes must return to its authored bypass (true, off in base): {doc}"
+    );
+    assert!(
+        bypass_of("ACD_BluesDriver"),
+        "BluesDriver must return to its authored bypass (true, off in base): {doc}"
+    );
+    assert!(
+        bypass_of("ACD_ObsessiveDrive"),
+        "ObsessiveDrive must return to its authored bypass (true, off in base): {doc}"
+    );
+    assert!(
+        !bypass_of("ACD_Rat"),
+        "Rat must return to its authored bypass (false, base-engaged) — not left forced off: \
+         {doc}"
+    );
+
+    // `lastLoadedScene` re-stamped to the preset's own original value (405 is scene-less, so
+    // its own `lastLoadedScene` is `BASE_SCENE_SLOT`) — never left at whatever scene the
+    // run's own measurement/solve connections happened to land on.
+    assert_eq!(
+        doc["lastLoadedScene"].as_u64(),
+        Some(crate::session::BASE_SCENE_SLOT as u64),
+        "lastLoadedScene must be unchanged: {doc}"
+    );
+}
+
+/// BUG→GATE (2026-08-31 investigation): closes the SCOPE note this gate's own comment used to
+/// carry (see `base_leveling_forces_every_footswitch_owned_block_off_not_the_preset_as_saved`,
+/// above) — 405's Phase 4 fixture amendment gave it a base-ENGAGED leveled block (`ACD_Rat`,
+/// bypass:false, volume 0.62), so the LU cost of forcing every footswitch-owned block off for
+/// a Base measurement is now expressible offline, not just on hardware.
+///
+/// This gate builds its OWN fresh `SimDevice` (`hiwatt_sim()`), independent of every other
+/// gate's own sim — so it is inherently evaluated PRE-BOOST (before any 405 gate has raised
+/// this preset's `presetLevel`/fader) with no run-order dependency on E1/E2/E8's sims, which
+/// each construct their own device too.
+#[test]
+fn base_isolation_on_a_base_engaged_pedal_costs_the_measured_lu_delta() {
+    let _serial = serial();
+    let _sim = hiwatt_sim();
+    let stim = test_stim();
+
+    let spec = crate::probe_api::seed_scenario::scenario_spec().expect("scenario spec");
+    let p24 = spec
+        .iter()
+        .find(|p| p.list_index == PLUMES)
+        .expect("405 present");
+    let preset: serde_json::Value = serde_json::from_str(&p24.preset_json).expect("405 json");
+
+    // AS-SAVED: no isolation at all. Rat (bypass:false, isActive:true) renders ENGAGED, so
+    // its SaturatedPedal curve REPLACES the flat law entirely (`sim_device.rs::model_lufs`).
+    let as_saved = crate::leveller::measure_c(PLUMES, &stim, 0.5, &[]).expect("as-saved measure");
+
+    // ISOLATED: the base run's own isolation — every footswitch-owned on-off block forced
+    // off, Rat included — falls through to the fixture's flat C law.
+    let force = crate::commands::doctor::doctor_force_bypass(&preset["ftsw"], &preset, None);
+    let isolated =
+        crate::leveller::measure_c(PLUMES, &stim, 0.5, &force).expect("isolated measure");
+
+    assert!(
+        (isolated.c - (-28.0)).abs() < 0.5,
+        "an isolated base must fall through to the fixture's flat C: {isolated:?}"
+    );
+    let delta = as_saved.c - isolated.c;
+    assert!(
+        (delta - 12.371).abs() < 0.1,
+        "base isolation costs ~12.37 LU (Rat's engaged curve at 0.62 vs the flat law): \
+         as_saved.c={:.3} isolated.c={:.3} delta={delta:.3}",
+        as_saved.c,
+        isolated.c
+    );
+}
+
+/// BUG→GATE: leveling the 4 footswitch rows AFTER a base boost must still converge — the
+/// boost consumed `presetLevel`'s headroom (0.27 → 1.0), which SHIFTS every leveled pedal's
+/// own achievable ceiling by the same `+raise_db` (each pedal's `SaturatedPedal` contribution
+/// folds in the ambient `preset_term`, `sim_device.rs::model_lufs`), so a footswitch row
+/// solved against the OLD presetLevel would be badly wrong against the new one. This is the
+/// "the fix must not just move the problem downstream" gate for Plumes' own 4-pedal FS lane.
+#[test]
+fn the_footswitch_rows_still_converge_after_a_base_boost() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _sim = hiwatt_sim();
+
+    // ── The base boost (mirrors E1) ──
+    {
+        let (_app, webview) = level_preset_app();
+        let r = run_base_level(&webview, PLUMES, -23.0, true);
+        assert_eq!(
+            r["base_boost"]["applied"], true,
+            "premise: base must boost: {r}"
+        );
+    }
+
+    // ── All 4 footswitch rows, at the plan's own targets ──
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![level_footswitches_apply])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+
+    let rows: [(u32, &str, &str, f64); 4] = [
+        (5, "ACD_Plumes", "level", -23.0),
+        (6, "ACD_BluesDriver", "level", -23.0),
+        (7, "ACD_ObsessiveDrive", "volume", -21.0),
+        (8, "ACD_Rat", "volume", -21.0),
+    ];
+    let jobs: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(switch, node, param, target)| {
+            serde_json::json!({
+                "switch": switch,
+                "levGroupId": "G1",
+                "levNodeId": node,
+                "levParameterId": param,
+                "targetLufs": target,
+            })
+        })
+        .collect();
+    let results = invoke(
+        &webview,
+        "level_footswitches_apply",
+        serde_json::json!({
+            "slot": PLUMES,
+            "jobs": jobs,
+            "save": true,
+            "topologyId": serde_json::Value::Null,
+            "calibrationLufs": null,
+            "profileId": null,
+            "onResult": "__CHANNEL__:0",
+        }),
+    )
+    .expect("level_footswitches_apply");
+    let results = results.as_array().expect("results array");
+    assert_eq!(results.len(), rows.len(), "{results:?}");
+
+    for (row, (switch, _, _, target)) in results.iter().zip(rows.iter()) {
+        assert_eq!(
+            row["clamped"], false,
+            "switch {switch} must converge after the base boost: {row}"
+        );
+        let predicted = row["predicted_lufs"].as_f64().expect("predicted_lufs");
+        // FS_TOL_LU (leveller.rs, private) = 0.1.
+        assert!(
+            (predicted - target).abs() <= 0.1,
+            "switch {switch} must land within FS_TOL_LU of {target}: {row}"
+        );
+    }
+}
+
+/// BUG→GATE: a no-save run must PLAN the boost and disclose it, but must never touch the
+/// device's persisted state — the advisory branch of `level_preset_impl`'s routing
+/// (`opts.save && !has_scenes` gates the full continuation; a `save:false` run always falls
+/// to the advisory).
+#[test]
+fn a_no_save_base_boost_run_plans_it_but_writes_nothing() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    let (_app, webview) = level_preset_app();
+
+    let r = run_base_level(&webview, PLUMES, -23.0, false);
+
+    assert_eq!(r["base_boost"]["applied"], false, "{r}");
+    let value = r["base_boost"]["base_amps"][0]["value"]
+        .as_f64()
+        .expect("the advisory must still carry the planner's SEED value");
+    assert!(
+        (value - 0.498).abs() < 0.02,
+        "the disclosed seed must match the plan: {r}"
+    );
+    assert_eq!(
+        r["clamped"], true,
+        "today's honest clamp (presetLevel alone maxes out short of target): {r}"
+    );
+    assert_eq!(r["saved"], false, "{r}");
+
+    assert_fader_untouched(&sim, PLUMES, PLUMES_TWIN, 0.28, Some(0.27));
+}
+
+/// BUG→GATE: an unreachable base target — even with BOTH controls pushed to their limits —
+/// must plan no move and report today's honest, unmodified clamp:
+/// no half-applied boost, no persisted fader move. -10 LUFS needs +29.37 dB over 405's as-is
+/// base; `presetLevel`'s ceiling supplies only +11.37 dB and the Twin's fader adds at most
+/// +11.06 dB more (0.28 → 1.0) — +22.43 dB total, still ~7 dB short — so `plan_level_pair`'s
+/// feasibility window (`dp_lo <= dp_hi`) is empty and the plan refuses before the closed loop
+/// ever runs (`headroom_trade.rs`'s U7 gate pins the same equivalence).
+#[test]
+fn an_infeasible_base_target_reports_todays_honest_clamp_with_no_partial_boost() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    let (_app, webview) = level_preset_app();
+
+    let r = run_base_level(&webview, PLUMES, -10.0, true);
+
+    assert!(
+        r["base_boost"].is_null(),
+        "an Infeasible target must never construct a boost summary at all: {r}"
+    );
+    assert_eq!(
+        r["clamped"], true,
+        "-10 LUFS needs more than both controls' combined headroom: {r}"
+    );
+    assert_eq!(
+        r["clamp_kind"],
+        serde_json::json!("scene_ceiling"),
+        "the ordinary headroom clamp, unchanged from the pre-Phase-1 shape: {r}"
+    );
+    assert!(
+        (r["final_level"].as_f64().expect("final_level") - 1.0).abs() < 1e-3,
+        "presetLevel still maxes out at its own ceiling: {r}"
+    );
+
+    assert_fader_untouched(&sim, PLUMES, PLUMES_TWIN, 0.28, None);
+}
+
+/// BUG→GATE: a second base run on an already-boosted preset must skip cleanly — no re-boost,
+/// no re-write of `presetLevel`, no new save, no spurious `clamped` row. The float-epsilon
+/// straddle this hinges on is `leveller::already_on_target`'s own mechanism, not re-derived
+/// here; assertions below hold on either side of it. Run 1 writes the fader exactly twice
+/// (solve + pre-save recall-reassert, Phase 2 guard (b)); run 2 must add none —
+/// `restore_saved_preset` is a bare load and emits no `ChangeParameter` at all.
+#[test]
+fn a_second_base_run_on_a_boosted_preset_writes_nothing_new_to_the_fader() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let sim = hiwatt_sim();
+    let (_app, webview) = level_preset_app();
+
+    let r1 = run_base_level(&webview, PLUMES, -23.0, true);
+    assert_eq!(
+        r1["base_boost"]["applied"], true,
+        "run 1 must actually boost: {r1}"
+    );
+    assert_eq!(r1["saved"], true, "{r1}");
+    let final_level_1 = r1["final_level"].as_f64().expect("final_level");
+    let saved_after_run1 = saved_event_count(&sim.events());
+
+    let r2 = run_base_level(&webview, PLUMES, -23.0, true);
+    assert!(
+        r2["base_boost"].is_null(),
+        "run 2 must never re-enter the Boost regime — presetLevel already has no room left: \
+         {r2}"
+    );
+    assert_eq!(
+        r2["clamped"], false,
+        "run 2 must not report a spurious clamp — the preset IS on target: {r2}"
+    );
+    assert_eq!(
+        r2["saved"], false,
+        "run 2 must take the idempotency skip and write nothing: {r2}"
+    );
+    let final_level_2 = r2["final_level"].as_f64().expect("final_level");
+    assert!(
+        (final_level_2 - final_level_1).abs() < 1e-6,
+        "the second run must not drift the persisted level: run1={final_level_1} \
+         run2={final_level_2}"
+    );
+
+    // ONE post-run-2 snapshot, shared by both counters below.
+    let events = sim.events();
+
+    // Asserted as a DELTA against run 1's own count, not a total: what this gate pins is that
+    // run 2 adds nothing, and a total would silently re-key itself the day run 1's save
+    // choreography changes.
+    assert_eq!(
+        saved_event_count(&events),
+        saved_after_run1,
+        "run 2 must emit NO new Saved event — the skip returns before any write: {events:?}"
+    );
+
+    // The fader is written exactly TWICE, both by run 1 (once by the solve, once by the
+    // pre-save recall-reassert guard replaying the SAME value — Phase 2's guard (b), see
+    // `recall_reassert_save`) — never a THIRD time by run 2.
+    assert_eq!(
+        output_level_write_count(&events, PLUMES_TWIN),
+        2,
+        "run 1 writes the fader twice (solve + pre-save reassert); run 2 must add NO more: \
+         {events:?}"
+    );
+
+    let (_, fader) = saved_pl_and_output_level(PLUMES, PLUMES_TWIN);
+    assert!(
+        (fader - 0.498).abs() < 0.02,
+        "the persisted fader must still be run 1's solved value: {fader}"
+    );
+}
+
+/// T3 RETIRED from the online lane (moved offline — `notes/leveling.md`'s online budget
+/// table): the online suite drove a live-device enumeration of every scenario preset purely
+/// to prove the backup-scan seam lists them all — a pure list read with no device-truth
+/// value, since `read_library_via_backup`'s e2e arm decodes the SAME fixture blob offline or
+/// on. Drives the backup-scan seam directly against the sim's own backup fixture and pins
+/// both this PR's fixtures' own child-row shape (405's 4 block-acting footswitches / no
+/// scenes, 410's 1 block-acting footswitch / 3 scenes) alongside the full 11-preset count.
+#[test]
+fn the_fixture_enumeration_reads_eleven_child_rows() {
+    let _serial = serial();
+    set_e2e_env(&[(
+        "TMP_E2E_BACKUP_FIXTURE",
+        "/../e2e/fixtures/backup-fixture.bin",
+    )]);
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![read_library_via_backup])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+
+    let lib = invoke(&webview, "read_library_via_backup", serde_json::json!({}))
+        .expect("read_library_via_backup");
+    let rows = lib
+        .get("presets")
+        .and_then(|p| p.as_array())
+        .expect("presets array");
+
+    let row_405 = rows
+        .iter()
+        .find(|r| r["slot"].as_i64() == Some(i64::from(PLUMES) + 1))
+        .expect("405 (device slot 406) present");
+    assert_eq!(row_405["name"], "E2E Preset24", "{row_405}");
+    assert_eq!(row_405["scene_count"], 0, "405 is scene-less: {row_405}");
+    assert_eq!(
+        row_405["footswitches"].as_array().map(Vec::len),
+        Some(4),
+        "405's 4 block-acting drive-pedal footswitches: {row_405}"
+    );
+
+    let row_410 = rows
+        .iter()
+        .find(|r| r["slot"].as_i64() == Some(i64::from(FRIEDMAN) + 1))
+        .expect("410 (device slot 411) present");
+    assert_eq!(row_410["name"], "E2E Friedman 3S", "{row_410}");
+    assert_eq!(
+        row_410["scene_count"], 3,
+        "410's 3 full-overlay scenes: {row_410}"
+    );
+    assert_eq!(
+        row_410["footswitches"].as_array().map(Vec::len),
+        Some(1),
+        "410's 1 block-acting TubeScreamer footswitch (its 3 scene-func switches are not \
+         block-acting): {row_410}"
     );
 }
 
@@ -3158,6 +3595,8 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         handle: Some(handle),
         // Legacy order: the solve takes its own as-is capture (no reordered prepass here).
         prepass: None,
+        // This test's job isn't a base job — nothing to isolate.
+        force_bypass: vec![],
     };
     let outcomes = crate::leveller::level_scenes_oneshot(
         404,
@@ -3168,7 +3607,10 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
         saved.as_ref(),
         // No headroom trade in this fixture run.
         None,
+        // Nothing was isolated for this job, so nothing to undo.
+        &[],
         |_, _| {},
+        |_| {}, // B6: no progress channel in this fixture
         || false,
     )
     .expect("handle run");
@@ -3218,24 +3660,7 @@ fn a_user_chosen_scene_handle_is_solved_by_the_param_secant_and_reaches_target()
 #[test]
 fn a_mid_batch_failure_keeps_every_surviving_scenes_identity_and_emits_its_row() {
     let _serial = serial();
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
     let sf = sim.clone();
@@ -3400,24 +3825,7 @@ impl Drop for SceneCancelReset {
 /// log and its `presetLevel`. Also returns the event index the RUN starts at — the seed below
 /// saves, and a `Saved` count has to be able to exclude it.
 fn trade_sim() -> (crate::sim_device::SimDevice, usize) {
-    set_e2e_env(&[
-        (
-            "TMP_E2E_SCENARIO_PRESETS",
-            "/../e2e/fixtures/scenario-presets.json",
-        ),
-        (
-            "TMP_E2E_LOUDNESS_SIDECAR",
-            "/../e2e/fixtures/scenario-loudness.json",
-        ),
-        (
-            "TMP_E2E_BACKUP_FIXTURE",
-            "/../e2e/fixtures/backup-fixture.bin",
-        ),
-        (
-            "TMP_E2E_STIMULUS",
-            "/resources/samples/guitar-humbucker.wav",
-        ),
-    ]);
+    scenario_env();
     crate::leveller::clear_slot_save_registry();
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim);
@@ -3445,6 +3853,11 @@ fn trade_sim() -> (crate::sim_device::SimDevice, usize) {
 /// guitar amp at that amp's authored base `outputLevel` (the fader the trade pays with), and
 /// the scene whose FULL overlay authors the SAME `outputLevel` as base — the row whose clamp
 /// the offline capture model and the planner agree about (see the section header).
+/// Fixture 400 "E2E Rig": `BASE_AMP` active in base, `SWAP_AMP` bypassed, scene 1 flips the pair.
+const SWAP_SLOT: u32 = 400;
+const SWAP_SCENE: u32 = 1;
+const BASE_AMP: &str = "ACD_JC120";
+const SWAP_AMP: &str = "ACD_TwinReverb65NoFx";
 const TRADE_SLOT: u32 = 404;
 const TRADE_PRESET_LEVEL: f32 = 0.6;
 const TRADE_AMP: &str = "ACD_HiwattDR103CanMod";
@@ -3470,6 +3883,43 @@ fn batched_scene_app() -> (tauri::App<MockRuntime>, WebviewWindow<MockRuntime>) 
         .build()
         .expect("wv");
     (app, webview)
+}
+
+/// Every `SceneLevelProgressItem` a run streamed over `onResult`, in the order sent.
+type CapturedChannel = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// `batched_scene_app`'s sibling for a test that needs the whole PROGRESS-ITEM SEQUENCE, not
+/// just the command's return value — e.g. "no item ever named slot 8" or "some `done` item
+/// carried the trade" (F5). The mock runtime's own eval-based `Channel` only remembers the
+/// LAST script it evaluated (`MockWebviewDispatcher::last_evaluated_script`), so a sequence
+/// assertion needs a `channel_interceptor` instead: it fires on every message a
+/// `tauri::ipc::Channel` sends, in order, before the (here, inert) mock eval — exactly the
+/// hook `JavaScriptChannelId::channel_on` documents.
+fn batched_scene_app_capturing_channel() -> (
+    tauri::App<MockRuntime>,
+    WebviewWindow<MockRuntime>,
+    CapturedChannel,
+) {
+    let captured: CapturedChannel = Default::default();
+    let sink = captured.clone();
+    let app = tauri::test::mock_builder()
+        .channel_interceptor(move |_webview, _callback_fn, _index, body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+                    sink.lock().unwrap().push(v);
+                }
+            }
+            // Consumed — there is no JS engine behind the mock webview to hand it to anyway.
+            true
+        })
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![level_scenes_apply_batched])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    (app, webview, captured)
 }
 
 /// The row a batched scene result names. Base rides the wire as a NULL `scene_slot` — the
@@ -3717,12 +4167,18 @@ impl crate::hid::HidTransport for CancelAtSceneWrite {
 /// back nothing would leave the preset carrying a gain-structure change the UI never mentioned
 /// and cannot offer to restore (danger.md — see ⟦F1⟧'s doc).
 ///
-/// JOB ORDER IS LOAD-BEARING, and so is which row triggers. The benefiting scene is the row
-/// that WRITES its own overlay (base is left exactly at target by the hold), so it
-/// is the cancel's trigger — and a third job follows it purely so the stop has an unstarted
-/// job to land on. It has to land at a LOOP TOP with at least one row already attempted: land
-/// it earlier and the runner takes its pre-solve exit, which reloads the preset and discards
-/// the untraded-for pair, exactly as the back-out does.
+/// JOB ORDER IS LOAD-BEARING, and so is which row triggers — and A1/A4 (`base-LAST` sort,
+/// "base's isolated prepass capture must run LAST in PHASE 1") changed what that order IS:
+/// `scene_jobs` is sorted so BASE always runs LAST, whatever position it held on the wire, and
+/// PHASE 3 shares that same order. So base is now the batch's own reliable "never runs" job —
+/// the trigger must fire on the SECOND job instead of the first, or the stop lands before even
+/// ONE row completes. Slot 404's scene 1 ("Rhythm") is, like scene 3, a Full-overlay
+/// beneficiary of this same trade (its own authored `outputLevel` also clamps and gets raised —
+/// see `TRADE_SCENE`'s doc for the fixture's physics), so it is the trigger: scene 3 (still
+/// first among the wire's non-base jobs) completes untouched, scene 1's own write stops the
+/// run, and base — sorted last — never starts. It has to land at a LOOP TOP with at least one
+/// row already attempted: land it earlier and the runner takes its pre-solve exit, which
+/// reloads the preset and discards the untraded-for pair, exactly as the back-out does.
 #[test]
 fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed() {
     let _serial = serial();
@@ -3735,7 +4191,8 @@ fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed()
         crate::session::e2e_transport::set_factory(Box::new(move || {
             Box::new(CancelAtSceneWrite {
                 sim: sf.clone(),
-                scene: TRADE_SCENE as i64,
+                // The SECOND job to run post-sort (base-last) — see the doc above.
+                scene: 1,
                 fired: ff.clone(),
             })
         }));
@@ -3767,15 +4224,16 @@ fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed()
     assert_eq!(
         rows.len(),
         2,
-        "base + the scene that finished come back; the stop landed on the LAST job's loop \
-         top — the historical shape returned an EMPTY vec here: {rows:?}"
+        "the two non-base scenes that finished come back; the stop landed on BASE's loop top \
+         (base sorts last post-A1/A4) — the historical shape returned an EMPTY vec here: \
+         {rows:?}"
     );
     assert!(
-        scene_row(&rows, Some(1)).is_none(),
-        "the unstarted job emits no row: {rows:?}"
+        scene_row(&rows, None).is_none(),
+        "base — sorted last — is the unstarted job and emits no row: {rows:?}"
     );
     assert!(
-        scene_row(&rows, None).is_some() && scene_row(&rows, Some(TRADE_SCENE)).is_some(),
+        scene_row(&rows, Some(1)).is_some() && scene_row(&rows, Some(TRADE_SCENE)).is_some(),
         "and the two that ran name themselves: {rows:?}"
     );
 
@@ -3813,6 +4271,221 @@ fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed()
         "the raised pair stands — backing it out would leave every solved scene off target by \
          the raise while the run reported it on: got {}",
         sim.preset_level()
+    );
+}
+
+// ───────────── A1/A9: the "base anchor" — the trade fires on a WIZARD-SHAPED run ─────────
+//
+// The wizard never sends a wire job for base itself (that lane is `level_preset`'s, run
+// separately) — so `plan_trade_for_batch`'s gate #2 ("a base row in `scene_jobs`") would
+// otherwise never see one on a real wizard run, and the trade above would stay reachable
+// only from a hand-built `base_requested` batch no UI path produces. `base_anchor` (A1) is
+// the fix: it keeps a base job alive through PHASE 1/2 with no wire target of its own, then
+// strips it before PHASE 3. This section proves the anchor reaches the SAME trade the
+// `base_requested` shape does, and that its isolation (A3/A4 — "base means base") never
+// leaks into the saved preset.
+
+/// ⟦A9(i)⟧ THE ANCHOR REACHES THE SAME TRADE A `base_requested` BATCH DOES — same fixture
+/// (404/scene 3), same raise, but the wizard's OWN shape: ONE wire job (the clamped scene)
+/// plus a bare `baseAnchor`, no slot-8 job at all. If the anchor's target didn't get the
+/// same offset a real wire job's does (A1's doc), or if PHASE 3 failed to strip the
+/// anchor-only base job, this would either trade against the wrong number or double-solve
+/// base on top of `level_preset`'s own apply — both regressions this pins.
+#[test]
+fn a_wizard_shaped_run_trades_headroom_when_base_arrives_as_an_anchor() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _cancel_reset = SceneCancelReset;
+    let (sim, from) = trade_sim();
+    let (_app, webview, captured) = batched_scene_app_capturing_channel();
+
+    // The wizard's shape: no slot-8 job — base rides ONLY the anchor.
+    let jobs = serde_json::json!([
+        {"sceneSlot": TRADE_SCENE, "targetLufs": -21.0}
+    ]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": TRADE_SLOT, "jobs": jobs, "candidates": trade_amp_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "baseAnchor": {"targetLufs": -21.0},
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    let rows = res.as_array().expect("results array").clone();
+
+    // Base's own `outputLevel` is never solved by THIS batch when it arrived only as an
+    // anchor — that write belongs to the wizard's separate `level_preset` lane.
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the wire job (the clamped scene) comes back — no anchor-only base row: {rows:?}"
+    );
+    let trade = rows[0]["trade"].clone();
+    assert_eq!(
+        trade["applied"],
+        serde_json::json!(true),
+        "an anchored base still lands an applied (not advisory) trade: {trade}"
+    );
+    let raise_db = trade["raise_db"].as_f64().expect("raise_db");
+    assert!(
+        (raise_db - 4.437).abs() < 0.1,
+        "the anchor must drive the IDENTICAL trade math as a base_requested batch (same \
+         fixture, same targets): {trade}"
+    );
+    let raised_pl = trade["preset_level"].as_f64().expect("preset_level") as f32;
+    let fader = trade["base_amps"][0]["value"]
+        .as_f64()
+        .expect("a landed trade solved the fader") as f32;
+
+    // BOTH HALVES persist even though base's own row never rode this batch's PHASE 3.
+    assert_eq!(
+        sim.events()[from..]
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(s) if *s == TRADE_SLOT))
+            .count(),
+        1,
+        "one deferred save persists the anchor-driven pair: {:?}",
+        &sim.events()[from..]
+    );
+    let saved = crate::read_saved_preset(TRADE_SLOT).expect("the saved preset re-reads");
+    let saved_pl = crate::audiograph::preset_level(&saved).expect("saved presetLevel") as f32;
+    assert!(
+        (saved_pl - raised_pl).abs() < 1e-3,
+        "the SAVED document carries the raised presetLevel from an anchor-only trade, got \
+         {saved_pl}"
+    );
+    let saved_fader =
+        crate::commands::level_footswitch::node_param_f64(&saved, TRADE_AMP, "outputLevel")
+            .expect("saved base outputLevel") as f32;
+    assert!(
+        (saved_fader - fader).abs() < 1e-3,
+        "…and the lowered base fader alongside it, got {saved_fader} vs the reported {fader}"
+    );
+
+    // Scene 3's own saved `outputLevel` sits at its solved value (its Full overlay pins the
+    // knob independently of base, which is why it benefited from the raise at all).
+    let solved = rows[0]["final_level"].as_f64().expect("final_level");
+    let scene_saved_output = match crate::scene_overlay(&saved, TRADE_SCENE as u32, TRADE_AMP) {
+        crate::SceneOverlay::Full(params) => params
+            .get("outputLevel")
+            .and_then(serde_json::Value::as_f64)
+            .expect("scene 3's Full overlay carries its own outputLevel"),
+        _ => panic!("scene 3 must keep a Full overlay for its own outputLevel after the batch"),
+    };
+    assert!(
+        (scene_saved_output - solved).abs() < 1e-3,
+        "scene 3's SAVED outputLevel must equal the row's own solved value: saved \
+         {scene_saved_output} vs solved {solved}"
+    );
+
+    // NO progress item ever named slot 8 — the anchor-only base has no frontend row to
+    // route one to (A1's suppression at both the prepass `started` and the PHASE-3
+    // `on_scene` send sites — moot for the latter since the job is stripped before PHASE 3,
+    // but the prepass DOES run a base capture and must stay silent about it).
+    let items = captured.lock().unwrap();
+    assert!(
+        !items.is_empty(),
+        "the channel-interceptor capture must actually see the run's progress items, or this \
+         gate is vacuous"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|it| it["sceneSlot"].as_u64() == Some(u64::from(session::BASE_SCENE_SLOT))),
+        "an anchor-only base must stream NO progress item at all: {items:?}"
+    );
+    // F5: at least one `done` item discloses the trade over the channel, not just the
+    // command's awaited return — the wizard's row-by-row UI reads the channel, not the
+    // return value.
+    assert!(
+        items
+            .iter()
+            .any(|it| it["status"] == "done" && !it["result"]["trade"].is_null()),
+        "at least one done item must carry the trade summary: {items:?}"
+    );
+}
+
+/// ⟦A9(ii)⟧ THE ANCHOR'S BASE CAPTURE IS ISOLATED, AND THE ISOLATION NEVER PERSISTS. Slot 400
+/// ("E2E Rig") saves its "DRIVE" footswitch's own `ACD_TubeScreamer` bypass=false — exactly
+/// the shape `base_leveling_forces_every_footswitch_owned_block_off_not_the_preset_as_saved`
+/// pins for `level_preset`'s own base lane ("base means base": preset 28's TubeScreamer was
+/// saved ON too). A1/A3/A4 give the BATCH command the identical isolation whenever base is in
+/// plan, anchor or not — this is the anchor half of that gate.
+///
+/// LUFS can't prove it: the offline capture model's C table carries no bypass term (same
+/// SCOPE HONESTY as the `level_preset` gate above), so this pins the two device-visible
+/// facts instead — the isolation WROTE (`changeParameter` on `bypass`, modeled as
+/// `SimEvent::Bypass` because the wire message differs from a float `ChangeParameter`), and
+/// by the batch's one save the working copy is clean again: the SAVED preset still reads
+/// bypass=false, exactly what the user's preset already had.
+#[test]
+fn a_base_anchor_measures_the_isolated_base_and_never_persists_the_isolation() {
+    let _serial = serial();
+    let _reset = RegistryReset;
+    let _cancel_reset = SceneCancelReset;
+    scenario_env();
+    crate::leveller::clear_slot_save_registry();
+    const RIG: u32 = 400;
+    const TUBE_SCREAMER: &str = "ACD_TubeScreamer";
+
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+
+    // Fixture premise: the pedal really is saved ON, or "isolation never leaked" would pass
+    // vacuously with no isolation ever needed.
+    let saved_before = crate::read_saved_preset(RIG).expect("400 field-8 read");
+    assert!(
+        !crate::footswitch::block_bypassed_in_base(&saved_before, TUBE_SCREAMER),
+        "fixture premise: 400's DRIVE pedal (TubeScreamer) must be saved ON (bypass=false)"
+    );
+
+    let from = sim.events().len();
+    let (_app, webview) = batched_scene_app();
+    let amp = serde_json::json!([{
+        "groupId": "G1", "nodeId": "ACD_JC120",
+        "parameterId": "outputLevel", "value": 0.35
+    }]);
+    let jobs = serde_json::json!([{"sceneSlot": 0, "targetLufs": -23.0}]);
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": RIG, "jobs": jobs, "candidates": amp,
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "baseAnchor": {"targetLufs": -23.0},
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    assert!(
+        res.as_array().is_some_and(|a| !a.is_empty()),
+        "the scene job must actually solve: {res:?}"
+    );
+
+    // THE ISOLATED CAPTURE: the pedal was forced off during the run.
+    let events = sim.events()[from..].to_vec();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            crate::sim_device::SimEvent::Bypass { node, on: true } if node == TUBE_SCREAMER
+        )),
+        "the anchor's base capture must isolate the footswitch-owned pedal exactly like \
+         `level_preset`'s own base lane: {events:?}"
+    );
+
+    // …AND NEVER PERSISTED: the saved preset still reads the pedal ON, exactly as the user
+    // left it — the working copy was cleaned before the batch's one save.
+    let saved_after = crate::read_saved_preset(RIG).expect("400 field-8 re-read");
+    assert!(
+        !crate::footswitch::block_bypassed_in_base(&saved_after, TUBE_SCREAMER),
+        "the isolation must NEVER reach the saved preset — the pedal must still read ON"
     );
 }
 

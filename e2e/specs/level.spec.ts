@@ -1,7 +1,9 @@
 import { test, expect } from "../fixtures/test";
 import {
   SCENARIO,
+  baseRowKey,
   clearScenario,
+  ensurePresetGroupOpen,
   ensureScenario,
   expectReampBalanced,
   isOnline,
@@ -18,9 +20,9 @@ import {
 // amp flip). None of the six rebuilt fixtures is Base-only any more (see
 // e2e/fixtures/COVERAGE.md) — SCENARIO[1]/[2] ("E2E Pedalboard"/"E2E Edge") now carry
 // footswitches/scenes of their own, so the first test below selects each preset's Base
-// row EXPLICITLY (never the whole-preset tick) to keep one selected row per preset — the
-// `data-pick="target:NAME"]` trigger is shared by every selected row of a preset, and a
-// whole-preset tick on a footswitch/scene-bearing fixture would collide.
+// row EXPLICITLY (never the whole-preset tick) to keep one selected row per preset — a
+// whole-preset tick would sweep those in too and shift the terminal summary's
+// Done-vs-Accept text for reasons unrelated to what this test drives.
 // Loudness accuracy is the device's job; these prove the multi-preset, per-preset-target
 // flow AND the base+scene+footswitch flow end to end through the real backend.
 //
@@ -69,9 +71,9 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
 
     // Select each preset's Base row explicitly (expand → tick "Base Preset") so exactly
     // ONE row per preset is selected — both now carry footswitches/scenes of their own,
-    // so a whole-preset tick would sweep those in too and collide on the shared
-    // `data-pick="target:NAME"]` trigger below. The filter narrows the list to each in
-    // turn; the selection persists across filters.
+    // so a whole-preset tick would sweep those in too and shift the terminal summary's
+    // Done-vs-Accept text. The filter narrows the list to each in turn; the selection
+    // persists across filters.
     const presets = [SCENARIO[1], SCENARIO[2]];
     for (const p of presets) {
       await selectBaseOnly(page, p.name);
@@ -83,24 +85,25 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     // commit (there is no separate Back-up step).
     await page.getByText(/I.ve backed up with Pro Control/i).click();
 
-    // Two DIFFERENT per-preset targets (each preset has exactly one selected row — its
-    // Base — so its `target:NAME` trigger is unique, no collision).
+    // Two DIFFERENT per-preset targets — each row's own `target:<rowKey>` trigger is
+    // unique by construction now, regardless of how many other rows that preset has.
     const targets = [
-      { name: SCENARIO[1].name, label: "Crunch" },
-      { name: SCENARIO[2].name, label: "Lead" },
+      { slot: SCENARIO[1].slot, label: "Crunch" },
+      { slot: SCENARIO[2].slot, label: "Lead" },
     ];
-    for (const { name, label } of targets) {
-      await pickBaseTarget(page, name, label);
+    for (const { slot, label } of targets) {
+      await ensurePresetGroupOpen(page, slot);
+      await pickBaseTarget(page, slot, label);
     }
     // The picks must actually BIND — assert each row's trigger now reads its target
     // (guards a silent display-vs-value no-op the always-solving fake re-amp would hide).
-    for (const { name, label } of targets) {
-      await expect(page.locator(`[data-pick="target:${name}"]`)).toContainText(
-        label,
-      );
+    for (const { slot, label } of targets) {
+      await expect(
+        page.locator(`[data-pick="target:${baseRowKey(slot)}"]`),
+      ).toContainText(label);
     }
 
-    await page.getByRole("button", { name: /Level 2 sound/ }).click();
+    await page.getByRole("button", { name: /Start.*2 sound/ }).click();
     await expect(page.getByRole("button", { name: "Done" })).toBeVisible({
       timeout: 240_000,
     });
@@ -159,25 +162,18 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
     // The wizard opens directly at Set up; tick the inline footer ack that gates the commit.
     await page.getByText(/I.ve backed up with Pro Control/i).click();
 
-    // Set up must show all THREE row kinds — proven by their distinct sub-text copy.
-    await expect(
-      page.getByText(/levels this preset against the others/),
-    ).toBeVisible(); // Base
-    await expect(
-      page.getByText(/levels this scene against/).first(),
-    ).toBeVisible(); // a footswitch SCENE
-    // PR #144: the verify-only footswitch mode is gone — every block-acting FOOTSWITCH
-    // row now levels (the same "evens out" copy every such row carries, distinct from a
-    // scene row's "levels this scene against the preset's base").
-    await expect(
-      page.getByText(/evens this footswitch out to your target/).first(),
-    ).toBeVisible(); // a block-acting FOOTSWITCH
+    // Set up must show all THREE row kinds — the redesign dropped the old per-row-kind
+    // sub-text captions (design 1a's terser direction), so this proves them by their own
+    // row label instead: Base, a scene ("Rhythm"), a block-acting footswitch ("DRIVE").
+    await expect(page.getByText("Base").first()).toBeVisible();
+    await expect(page.getByText("Rhythm").first()).toBeVisible(); // a footswitch SCENE
+    await expect(page.getByText("DRIVE").first()).toBeVisible(); // a block-acting FOOTSWITCH
     // The bake/assign mechanism is never surfaced.
     await expect(page.getByText(/baked|assigned/i)).toHaveCount(0);
 
     // Run base + scenes + footswitches → a terminal Summary (Done OR Accept; offline
     // clamps on scenes/footswitches are fine).
-    await page.getByRole("button", { name: /Level \d+ sound/ }).click();
+    await page.getByRole("button", { name: /Start.*\d+ sound/ }).click();
     await expect(
       page.getByRole("button", { name: /^(Done|Accept)$/ }),
     ).toBeVisible({ timeout: 1_200_000 });
@@ -250,8 +246,7 @@ test.describe("Level — plain presets + a scenes-and-footswitches preset", () =
 
     // Base-only, not the whole-preset checkbox: 401 now carries footswitches of its own
     // (P4-B fixture rebuild — see level-defaults.spec.ts's header), and a whole-preset
-    // tick would sweep those in too, colliding on the shared `data-pick="target:NAME"]`
-    // trigger `runBaseLevel` drives.
+    // tick would sweep those in too and shift the terminal summary's Done-vs-Accept text.
     const run = () =>
       runBaseLevel(page, [{ preset: SCENARIO[1], label: "Crunch" }]);
 

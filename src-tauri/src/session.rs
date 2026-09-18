@@ -444,6 +444,12 @@ impl Session {
     /// `on_progress` is called as the transfer advances (a `BackupProgress` per
     /// device state-change and per chunk) so a caller can drive a progress bar; the
     /// chunk percentage is exact because `numChunks` is known from the first chunk.
+    ///
+    /// `max_secs` bounds the time WITHOUT a progress event (new chunk, state change,
+    /// build tick), not the whole transfer: the stream runs at ~2.7 chunks/s, so a
+    /// 230-chunk (2.2 MiB) library needs ~85 s and a whole-transfer cap of 60 s cut it
+    /// at 163/230 (HW, 2026-09-02). Every refresh source is finite, so the stall timer
+    /// alone bounds the loop.
     pub fn device_backup<F: FnMut(BackupProgress)>(
         &mut self,
         max_secs: u64,
@@ -490,9 +496,9 @@ impl Session {
         let mut pending: Vec<Vec<u8>> = std::mem::take(&mut self.raw);
 
         loop {
-            if start.elapsed().as_secs() >= max_secs {
+            if last_progress.elapsed().as_secs() >= max_secs {
                 return Err(format!(
-                    "device backup timed out after {max_secs}s: {}/{} chunks, last_state={last_state}",
+                    "device backup stalled for {max_secs}s: {}/{} chunks, last_state={last_state}",
                     chunks.len(),
                     num_chunks
                 ));
@@ -570,13 +576,17 @@ impl Session {
                         build_size = build_size.max(sz as u32);
                     }
                     if let Some(tk) = proto::first_varint(&stp, 3) {
-                        build_ticks = build_ticks.max(tk as u32);
+                        if tk as u32 > build_ticks {
+                            build_ticks = tk as u32;
+                            last_progress = Instant::now();
+                        }
                     }
                     if let Some(s) = proto::first_varint(&stp, 1) {
                         let s = s as i64;
                         if s != last_state {
                             state_log.push((start.elapsed().as_secs_f64(), s));
                             last_state = s;
+                            last_progress = Instant::now();
                             // Pre-stream "building" progress (determinate iff the
                             // device populates build_size).
                             if chunks.is_empty() && matches!(s, 1 | 2) {
@@ -1365,6 +1375,12 @@ impl Session {
         })
     }
 
+    /// Byte length of the presetJson carrier [`Self::current_preset_value`] would parse —
+    /// how much of a field-3 reply has landed so far (the growth-stability gate).
+    pub(crate) fn json_payload_len(&self) -> usize {
+        self.best_json_payload().len()
+    }
+
     /// The largest reassembled `presetJson` payload found in the accumulated
     /// streams, across all three carriers (presetMessage submessage field →
     /// presetJson inner field): currentPresetDataChanged 3→1,
@@ -1372,6 +1388,20 @@ impl Session {
     /// slot-addressed reply). Largest wins so a complete stream beats a stray.
     fn best_json_payload(&self) -> Vec<u8> {
         best_json_payload_from_reports(&self.raw)
+    }
+
+    /// Diagnostic: every `presetJson` carrier in the accumulated reports as
+    /// `(PresetMessage field, payload bytes)` — `3` = the `currentPresetDataChanged` live
+    /// push, `79` = `currentPresetDataJsonResponse`, `9` = `presetDataChanged` (the field-8
+    /// slot read's reply, the stored document). Names WHICH document a buffer-scraped
+    /// "read-back" ([`Self::current_preset_value`]) actually came from — the Copy post-save
+    /// verdict line logs it so an online run can tell a late field-3 push from a stored-slot
+    /// field-9 reply.
+    pub(crate) fn json_payload_carriers(&self) -> Vec<(u32, usize)> {
+        json_payloads_from_reports(&self.raw)
+            .into_iter()
+            .map(|(field, payload)| (field, payload.len()))
+            .collect()
     }
 
     /// HW / Tier-4 diagnostic: capture the FULL `currentPresetDataChanged` (field
@@ -2208,23 +2238,80 @@ impl Session {
         Ok(())
     }
 
+    /// Re-prompt the device for its live WORKING COPY (`currentPresetDataRequest`, field 2
+    /// → a fresh field-3 push) and return the first parse `done` accepts, pumping the reply
+    /// in ≤8 × 200 ms slices under the live-controller heartbeat. This is the ONE re-prompt
+    /// seam: the buffer is cleared first, so nothing buffered before the request can pass
+    /// as the reply — the difference between a read and the buffer scrape the 2026-09-02
+    /// Copy stale-cache incident came from. `Err` names the carriers that landed when no
+    /// accepted parse arrived within the budget. Keep the wire shape as is: it is the
+    /// HW-proven footswitch confirm channel ([`Self::live_ftsw`], fw 1.8.45).
+    pub(crate) fn live_preset_value(
+        &mut self,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<serde_json::Value, String> {
+        self.clear_raw();
+        let _ = self.send_and_collect(&proto::current_preset_data_request(3), 300);
+        let mut last = String::new();
+        for _ in 0..8 {
+            let _ = self.heartbeat();
+            let _ = self.pump_collect(200);
+            match self.current_preset_value() {
+                Ok(v) if done(&v) => return Ok(v),
+                Ok(_) => last = "a reply parsed but was not accepted".to_string(),
+                Err(e) => last = e,
+            }
+        }
+        Err(format!(
+            "no accepted working-copy reply ({last}; carriers {:?})",
+            self.json_payload_carriers()
+        ))
+    }
+
+    /// The working-copy GRAPH behind a re-prompt: [`Self::live_preset_value`] until `done`
+    /// accepts a parse, then hold until no new report lands for two 200 ms slices (bounded
+    /// at 6, a heartbeat per slice — `read_slot_preset_json_inner`'s growth-stability
+    /// pattern on the raw report count, which needs no reassembly), re-check `done` on
+    /// what landed, then [`Self::current_audio_graph`] with its truncation guard. The Copy read and the
+    /// `probe --reprompt-map` COMMIT arm share this exact seam, so the probe's
+    /// "save persists after a re-prompt" sample is taken with the product's own timing.
+    pub(crate) fn live_audio_graph(
+        &mut self,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<ActiveGraph, String> {
+        self.live_preset_value(&done)?;
+        let (mut last, mut stable) = (self.raw.len(), 0u32);
+        for _ in 0..6 {
+            let _ = self.heartbeat();
+            let _ = self.pump_collect(200);
+            let len = self.raw.len();
+            if len == last {
+                stable += 1;
+                if stable >= 2 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            last = len;
+        }
+        // The seam's own guarantee: the document handed back is one `done` accepts, even if
+        // frames kept landing after the first accepted parse.
+        match self.current_preset_value() {
+            Ok(v) if done(&v) => self.current_audio_graph(),
+            Ok(_) => Err("the working-copy reply changed after it was accepted".to_string()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Re-prompt and read the live WORKING-COPY `ftsw` array (`currentPresetDataRequest`
     /// → fresh field-3 push). Reflects UNSAVED edits, so it's how a footswitch set/clear is
     /// confirmed (no dedicated echo). `ftsw` sits at byte ~4330 of field-3, before the
     /// scene-tail truncation, so it survives the partial. `None` if no field-3 lands.
     pub fn live_ftsw(&mut self) -> Option<serde_json::Value> {
-        self.clear_raw();
-        let _ = self.send_and_collect(&proto::current_preset_data_request(3), 300);
-        for _ in 0..8 {
-            let _ = self.heartbeat();
-            let _ = self.pump_collect(200);
-            if let Ok(v) = self.current_preset_value() {
-                if let Some(ftsw) = v.get("ftsw") {
-                    return Some(ftsw.clone());
-                }
-            }
-        }
-        None
+        self.live_preset_value(|v| v.get("ftsw").is_some())
+            .ok()
+            .and_then(|v| v.get("ftsw").cloned())
     }
 
     /// Re-import a full preset to the device. `preset_bytes` is the
@@ -2649,6 +2736,16 @@ fn best_factory_list_from_reports(reports: &[Vec<u8>]) -> Option<Vec<String>> {
 /// exactly this reason; `best_json_payload_from_reports_can_prefer_a_stale_field9_reply`
 /// below proves the hazard exists at this layer.
 fn best_json_payload_from_reports(reports: &[Vec<u8>]) -> Vec<u8> {
+    json_payloads_from_reports(reports)
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .max_by_key(Vec::len)
+        .unwrap_or_default()
+}
+
+/// Every `presetJson` payload in `reports`, tagged with the PresetMessage carrier field it
+/// rode in on (3 / 79 / 9 — see [`best_json_payload_from_reports`]), in stream order.
+fn json_payloads_from_reports(reports: &[Vec<u8>]) -> Vec<(u32, Vec<u8>)> {
     const CARRIERS: [(u32, u32); 3] = [(3, 1), (79, 1), (9, 3)];
     proto::reassemble_streams(reports)
         .iter()
@@ -2659,11 +2756,10 @@ fn best_json_payload_from_reports(reports: &[Vec<u8>]) -> Vec<u8> {
                     .iter()
                     .find(|(f, _)| *f == json_field)
                     .and_then(|(_, v)| v.as_bytes())
-                    .map(|b| b.to_vec())
+                    .map(|b| (pm_field, b.to_vec()))
             })
         })
-        .max_by_key(|b| b.len())
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Extract the firmware version from a `currentFwResponse` frame:
@@ -3670,6 +3766,100 @@ mod tests {
         fn transact_eager(&self, body: &[u8], max_ms: u64) -> Result<Vec<Vec<u8>>, String> {
             self.transact(body, max_ms)
         }
+    }
+
+    /// Streams `chunks` backup chunks, one per pump, `gap` apart, then BACKUP_COMPLETE.
+    /// `chunks == 0` never answers at all.
+    struct PacedBackupTransport {
+        chunks: u32,
+        gap: std::time::Duration,
+        sent: std::sync::Mutex<u32>,
+    }
+    impl PacedBackupTransport {
+        fn report(body: &[u8]) -> Vec<u8> {
+            let mut r = vec![0x00, 0x35, 0x00, body.len() as u8];
+            r.extend_from_slice(body);
+            r
+        }
+        fn chunk(&self, n: u32) -> Vec<u8> {
+            let mut data = Vec::new();
+            proto::field_varint(&mut data, 3, u64::from(self.chunks) * 4);
+            proto::field_varint(&mut data, 4, u64::from(self.chunks));
+            proto::field_varint(&mut data, 5, u64::from(n));
+            data.extend(proto::len_delimited(6, &[n as u8; 4]));
+            let mut state = Vec::new();
+            proto::field_varint(&mut state, 1, 2);
+            let mut bm = proto::len_delimited(2, &data);
+            bm.extend(proto::len_delimited(3, &state));
+            Self::report(&proto::len_delimited(8, &bm))
+        }
+        fn complete() -> Vec<u8> {
+            let mut state = Vec::new();
+            proto::field_varint(&mut state, 1, 4);
+            Self::report(&proto::len_delimited(8, &proto::len_delimited(3, &state)))
+        }
+    }
+    impl crate::hid::HidTransport for PacedBackupTransport {
+        fn send(&self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn transact(&self, _: &[u8], _: u64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(Vec::new())
+        }
+        fn transact_chunked(&self, b: &[u8], ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            self.transact(b, ms)
+        }
+        fn transact_eager(&self, b: &[u8], ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            self.transact(b, ms)
+        }
+        fn pump(&self, _: u64) -> Result<Vec<Vec<u8>>, String> {
+            let mut sent = self.sent.lock().unwrap();
+            if self.chunks == 0 || *sent > self.chunks {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(self.gap);
+            *sent += 1;
+            Ok(vec![if *sent > self.chunks {
+                Self::complete()
+            } else {
+                self.chunk(*sent - 1)
+            }])
+        }
+    }
+    fn backup_session(t: PacedBackupTransport) -> Session {
+        Session {
+            hid: Box::new(t),
+            batch: 0,
+            raw: Vec::new(),
+            fw_version: None,
+        }
+    }
+
+    /// `max_secs` is a stall budget, not a transfer cap: a stream slower than the budget
+    /// in total still completes while each chunk lands inside it (HW: a 230-chunk library
+    /// needs ~85 s against the callers' 60).
+    #[test]
+    fn device_backup_completes_a_transfer_longer_than_the_stall_budget() {
+        let t = PacedBackupTransport {
+            chunks: 5,
+            gap: std::time::Duration::from_millis(300),
+            sent: std::sync::Mutex::new(0),
+        };
+        let (blob, stats) = backup_session(t).device_backup(1, |_| {}).unwrap();
+        assert_eq!(stats.chunks_received, 5);
+        assert_eq!(blob.len(), 20);
+        assert!(stats.elapsed_secs > 1.0, "{}", stats.elapsed_secs);
+    }
+
+    #[test]
+    fn device_backup_errors_when_the_stream_never_starts() {
+        let t = PacedBackupTransport {
+            chunks: 0,
+            gap: std::time::Duration::ZERO,
+            sent: std::sync::Mutex::new(0),
+        };
+        let err = backup_session(t).device_backup(1, |_| {}).unwrap_err();
+        assert!(err.contains("stalled for 1s"), "{err}");
     }
 
     fn handshake_sends(lean: bool) -> Vec<Vec<u8>> {
@@ -4692,10 +4882,10 @@ mod tests {
     }
 
     // BUG→GATE: the preset lane's PICKER used to run the name-substring rule, which
-    // disagreed with the run-time class gate in BOTH directions — it offered
-    // `ACD_TMRumbleV3.level` (an amp knob the solve then refuses) and hid the wet `mix` and
-    // raw-dB `ACD_Boost.gain` the footswitch and scene-handle pickers offer. One classifier
-    // for every picker.
+    // disagreed with the run-time class gate — it offered `ACD_TMRumbleV3.level` (an amp
+    // knob the solve then refuses) and hid the raw-dB `ACD_Boost.gain` the footswitch and
+    // scene-handle pickers offer. One classifier for every picker. (Issue 3, later: `mix`
+    // itself became excluded from every picker's safe-default list too — see the test body.)
     #[test]
     fn extract_level_candidates_uses_the_classifier_not_the_name_rule() {
         let json = serde_json::json!({
@@ -4721,10 +4911,18 @@ mod tests {
             got.contains(&("boost".to_string(), "gain".to_string())),
             "ACD_Boost.gain is raw dB with ~1:1 authority — the name rule hid it: {got:?}"
         );
+        // Issue 3 ("hide Mix everywhere"): a wet/mix control is EXCLUDED from this
+        // safe-default candidate list, even though the classifier still recognises it
+        // (floored, not gutted, when explicitly named elsewhere) — see
+        // `footswitch::is_levelable_param`'s doc.
         assert!(
-            got.contains(&("chorus".to_string(), "mix".to_string())),
-            "a wet/mix control IS levelable (floored, not gutted) — the name rule hid it: \
-             {got:?}"
+            !got.iter().any(|(n, p)| n == "chorus" && p == "mix"),
+            "issue 3: Mix is never a default/pickable candidate: {got:?}"
+        );
+        assert_eq!(
+            crate::param_class::classify("ACD_Chorus", "mix").class,
+            crate::param_class::ParamClass::WetMix,
+            "…the classifier's own verdict is untouched"
         );
         // The classifier still reads the block's FenderId, so the raw-dB value passes through
         // unscaled (the old `(0.0..=1.0)` value filter would have dropped 2.5).

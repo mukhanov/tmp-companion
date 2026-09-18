@@ -39,6 +39,11 @@ pub struct DoctorInput {
     pub footswitches: Vec<footswitch::FootswitchInfo>,
 }
 
+/// `(group_id, node_id, bypass_to_write)` — the force-bypass isolation list
+/// [`doctor_force_bypass`] and [`base_isolation_or_refuse`] share. Named purely to keep
+/// their signatures under clippy's `type_complexity` threshold.
+pub(crate) type ForceBypass = Vec<(String, String, bool)>;
+
 /// The force-bypass isolation list for capturing one sound cleanly (mirrors the
 /// leveller's base/footswitch isolation, `footswitch.rs`): Base forces EVERY
 /// footswitch on/off block OFF; a footswitch forces its OWN blocks into their
@@ -50,7 +55,7 @@ pub(crate) fn doctor_force_bypass(
     ftsw: &serde_json::Value,
     preset: &serde_json::Value,
     footswitch: Option<u32>,
-) -> Vec<(String, String, bool)> {
+) -> ForceBypass {
     match footswitch {
         Some(s) => {
             let mut out = footswitch::siblings_off_excluding(ftsw, s);
@@ -62,6 +67,59 @@ pub(crate) fn doctor_force_bypass(
             .map(|(g, n)| (g, n, true))
             .collect(),
     }
+}
+
+/// The shared "read → refuse-or-force" step for a BASE leveling run's isolation: given the
+/// OUTCOME of a `read_slot_preset_complete(slot, &["ftsw"])`-shaped read (`Ok(preset)` or the
+/// read's own `Err`), either derive the base force-bypass list (`doctor_force_bypass`'s
+/// `None` arm) plus the preset's `restore_scene`, or propagate the SAME refusal message
+/// production's base arm has always shown. ONE definition of "base isolation" for every arm
+/// that levels base — the paths disagreeing about what "base" means cost a ~16 LU divergence
+/// (2026-08-31 bisect: an empty `&[]` force list solved C=-11.95 where production's isolated
+/// base measured C≈-28.2).
+///
+/// Pure over the read's `Result` rather than doing the read itself, so the refusal is
+/// testable at all: `SimDevice` always serves whole bodies, so a truncated field-8 read can
+/// never be driven from an offline fixture — a test hands this fn a synthetic `Err` instead.
+pub(crate) fn base_isolation_or_refuse(
+    read: Result<serde_json::Value, String>,
+    slot: u32,
+) -> Result<(serde_json::Value, ForceBypass, Option<u32>), String> {
+    let preset = read.map_err(|e| {
+        format!(
+            "could not read preset {}'s footswitch assignments ({e}) — they define which \
+             blocks are switched off for the Base measurement, and leveling without them \
+             would save a level solved for the wrong sound",
+            slot + 1
+        )
+    })?;
+    let force = doctor_force_bypass(&preset["ftsw"], &preset, None);
+    let restore_scene = crate::last_loaded_scene(&preset);
+    Ok((preset, force, restore_scene))
+}
+
+/// [`base_isolation_or_refuse`] with the read it needs and the HID gap that read owes — the
+/// whole "isolate base before levelling" step, for every base leveling arm (production's
+/// `commands::level_preset` and both probe arms). Returns the preset body, the read's own
+/// fail-safe `has_fs_scenes` flag (`read_slot_preset_sections`' doc), the force-bypass list and
+/// `restore_scene`.
+///
+/// The gap is part of the seam, not the caller's bookkeeping: the read opens and closes its OWN
+/// session before the leveller's first connect, so a back-to-back re-open risks the exclusive-open
+/// lockout (`0xe00002c5` — `danger.md`'s "HID open-lockout model").
+pub(crate) fn read_base_isolation(
+    slot: u32,
+) -> Result<(serde_json::Value, bool, ForceBypass, Option<u32>), String> {
+    let read = crate::read_slot_preset_complete(slot, &["ftsw"]);
+    let has_fs_scenes = read
+        .as_ref()
+        .is_ok_and(|(_, has_fs_scenes, _)| *has_fs_scenes);
+    let (preset, force, restore_scene) =
+        base_isolation_or_refuse(read.map(|(preset, _, _)| preset), slot)?;
+    crate::settle(std::time::Duration::from_millis(
+        crate::leveller::RECONNECT_GAP_MS,
+    ));
+    Ok((preset, has_fs_scenes, force, restore_scene))
 }
 
 /// `DoctorNode`s → a `node_id → saved bypass` map, first-occurrence-wins
@@ -1007,7 +1065,7 @@ fn bypass_only_conflict(
     ops.iter().find_map(|op| match op {
         doctor::DoctorOp::Param { node_id, param, .. } => {
             match scene_write_verdict_for_param(preset, scene, node_id, param) {
-                SceneWriteVerdict::WriteDirect { .. } => None,
+                SceneWriteVerdict::WriteDirect => None,
                 SceneWriteVerdict::Refuse { reason, .. } => Some(reason),
                 SceneWriteVerdict::NeedsEnable => Some(format!(
                     "{node_id} has no scene overlay yet in scene {scene} — Doctor can't safely \

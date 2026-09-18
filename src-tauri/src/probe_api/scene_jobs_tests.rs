@@ -895,13 +895,8 @@ fn shared_write_is_scene_local_false_on_an_ambiguous_base_node_match() {
 fn scene_write_verdict_for_param_allows_the_solo_write_direct_with_no_enable() {
     let verdict = scene_write_verdict_for_param(&hbe_boost_preset(), 2, HBE_NODE, HBE_PARAM);
     assert!(
-        matches!(
-            verdict,
-            SceneWriteVerdict::WriteDirect {
-                lands_on_base: true
-            }
-        ),
-        "the audibility-guarded shared write must land WriteDirect with lands_on_base=true"
+        matches!(verdict, SceneWriteVerdict::WriteDirect),
+        "the audibility-guarded shared write must be allowed through as WriteDirect"
     );
     assert!(
         !matches!(verdict, SceneWriteVerdict::NeedsEnable),
@@ -930,9 +925,7 @@ fn scene_write_verdict_for_param_full_overlay_arm_unchanged() {
     // guard, exactly like the paramless rule, and lands on the overlay (not base).
     assert!(matches!(
         scene_write_verdict_for_param(&hbe_boost_preset(), 0, HBE_NODE, HBE_PARAM),
-        SceneWriteVerdict::WriteDirect {
-            lands_on_base: false
-        }
+        SceneWriteVerdict::WriteDirect
     ));
 }
 
@@ -963,9 +956,271 @@ fn scene_write_verdict_for_param_unknown_overlay_arm_unchanged() {
             assert_eq!(scope, RefusedScope::Unknown);
             assert!(reason.contains("truncated"));
         }
-        SceneWriteVerdict::WriteDirect { .. } => {
+        SceneWriteVerdict::WriteDirect => {
             panic!("expected Refuse(Unknown), got WriteDirect")
         }
         SceneWriteVerdict::NeedsEnable => panic!("expected Refuse(Unknown), got NeedsEnable"),
     }
+}
+
+// ─────────────── G-D1a: an unusable scene doc must REFUSE, never fall back to base ───────────
+// HW motivation (Friedman HBE, device slot 28): the preset carries two guitar amps — `ACD_BE100`
+// active in base and `ACD_TwinReverb65NoFx` bypassed there. When a scene's doc does not arrive,
+// `classify_scene_knobs`' `None => !nd.bypassed` arm resolves bypass from the BASE graph, so the
+// scene is leveled on whichever amp base leaves on. On a scene that swaps amps that knob is not in
+// the scene's signal path at all: the solve sweeps it, nothing moves, and the row reports a
+// `no_authority` clamp that reads exactly like a genuine ceiling.
+//
+// A missing amp knob is NOT a levelable outcome, so the honest answer is this row's own `skip`
+// (the lane's per-scene-skip rule — never a batch abort). Deciding from base is the bug.
+fn two_amp_base_saved() -> serde_json::Value {
+    serde_json::json!({
+        "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+            { "nodeId": "ACD_BE100", "FenderId": "ACD_BE100",
+              "dspUnitParameters": { "bypass": false, "outputLevel": 1.0 } },
+            { "nodeId": "ACD_TwinReverb65NoFx", "FenderId": "ACD_TwinReverb65NoFx",
+              "dspUnitParameters": { "bypass": true, "outputLevel": 0.28 } }
+        ] } }
+    })
+}
+
+fn two_amp_candidates() -> Vec<LevelBlockArg> {
+    vec![
+        LevelBlockArg {
+            group_id: "G1".to_string(),
+            node_id: "ACD_BE100".to_string(),
+            parameter_id: "outputLevel".to_string(),
+            value: 1.0,
+        },
+        LevelBlockArg {
+            group_id: "G1".to_string(),
+            node_id: "ACD_TwinReverb65NoFx".to_string(),
+            parameter_id: "outputLevel".to_string(),
+            value: 0.28,
+        },
+    ]
+}
+
+#[test]
+fn a_scene_whose_doc_never_arrived_skips_instead_of_classifying_against_base() {
+    let saved = two_amp_base_saved();
+    // The live prepass pushes `(scene, None)` when no field-3 doc materialises for the recall.
+    let jobs = build_scene_jobs(
+        &[3],
+        &two_amp_candidates(),
+        &[(3, None)],
+        -23.0,
+        Some(&saved),
+    )
+    .unwrap();
+
+    assert!(
+        jobs[0].skip.is_some(),
+        "a scene with no doc must skip; instead it was classified with knobs {:?}",
+        jobs[0].knobs
+    );
+}
+
+#[test]
+fn a_scene_whose_doc_is_partial_skips_instead_of_classifying_against_base() {
+    // The REALISTIC shape: the doc EXISTS but was cut before the amp nodes, so every
+    // `block_bypass_in_live_graph` lookup past the cut returns `None` — the identical fallback,
+    // with no `Value::Null` anywhere. A gate keyed only on the null case would miss this.
+    let saved = two_amp_base_saved();
+    let partial = serde_json::json!({ "audioGraph": { "guitarNodes": { "G1": [] } } });
+    let jobs = build_scene_jobs(
+        &[3],
+        &two_amp_candidates(),
+        &[(3, Some(partial))],
+        -23.0,
+        Some(&saved),
+    )
+    .unwrap();
+
+    assert!(
+        jobs[0].skip.is_some(),
+        "a scene whose doc is missing its amp nodes must skip; instead it was classified with \
+         knobs {:?}",
+        jobs[0].knobs
+    );
+}
+
+#[test]
+fn a_scene_whose_saved_overlay_is_unclassifiable_skips_instead_of_losing_its_headroom_silently() {
+    // The live doc classifies CLEANLY — one un-bypassed amp, so knobs build and the row looks
+    // perfectly levelable. The defect is on the OTHER input: the SAVED doc cannot answer this
+    // scene's overlay (`scene_body` → `None` ⇒ `SceneOverlay::Unknown`), so the headroom trade
+    // scores the row `benefits: false` via `benefits_from_base_raise` and buys it no headroom —
+    // and it clamps with nothing red. The write path already refuses `Unknown`
+    // (`scene_write_verdict`), so this row was never going to be written: refusing it HERE, at
+    // build time, is what makes the loss visible instead of silent (and saves it an engage).
+    // The saved doc CLAIMS overlay authority — it carries a `scenes` array — but that array
+    // stops at index 1 while the batch levels scene 3, so `scene_body` can't answer and the
+    // overlay reads `Unknown`. On the batched command path the doc is complete-or-fail, so this
+    // is genuine malformation rather than a truncated tail, and it must not pass as levelable.
+    let mut saved = two_amp_base_saved();
+    saved["scenes"] = serde_json::json!([
+        { "guitarNodes": { "G1": {} } },
+        { "guitarNodes": { "G1": {} } }
+    ]);
+    let live = serde_json::json!({
+        "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+            { "nodeId": "ACD_BE100", "FenderId": "ACD_BE100",
+              "dspUnitParameters": { "bypass": false, "outputLevel": 1.0 } },
+            { "nodeId": "ACD_TwinReverb65NoFx", "FenderId": "ACD_TwinReverb65NoFx",
+              "dspUnitParameters": { "bypass": true, "outputLevel": 0.28 } }
+        ] } }
+    });
+    let jobs = build_scene_jobs(
+        &[3],
+        &two_amp_candidates(),
+        &[(3, Some(live))],
+        -23.0,
+        Some(&saved),
+    )
+    .unwrap();
+
+    assert!(
+        jobs[0].skip.is_some(),
+        "a scene whose saved overlay cannot be classified must skip and say so; instead it was \
+         built as a levelable row with knobs {:?}, which the trade then silently scores as a \
+         non-beneficiary",
+        jobs[0].knobs
+    );
+}
+
+// --- Live-prepass misses are repaired from the saved preset, never from base ---
+
+// G-D1a's two-amp base, plus the SCENES the real "Friedman HBE" carries. Scene 1 ("Clean") is
+// the swap scene: its overlay inverts the base pair — `ACD_BE100` off, `ACD_TwinReverb65NoFx`
+// on at its own outputLevel of 0.45. That is the scene base fallback gets wrong, and the one
+// the live prepass skipped on HW (2026-09-01) by pushing no usable doc for it.
+fn two_amp_swap_preset() -> serde_json::Value {
+    let mut p = two_amp_base_saved();
+    p["lastLoadedScene"] = serde_json::json!(8);
+    p["scenes"] = serde_json::json!([
+        { "guitarNodes": { "G1": {
+            "ACD_BE100": { "dspUnitParameters": { "bypass": false, "outputLevel": 0.97 } },
+            "ACD_TwinReverb65NoFx": { "dspUnitParameters": { "bypass": true } }
+          } } },
+        { "guitarNodes": { "G1": {
+            "ACD_BE100": { "dspUnitParameters": { "bypass": true } },
+            "ACD_TwinReverb65NoFx": { "dspUnitParameters": { "bypass": false, "outputLevel": 0.45 } }
+          } } }
+    ]);
+    p
+}
+
+// The repair predicate keys on the AMP question, so it catches BOTH live-prepass failure
+// shapes — the scene that pushed nothing at all, and the scene whose doc arrived cut before
+// the amp nodes. The partial is the one a `Null` check would miss while it produces the
+// identical wrong-amp fallback.
+#[test]
+fn scenes_missing_amp_bypass_flags_absent_and_partial_docs() {
+    let (docs, _) = scene_docs_from_saved(&two_amp_swap_preset(), &[0]).unwrap();
+    let answerable = docs[0].1.clone().unwrap();
+    let partial = serde_json::json!({
+        "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+            { "nodeId": "ACD_TubeScreamer", "dspUnitParameters": { "bypass": false } }
+        ] } }
+    });
+    let docs = vec![
+        (0u32, Some(answerable)),
+        (1u32, None),
+        (2u32, Some(partial)),
+    ];
+    assert_eq!(
+        scenes_missing_amp_bypass(&saved_structure(), &docs),
+        vec![1, 2],
+        "the absent doc AND the amp-less partial both need repair; the answerable one does not"
+    );
+}
+
+// A doc cut BETWEEN the two amps answers the first (BE100) and not the second (the Twin the
+// swap scene needs): it must be flagged for repair and refused by the classifier, never
+// classified with the Twin's bypass resolved from base.
+#[test]
+fn a_doc_cut_between_two_amps_is_flagged_and_refused() {
+    let cut = serde_json::json!({
+        "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+            { "nodeId": "ACD_BE100", "dspUnitParameters": { "bypass": true } }
+        ] } }
+    });
+    let (answerable, _) = scene_docs_from_saved(&two_amp_swap_preset(), &[0]).unwrap();
+    let docs = vec![(0u32, answerable[0].1.clone()), (1u32, Some(cut.clone()))];
+    assert_eq!(
+        scenes_missing_amp_bypass(&saved_structure(), &docs),
+        vec![1]
+    );
+    let structure = session::extract_active_graph(&two_amp_base_saved(), None);
+    let err = classify_scene_knobs(&structure, &cut, &two_amp_candidates()).unwrap_err();
+    assert!(err.contains("every amp"), "{err}");
+}
+
+/// The complete saved graph every repair scan takes its amp roster from.
+fn saved_structure() -> session::ActiveGraph {
+    session::extract_active_graph(&two_amp_base_saved(), None)
+}
+
+// The roster must come from the COMPLETE saved graph, never from the live docs: when the only
+// doc is the one cut between the two amps, a roster read off that doc lists one amp and the
+// doc answers for itself (red under the docs-derived roster).
+#[test]
+fn a_cut_only_doc_is_flagged_off_the_saved_roster() {
+    let cut = serde_json::json!({
+        "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+            { "nodeId": "ACD_BE100", "dspUnitParameters": { "bypass": true } }
+        ] } }
+    });
+    let docs = vec![(1u32, Some(cut))];
+    assert_eq!(
+        scenes_missing_amp_bypass(&saved_structure(), &docs),
+        vec![1]
+    );
+}
+
+// The repair itself, end to end on the HW shape: two scenes the live prepass could not answer
+// (one pushed nothing, one arrived cut before the amps) are filled from the saved preset, the
+// scene that DID answer is left alone, and the swap scene ends up on its own amp.
+#[test]
+fn repair_scene_docs_fills_only_the_unanswerable_scenes() {
+    let saved = two_amp_swap_preset();
+    let (answerable, _) = scene_docs_from_saved(&saved, &[0]).unwrap();
+    let mut docs = vec![
+        (0u32, answerable[0].1.clone()),
+        // Scene 1 pushed nothing at all.
+        (1u32, None),
+    ];
+    // Mark scene 0's doc so we can prove the repair did not touch it.
+    docs[0].1.as_mut().unwrap()["__probe"] = serde_json::json!("untouched");
+
+    let needy = scenes_missing_amp_bypass(&saved_structure(), &docs);
+    assert_eq!(
+        needy,
+        vec![1],
+        "only the scene that pushed nothing needs repair"
+    );
+    assert!(repair_scene_docs_from(&mut docs, &saved, &needy));
+    assert_eq!(docs[0].1.as_ref().unwrap()["__probe"], "untouched");
+
+    let structure = session::extract_active_graph(&two_amp_base_saved(), None);
+    let (knobs, _) = classify_scene_knobs(
+        &structure,
+        docs[1].1.as_ref().unwrap(),
+        &two_amp_candidates(),
+    )
+    .expect("the repaired scene must classify");
+    assert_eq!(knobs[0].1, "ACD_TwinReverb65NoFx");
+}
+
+// A saved preset that cannot answer either (truncated `scenes`) repairs NOTHING and leaves the
+// docs as they were — the classifier's refusal is still what the row reports.
+#[test]
+fn repair_scene_docs_leaves_docs_untouched_when_the_saved_preset_cannot_answer() {
+    let mut truncated = two_amp_swap_preset();
+    truncated["scenes"] = serde_json::json!([]);
+    let mut docs = vec![(1u32, None)];
+    let needy = scenes_missing_amp_bypass(&saved_structure(), &docs);
+    assert!(!repair_scene_docs_from(&mut docs, &truncated, &needy));
+    assert!(docs[0].1.is_none(), "no doc was invented");
 }

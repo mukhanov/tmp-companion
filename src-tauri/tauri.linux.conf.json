@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb", "rpm"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/256x256.png"
+    ],
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "deb": {
+        "depends": ["sqlite3", "libasound2"],
+        "files": {
+          "/usr/lib/udev/rules.d/70-fender-tone-master-pro.rules": "../packaging/udev/70-fender-tone-master-pro.rules"
+        },
+        "postInstallScript": "../packaging/linux/postinst.sh",
+        "postRemoveScript": "../packaging/linux/postrm.sh"
+      },
+      "rpm": {
+        "depends": ["sqlite", "alsa-lib"],
+        "files": {
+          "/usr/lib/udev/rules.d/70-fender-tone-master-pro.rules": "../packaging/udev/70-fender-tone-master-pro.rules"
+        },
+        "postInstallScript": "../packaging/linux/postinst.sh",
+        "postRemoveScript": "../packaging/linux/postrm.sh"
+      }
+    }
+  }
+}

@@ -112,7 +112,16 @@
 //!                                  convergence state machine → exit time + Δ vs full
 //!   probe --levelpreset <slot> <target_lufs> [save] [noverify]
 //!                                  full one-shot leveling on the real device
-//!                                  (stimulus via TMP_LEVELLER_STIMULUS)
+//!                                  (stimulus via TMP_LEVELLER_STIMULUS). Base isolation
+//!                                  is production's (every footswitch-owned block off).
+//!                                  NEVER BOOSTS: this calls the public
+//!                                  `leveller::level_preset`, which passes
+//!                                  `BoostContext::default()`, so `ctx.base_amp` is always
+//!                                  None and the amp-fader raise cannot fire. Only
+//!                                  `commands::level_preset` builds a real context. A
+//!                                  preset whose pedals-off ceiling sits below target
+//!                                  therefore CLAMPS here and levels cleanly in the app —
+//!                                  that difference is this arm's scope, not a regression.
 //!   probe --measure-current <topology> [sceneSlot] [calibrationLUFS]
 //!                                  measure current live state without changing levels
 //!   probe --measure-pair <listIdx> <topology> <presetLevel> [--scene N] <g:n:p=v>…
@@ -1184,6 +1193,47 @@ fn main() {
             .and_then(|s| s.parse().ok());
         let commit = args.iter().any(|a| a == "--commit");
         match tmp_companion_lib::probe_ftsw_validate(switch_override, commit) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--reprompt-map") {
+        // --reprompt-map <slot> <name> <group> (--remove <nodeId> | --insert <fenderId> [--before <id>]) [--commit]
+        let slot: u32 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let name = args.get(i + 2).cloned().unwrap_or_default();
+        let group = args.get(i + 3).cloned().unwrap_or_default();
+        let opt = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|j| args.get(j + 1))
+                .cloned()
+        };
+        let (remove, insert, before) = (opt("--remove"), opt("--insert"), opt("--before"));
+        let commit = args.iter().any(|a| a == "--commit");
+        if slot == 0
+            || name.is_empty()
+            || group.is_empty()
+            || (remove.is_none() && insert.is_none())
+        {
+            eprintln!("usage: probe --reprompt-map <slot> <name> <group> (--remove <nodeId> | --insert <fenderId> [--before <id>]) [--commit]");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_reprompt_map(
+            slot,
+            &name,
+            &group,
+            remove.as_deref(),
+            insert.as_deref(),
+            before.as_deref(),
+            commit,
+        ) {
             Ok(report) => {
                 print!("{report}");
                 return;

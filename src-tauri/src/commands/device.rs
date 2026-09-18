@@ -5,6 +5,12 @@ use crate::*;
 pub(crate) struct AppInfo {
     pub(crate) name: String,
     pub(crate) version: String,
+    /// Compile-time target OS (`"macos"`, `"linux"`, …). The frontend needs it
+    /// for one thing only: deciding whether this build has an update channel to
+    /// check (`latest.json` carries `darwin-*` keys and nothing else), so the
+    /// Settings pane can say what actually happens instead of reporting a
+    /// permanent "up to date". Cheaper than a platform plugin for one string.
+    pub(crate) os: String,
 }
 
 /// Frontend handshake on mount — confirms the backend is reachable.
@@ -18,6 +24,7 @@ pub(crate) fn app_info<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AppInfo {
     AppInfo {
         name: "TMP Companion".to_string(),
         version: app.package_info().version.to_string(),
+        os: std::env::consts::OS.to_string(),
     }
 }
 

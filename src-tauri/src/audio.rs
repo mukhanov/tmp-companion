@@ -33,8 +33,10 @@
 //! **PipeWire/WirePlumber claiming the TMP as a system audio device blocks `hw:`'s
 //! exclusive open with EBUSY** (HW-measured) whenever it's actively holding the
 //! card — a WirePlumber rule excluding the TMP by USB vendor/product id
-//! (`device.disabled`) is required on Linux dev machines; this module has no way
-//! to detect or work around a live PipeWire hold itself.
+//! (`device.disabled`) is required on Linux dev machines. This module cannot work
+//! AROUND a live hold, but it does recognise one: `stream_error` turns the busy
+//! stream-build failure into the rule that fixes it, the same way `hid.rs` turns
+//! `EACCES` into the udev command that fixes that.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -841,6 +843,36 @@ fn host_config_hint() -> &'static str {
     }
 }
 
+/// Format a cpal stream-build failure, adding the one piece of context the
+/// message never carries on Linux: a busy card is almost always PipeWire, and
+/// there is a concrete fix.
+///
+/// This mirrors `hid.rs`'s `EACCES` → udev hint. In both cases the transport
+/// layer knows exactly why the open failed and what to do about it, while the
+/// raw error says only "Device or resource busy" — which a user has no way to
+/// connect to WirePlumber having claimed the card. Nothing here works AROUND a
+/// live hold; it just stops the failure being unactionable.
+///
+/// Matched on the message text because cpal surfaces ALSA's `EBUSY` through
+/// `BackendSpecificError`, which carries a string and no errno.
+///
+/// `linux` is a parameter rather than a `cfg!` inside, so both branches are
+/// unit-testable from either platform's CI leg.
+fn stream_error(what: &str, err: &str, linux: bool) -> String {
+    let base = format!("{what}: {err}");
+    if linux && err.to_lowercase().contains("busy") {
+        return format!(
+            "{base} — the card is already open. PipeWire/WirePlumber claims \
+             USB-audio devices by default and holds this one, which blocks the \
+             exclusive `hw:` open re-amp needs. Exclude the unit \
+             (device.vendor.id 0x1ed8, device.product.id 0x0047) with a \
+             WirePlumber rule, then restart wireplumber/pipewire — see \
+             CONTRIBUTING.md, \"Developing on Linux\"."
+        );
+    }
+    base
+}
+
 /// Find the TMP and pick a 48 kHz output config (≥3 ch for USB-In 3) + input
 /// config. Errors describe exactly which half is missing.
 fn resolve_reamp_streams(sample_rate: u32) -> Result<ReampStreams, String> {
@@ -922,7 +954,13 @@ fn build_oneshot_output_stream(
             err,
             None,
         )
-        .map_err(|e| format!("build output stream: {e}"))
+        .map_err(|e| {
+            stream_error(
+                "build output stream",
+                &e.to_string(),
+                cfg!(target_os = "linux"),
+            )
+        })
 }
 
 /// Build the capture INPUT stream that appends the device's USB-Out return into
@@ -946,7 +984,13 @@ fn build_capture_input_stream(
             err,
             None,
         )
-        .map_err(|e| format!("build input stream: {e}"))
+        .map_err(|e| {
+            stream_error(
+                "build input stream",
+                &e.to_string(),
+                cfg!(target_os = "linux"),
+            )
+        })
 }
 
 /// Play `stimulus_mono` into the TMP's USB-In 3 while recording its processed
@@ -1542,7 +1586,13 @@ impl LiveReamp {
                 err,
                 None,
             )
-            .map_err(|e| format!("build output stream: {e}"))?;
+            .map_err(|e| {
+                stream_error(
+                    "build output stream",
+                    &e.to_string(),
+                    cfg!(target_os = "linux"),
+                )
+            })?;
 
         // Ring-buffer the capture: keep only the recent tail the callers can ask
         // for. Unbounded growth here OOM'd the whole machine on a long benchmark
@@ -1564,7 +1614,13 @@ impl LiveReamp {
                 err,
                 None,
             )
-            .map_err(|e| format!("build input stream: {e}"))?;
+            .map_err(|e| {
+                stream_error(
+                    "build input stream",
+                    &e.to_string(),
+                    cfg!(target_os = "linux"),
+                )
+            })?;
 
         in_stream.play().map_err(|e| format!("play input: {e}"))?;
         out_stream.play().map_err(|e| format!("play output: {e}"))?;
@@ -1652,7 +1708,13 @@ pub fn capture_input(secs: f32, sample_rate: u32) -> Result<Capture, String> {
             err,
             None,
         )
-        .map_err(|e| format!("build input stream: {e}"))?;
+        .map_err(|e| {
+            stream_error(
+                "build input stream",
+                &e.to_string(),
+                cfg!(target_os = "linux"),
+            )
+        })?;
 
     in_stream.play().map_err(|e| format!("play input: {e}"))?;
     std::thread::sleep(Duration::from_millis((secs * 1000.0) as u64));
@@ -2456,5 +2518,64 @@ mod tests {
             (inc - oneshot).abs() < 1e-6,
             "incremental {inc:.6} vs one-shot {oneshot:.6}"
         );
+    }
+}
+
+/// `stream_error` tests. Ungated on `target_os` — the `linux` flag is a
+/// parameter precisely so the macOS CI leg checks the Linux branch too.
+#[cfg(test)]
+mod pipewire_hint_tests {
+    use super::stream_error;
+
+    /// The exact text ALSA gives cpal when WirePlumber is holding the card.
+    const BUSY: &str = "A backend-specific error has occurred: Device or resource busy";
+
+    #[test]
+    fn a_busy_card_on_linux_names_the_wireplumber_fix() {
+        let msg = stream_error("build input stream", BUSY, true);
+        // The original error must survive — the hint is added, never substituted.
+        assert!(msg.starts_with("build input stream: "), "{msg}");
+        assert!(msg.contains("Device or resource busy"), "{msg}");
+        // And it must carry something the user can actually act on.
+        assert!(msg.contains("WirePlumber"), "{msg}");
+        assert!(msg.contains("0x1ed8"), "{msg}");
+        assert!(msg.contains("0x0047"), "{msg}");
+    }
+
+    /// Off Linux there is no PipeWire, so the hint would be nonsense.
+    #[test]
+    fn a_busy_card_off_linux_gets_no_hint() {
+        let msg = stream_error("build input stream", BUSY, false);
+        assert_eq!(msg, format!("build input stream: {BUSY}"));
+    }
+
+    /// Only a BUSY failure is PipeWire's fault. An unsupported format or a
+    /// missing device must not be blamed on it.
+    #[test]
+    fn an_unrelated_failure_gets_no_hint() {
+        for err in [
+            "The requested stream configuration is not supported by the device",
+            "The requested device is no longer available",
+        ] {
+            let msg = stream_error("build output stream", err, true);
+            assert_eq!(msg, format!("build output stream: {err}"));
+            assert!(!msg.contains("WirePlumber"), "{msg}");
+        }
+    }
+
+    /// ALSA's casing has moved around between versions; the match must not be
+    /// brittle about it.
+    #[test]
+    fn the_busy_match_is_case_insensitive() {
+        for err in [
+            "Device or resource busy",
+            "DEVICE OR RESOURCE BUSY",
+            "EBUSY: busy",
+        ] {
+            assert!(
+                stream_error("build input stream", err, true).contains("WirePlumber"),
+                "missed: {err}",
+            );
+        }
     }
 }

@@ -22,6 +22,7 @@ import { type EditMode } from "./BlockEditor";
 import { useCopyLibrary } from "./useCopyLibrary";
 import {
   activeFromEditGraph,
+  reconcileReadBack,
   applyEditOp,
   diffToOps,
   initEdit,
@@ -204,29 +205,30 @@ export function CopyView({ connected, onScan, initialGraph }: CopyViewProps) {
     copyApply(jobs, true, onResult)
       .then((items) => {
         // Patch the cached library graph in place so a second edit reads the just-saved
-        // path WITHOUT a ~22 s backup re-scan. Prefer the device's post-save read-back
-        // (authoritative); when it's absent (offline, or a failed read), fall back to the
-        // edit we just applied (optimistic) — an edit NEVER triggers a refetch. Done from
-        // the resolved result (not the channel, which the offline bridge doesn't stream).
-        // ONLY for a CONFIRMED save: a "skipped"/"error" item (device rejected the edit)
-        // must NOT patch the cache, or it would assert blocks the unit never saved.
+        // path WITHOUT a ~22 s backup re-scan — an edit NEVER triggers a refetch. The edit
+        // the device acked is the truth (optimistic); the device's working-copy read
+        // (taken by the backend BEFORE the save) is adopted only when it shows those same
+        // blocks (`reconcileReadBack`) — the earlier buffer-scraped read-back once handed
+        // back the LOAD-TIME graph and patched the cache back to the pre-edit blocks.
+        // Done from the resolved result (not the channel, which the offline bridge
+        // doesn't stream). ONLY for a CONFIRMED save: a "skipped"/"error" item (device
+        // rejected the edit) must NOT patch the cache, or it would assert blocks the unit
+        // never saved.
         for (const item of items) {
           if (item.outcome !== "updated") continue;
           const staged = edit?.[item.slot];
-          const patch =
-            item.graph ??
-            (staged
-              ? activeFromEditGraph(
-                  staged.graph,
-                  graphForSlot(item.slot) ?? undefined,
-                )
-              : null);
-          if (patch) {
-            patchLibraryGraph(item.slot, patch);
-            // BUG-2: a live block edit pushes no device field-3, so optimistically
-            // repaint the hero when we just edited the ACTIVE preset (no device re-read).
-            if (item.slot === activeSlot) patchLiveGraph(patch);
-          }
+          if (!staged) continue;
+          const patch = reconcileReadBack(
+            activeFromEditGraph(
+              staged.graph,
+              graphForSlot(item.slot) ?? undefined,
+            ),
+            item.graph,
+          );
+          patchLibraryGraph(item.slot, patch);
+          // BUG-2: a live block edit pushes no device field-3, so optimistically
+          // repaint the hero when we just edited the ACTIVE preset (no device re-read).
+          if (item.slot === activeSlot) patchLiveGraph(patch);
         }
         setSaveDone(true);
       })
@@ -272,8 +274,8 @@ export function CopyView({ connected, onScan, initialGraph }: CopyViewProps) {
         title="Copy lives on the Tone Master Pro"
         body={
           <>
-            Connect your unit over <UsbC /> to copy blocks between presets — it
-            will connect automatically.
+            Connect your unit over <UsbC /> to copy blocks between presets. It
+            connects on its own.
           </>
         }
         onScan={onScan}

@@ -13,7 +13,8 @@ const h = vi.hoisted(() => {
   return {
     checkForUpdate: vi.fn<() => Promise<FoundUpdate | null>>(),
     relaunchApp: vi.fn<() => Promise<void>>(() => Promise.resolve()),
-    appInfo: vi.fn<() => Promise<{ name: string; version: string }>>(),
+    appInfo:
+      vi.fn<() => Promise<{ name: string; version: string; os: string }>>(),
     getStore: vi.fn<() => Promise<unknown>>(),
     setAutoInstallUpdates: vi.fn<(on: boolean) => Promise<void>>(() =>
       Promise.resolve(),
@@ -40,7 +41,11 @@ vi.mock("../lib/invoke", async (importOriginal) => {
 // Imported AFTER the mocks so the hook picks up the mocked seams.
 import { useUpdater, formatReleaseNotes } from "../lib/useUpdater";
 
-const info = (version: string): AppInfo => ({ name: "TMP Companion", version });
+const info = (version: string, os = "macos"): AppInfo => ({
+  name: "TMP Companion",
+  version,
+  os,
+});
 
 const storeWith = (auto: boolean): Store => ({
   profiles: [],
@@ -185,6 +190,41 @@ describe("useUpdater — dev-build guard", () => {
     expect(h.checkForUpdate).not.toHaveBeenCalled();
     expect(result.current.phase).toBe("idle");
   });
+});
+
+// latest.json carries darwin-* keys and nothing else, so macOS is the only
+// platform with a channel. This is an allow-list rather than "not linux"
+// precisely so a new target (the in-flight Windows port) does not silently
+// inherit the permanent "up to date" bug this guard exists to prevent.
+describe("useUpdater — update-channel allow-list", () => {
+  it("reports a channel on macOS and checks on mount", async () => {
+    h.appInfo.mockResolvedValue(info("1.0.0", "macos"));
+    h.checkForUpdate.mockResolvedValue(null);
+
+    const { result } = renderHook(() => useUpdater());
+    await waitFor(() => {
+      expect(result.current.hasUpdateChannel).toBe(true);
+    });
+    expect(h.checkForUpdate).toHaveBeenCalled();
+  });
+
+  it.each(["linux", "windows"])(
+    "reports no channel on %s and never checks",
+    async (os) => {
+      h.appInfo.mockResolvedValue(info("1.0.0", os));
+
+      const { result } = renderHook(() => useUpdater());
+      await waitFor(() => {
+        expect(result.current.hasUpdateChannel).toBe(false);
+      });
+      // Settle the mount effect, then assert the pointless round-trip never ran.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(h.checkForUpdate).not.toHaveBeenCalled();
+      expect(result.current.phase).toBe("idle");
+    },
+  );
 });
 
 describe("useUpdater — manual check()", () => {

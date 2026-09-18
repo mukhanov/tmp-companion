@@ -18,7 +18,9 @@ fn backup_slot_read_returns_the_complete_body_and_refuses_a_slot_that_moved() {
     ));
 
     // Device slot 401 = list index 400. The whole document comes back, `ftsw` included.
-    let doc = preset_json_from_backup(&archive, 401, "Big Rig").expect("complete body");
+    // The fixture body carries no `info.preset_id`, so the caller has nothing to expect —
+    // `None` exercises the graceful-fallback (slot+name-only) path.
+    let doc = preset_json_from_backup(&archive, 401, "Big Rig", None).expect("complete body");
     assert_eq!(
         doc["ftsw"].as_array().map(Vec::len),
         Some(2),
@@ -27,12 +29,145 @@ fn backup_slot_read_returns_the_complete_body_and_refuses_a_slot_that_moved() {
     assert_eq!(doc["scenes"][0]["sceneName"], "Rhythm");
 
     // The occupant changed since the slot was named → refuse, never substitute.
-    let err = preset_json_from_backup(&archive, 401, "Some Other Preset")
+    let err = preset_json_from_backup(&archive, 401, "Some Other Preset", None)
         .expect_err("a renamed occupant must refuse");
     assert!(err.contains("Big Rig") && err.contains("refusing"), "{err}");
 
     // A slot with no row is a refusal too, not an empty preset.
-    assert!(preset_json_from_backup(&archive, 402, "Big Rig").is_err());
+    assert!(preset_json_from_backup(&archive, 402, "Big Rig", None).is_err());
+}
+
+/// Same slot + name, matching `expect_id` → accepted (the identity guard's own
+/// mainline: both sides agree, and the check does not merely default to a pass).
+#[test]
+fn backup_slot_read_accepts_on_matching_name_and_preset_id() {
+    let preset_json = r#"{"info":{"displayName":"Big Rig","preset_id":"aaaaaaaa-0000-0000-0000-000000000001"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        preset_json.replace('\'', "''")
+    ));
+
+    let doc = preset_json_from_backup(
+        &archive,
+        401,
+        "Big Rig",
+        Some("aaaaaaaa-0000-0000-0000-000000000001"),
+    )
+    .expect("matching id must be accepted");
+    assert_eq!(doc["scenes"][0]["sceneName"], "Rhythm");
+}
+
+/// Same slot, SAME NAME, but a different `preset_id` in the body — only the identity
+/// guard can catch this (the name guard alone would pass it). Proves the fallback for
+/// issue #155: a slot+name match is not enough when the caller can name an id.
+#[test]
+fn backup_slot_read_refuses_a_same_name_row_whose_preset_id_differs() {
+    let preset_json = r#"{"info":{"displayName":"Big Rig","preset_id":"aaaaaaaa-0000-0000-0000-000000000001"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        preset_json.replace('\'', "''")
+    ));
+
+    let err = preset_json_from_backup(
+        &archive,
+        401,
+        "Big Rig",
+        Some("bbbbbbbb-0000-0000-0000-000000000002"),
+    )
+    .expect_err("a same-name row with a different preset_id must refuse");
+    assert!(
+        err.contains("aaaaaaaa-0000-0000-0000-000000000001")
+            && err.contains("bbbbbbbb-0000-0000-0000-000000000002")
+            && err.contains("401"),
+        "{err}"
+    );
+}
+
+/// A body with no `info.preset_id` at all, when the caller expected one — refused as
+/// unidentifiable rather than silently accepted on name alone.
+#[test]
+fn backup_slot_read_refuses_a_body_with_no_preset_id_when_one_was_expected() {
+    let preset_json =
+        r#"{"info":{"displayName":"Big Rig"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        preset_json.replace('\'', "''")
+    ));
+
+    let err = preset_json_from_backup(
+        &archive,
+        401,
+        "Big Rig",
+        Some("aaaaaaaa-0000-0000-0000-000000000001"),
+    )
+    .expect_err("a body with no preset_id, when one was expected, must refuse");
+    assert!(
+        err.contains("preset_id") && err.contains("aaaaaaaa-0000-0000-0000-000000000001"),
+        "{err}"
+    );
+}
+
+/// `expect_id: None` — the caller's own partial could not name an id (the common
+/// ftsw-cut shape) — falls back to the slot+name guards alone: a matching name with a
+/// body that DOES carry an id is still accepted. This is the graceful-fallback
+/// mainline for this call path.
+#[test]
+fn backup_slot_read_accepts_on_name_alone_when_the_partial_could_not_identify_itself() {
+    let preset_json = r#"{"info":{"displayName":"Big Rig","preset_id":"aaaaaaaa-0000-0000-0000-000000000001"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        preset_json.replace('\'', "''")
+    ));
+
+    let doc = preset_json_from_backup(&archive, 401, "Big Rig", None)
+        .expect("no expected id → accepted on slot+name alone");
+    assert_eq!(doc["scenes"][0]["sceneName"], "Rhythm");
+}
+
+/// Empty-string ids are normalized to absent on BOTH sides of this guard, mirroring
+/// `presets.rs`'s `empty_string_preset_ids_are_treated_as_absent_never_matched` on the
+/// sibling identity-guard site: an empty string is not an identity and must never
+/// compare equal to another empty.
+#[test]
+fn backup_slot_read_treats_empty_string_ids_as_absent() {
+    // (a) Body carries an empty-string preset_id: treated as absent, so it can never
+    // satisfy a present `expect_id` — must refuse as unidentifiable, not vacuously
+    // accept.
+    let empty_id_body = r#"{"info":{"displayName":"Big Rig","preset_id":""},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive_empty_body = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        empty_id_body.replace('\'', "''")
+    ));
+    let err = preset_json_from_backup(
+        &archive_empty_body,
+        401,
+        "Big Rig",
+        Some("aaaaaaaa-0000-0000-0000-000000000001"),
+    )
+    .expect_err("an empty-string body id must never satisfy a present expect_id");
+    assert!(
+        err.contains("aaaaaaaa-0000-0000-0000-000000000001")
+            && err.contains("carries no info.preset_id"),
+        "{err}"
+    );
+
+    // (b) `expect_id: Some("")` — empty-string expected id normalizes to `None`, so the
+    // identity check is skipped (fallback path): a matching name with a body that DOES
+    // carry a real id is still accepted.
+    let real_id_body = r#"{"info":{"displayName":"Big Rig","preset_id":"aaaaaaaa-0000-0000-0000-000000000001"},"scenes":[{"sceneName":"Rhythm","uuid":"a"}]}"#;
+    let archive_real_body = build_backup_archive(&format!(
+        "CREATE TABLE UserPresets(slot INTEGER, displayName TEXT, presetJson TEXT); \
+         INSERT INTO UserPresets VALUES (401, 'Big Rig', '{}');",
+        real_id_body.replace('\'', "''")
+    ));
+    let doc = preset_json_from_backup(&archive_real_body, 401, "Big Rig", Some(""))
+        .expect("empty-string expect_id falls back to slot+name");
+    assert_eq!(doc["scenes"][0]["sceneName"], "Rhythm");
 }
 
 #[test]
@@ -336,6 +471,60 @@ fn backup_row_handle_candidates_are_empty_when_preset_json_does_not_parse() {
     assert!(row.base_handles.is_empty());
 }
 
+/// `BackupPresetRow::preset_id` carries the body's `info.preset_id` when the body has
+/// one, is `None` for a body missing the key, and is `None` for a row whose
+/// `presetJson` doesn't parse at all — the same "unparseable ⇒ empty/default" contract
+/// as every other derived field on this row (`scene_count`, `amp_candidates`, …).
+#[test]
+fn backup_rows_carry_preset_id_only_when_the_body_has_one() {
+    let has_id = serde_json::json!({
+        "info": {"displayName": "Has Id", "preset_id": "11111111-1111-1111-1111-111111111111"},
+        "scenes": [{"sceneName": "Rhythm", "uuid": "a"}]
+    })
+    .to_string();
+    let no_id = serde_json::json!({
+        "info": {"displayName": "No Id"},
+        "scenes": [{"sceneName": "Rhythm", "uuid": "a"}]
+    })
+    .to_string();
+
+    let sql = format!(
+        "CREATE TABLE UserPresets (id INTEGER PRIMARY KEY, slot INTEGER, isEmpty INTEGER, \
+         displayName TEXT, presetJson BLOB); \
+         INSERT INTO UserPresets VALUES (1, 1, 0, 'Has Id', '{}'); \
+         INSERT INTO UserPresets VALUES (2, 2, 0, 'No Id', '{}'); \
+         INSERT INTO UserPresets VALUES (3, 3, 0, 'Broken', '{{not json');",
+        has_id.replace('\'', "''"),
+        no_id.replace('\'', "''"),
+    );
+    let archive = build_backup_archive(&sql);
+    let result = read_backup_archive(&archive).expect("decode archive");
+
+    let row = |slot: i64| {
+        result
+            .presets
+            .iter()
+            .find(|p| p.slot == slot)
+            .unwrap_or_else(|| panic!("row for slot {slot} present"))
+    };
+
+    assert_eq!(
+        row(1).preset_id.as_deref(),
+        Some("11111111-1111-1111-1111-111111111111"),
+        "a body with an info.preset_id carries it"
+    );
+    assert!(
+        row(2).preset_id.is_none(),
+        "a body without preset_id carries None"
+    );
+    let broken = row(3);
+    assert!(
+        broken.preset_id.is_none(),
+        "an unparseable body carries None"
+    );
+    assert_eq!(broken.scene_count, -1, "unparseable presetJson");
+}
+
 /// The archive's `settingsBackup` entry (the device's settings.json) round-trips
 /// into `BackupReadResult::settings_bytes` — the capture the command layer persists
 /// to `<app_config_dir>/support/device-settings.json` for a later support bundle.
@@ -571,6 +760,38 @@ fn scenario_fixture_matches_scenario_presets_json() {
         "backup-fixture.bin is out of sync with scenario-presets.json — rerun \
          `cargo test build_scenario_fixture -- --ignored` and commit the regenerated fixture"
     );
+}
+
+/// This checks the STRUCT PLUMBING that the raw-bytes gate
+/// `backup_fixture_uses_device_product_id_and_unique_preset_ids` (lib.rs:1424+) is
+/// deliberately blind to — that gate reads the raw presetJson column, this one proves
+/// `BackupPresetRow` actually carries the id through `read_backup_archive`.
+#[test]
+fn scenario_fixture_rows_all_carry_distinct_preset_ids() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../e2e/fixtures/backup-fixture.bin"
+    ))
+    .expect("read committed backup-fixture.bin");
+    let result = read_backup_archive(&bytes).expect("decode committed fixture");
+
+    assert!(!result.presets.is_empty(), "fixture must have presets");
+
+    let ids: Vec<&str> = result
+        .presets
+        .iter()
+        .filter_map(|p| p.preset_id.as_deref())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        result.presets.len(),
+        "every row must carry a preset_id"
+    );
+
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "all preset_ids must be distinct");
 }
 
 #[test]

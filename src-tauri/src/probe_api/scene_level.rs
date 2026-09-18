@@ -10,10 +10,11 @@ use crate::leveller;
 // Every scene-leveling entry point below ENUMERATES scenes via the complete-JSON
 // fallback (`read_preset_scenes_complete`), not the raw field-8 partial: the scene-tail
 // cut is per-slot-deterministic (notes/gotchas.md's field-8 entry) and a probe run that
-// levels off a truncated scene list silently mislevels or drops a scene. Enumeration
-// only — overlay classification (`scene_jobs::read_saved_preset`) still reads the raw
-// partial, so a tail scene past the cut gets an honest `SceneOverlay::Unknown` refusal
-// rather than a silent skip.
+// levels off a truncated scene list silently mislevels or drops a scene. The
+// save-bearing `probe_level_preset_scenes` also classifies off the COMPLETE saved doc
+// (`read_saved_preset_complete`, backup fallback) — off the raw partial, every tail
+// scene past the cut refused as `SceneOverlay::Unknown` (HW 2026-09-02, "Friedman HBE"
+// scene 3); the read-only bench/scan entry points keep the tolerant read.
 use crate::read_preset_scenes_complete;
 use crate::scenes;
 use crate::session;
@@ -159,14 +160,19 @@ pub fn probe_level_preset_scenes(
         .find(|(n, _)| n.eq_ignore_ascii_case("base"))
         .map(|(_, t)| *t)
         .unwrap_or(default_target);
+    // Production's isolated base (every footswitch-owned on-off block forced OFF), via the
+    // ONE shared read → refuse-or-force step; an unreadable/truncated `ftsw` refuses rather
+    // than leveling a guess.
+    let (_, _, force, restore_scene) = crate::commands::doctor::read_base_isolation(list_index)?;
     let opts = leveller::LevelOptions {
         save,
         verify: true,
+        restore_scene,
         ..Default::default()
     };
     // probe = raw benchmark behavior; the setlist/scene-bench base pass stays skip-free
     // this PR (its common target moves with min(C), so "unchanged" is rarer anyway).
-    let br = leveller::level_preset(list_index, &stim, base_target, opts, &[], None, || false)?;
+    let br = leveller::level_preset(list_index, &stim, base_target, opts, &force, None, || false)?;
     out += &format!(
         "Base  → target {:.1}  presetLevel={:.4}  verify {:.2} LU (err {:+.2}){}{}\n",
         base_target,
@@ -193,12 +199,13 @@ pub fn probe_level_preset_scenes(
     // The field-3 harvest can flake batch-wide (a lean/stale session yields docs with
     // no routing template, HW-observed: every scene then skips as "can't classify").
     // Routing is scene-invariant, so mirror production and the batched sibling below:
-    // read the SAVED field-8 doc and pass it as `build_scene_jobs`' fallback template
-    // source (`read_saved_preset`'s gap contract: the caller sleeps RECONNECT_GAP_MS).
+    // read the SAVED doc COMPLETE (the field-8 partial cuts the scene tail, and a
+    // present-but-cut `scenes` skips every scene past the cut as "can't answer") and pass
+    // it as `build_scene_jobs`' fallback template source.
     let all_slots: Vec<u32> = (0..scenes.scenes.len() as u32).collect();
     let (docs, _) = prepass_scene_docs(list_index, &all_slots)?;
     std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
-    let saved = super::scene_jobs::read_saved_preset(list_index);
+    let saved = super::scene_jobs::read_saved_preset_complete(list_index)?;
 
     // 3c) ONE-SHOT open-loop per scene on the active amp `outputLevel`. HW-verified:
     //     captured_LUFS = 20*log10(outputLevel) + C is LINEAR with ~25 LU authority, so
@@ -215,7 +222,7 @@ pub fn probe_level_preset_scenes(
         // REASON (e.g. "no complete routing read", "no active guitar amp in scene") —
         // print them rather than folding every failure into one generic skip, or a
         // prepass harvest problem is indistinguishable from a genuinely knobless scene.
-        let jobs = match build_scene_jobs(&[slot], &candidates, &docs, target, saved.as_ref()) {
+        let jobs = match build_scene_jobs(&[slot], &candidates, &docs, target, Some(&saved)) {
             Err(reason) => {
                 out += &format!("FS[{slot}] {name:<18} [SKIP: {reason}]\n");
                 continue;
@@ -649,7 +656,10 @@ pub fn probe_jointk_scenes(
             saved.as_ref(),
             // No headroom trade on this dev arm — it runs the jobs verbatim.
             None,
+            // No base isolation on this dev arm either — `build_scene_jobs` never sets it.
+            &[],
             |_, _| {},
+            |_| {}, // B6: this probe has no progress channel to caption
             || false,
         ) {
             Ok(outcomes) => {
@@ -711,6 +721,7 @@ pub fn probe_redistribute(
         restore_scene,
         saved.as_ref(),
         |_, _| {},
+        |_| {}, // B6: this probe has no progress channel to caption
         || false,
     ) {
         Ok(outcomes) => {

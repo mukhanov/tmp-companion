@@ -28,11 +28,11 @@ pub(crate) struct FootswitchLevelJob {
     /// A footswitch does not sound the same in every scene — the scene's overlay decides which
     /// blocks the switch is layered on top of, and (for the headroom trade) whether the sound
     /// is pinned by its own `outputLevel` overlay or inherits base's. The UI picks this with
-    /// [`footswitch::scene_contexts_for_switches`]: exactly ONE scene enabling the switch
-    /// preselects that scene,
-    /// anything else falls back to base. A user override to a NON-enabling scene is allowed —
-    /// it is a real sound, just not one the pedalboard reaches by tapping that switch there —
-    /// and the picker flags it.
+    /// [`footswitch::scene_contexts_for_switches`]: any scene enabling the switch preselects the
+    /// FIRST such scene (issue 4 — a switch enabled by several scenes no longer falls back to
+    /// base), and only zero enabling scenes falls back to base. A user override to a
+    /// NON-enabling scene is allowed — it is a real sound, just not one the pedalboard reaches
+    /// by tapping that switch there — and the picker flags it.
     #[serde(default)]
     pub(crate) scene_context: Option<u32>,
 }
@@ -163,22 +163,25 @@ pub(crate) fn resolve_footswitch_job(
     Ok((value_b, spec))
 }
 
+/// Every section [`footswitch::scene_contexts_for_switches`] dereferences — `ftsw` sizes the
+/// row list, `scenes` carries the answer (see `the_scene_context_read_requires_every_section_
+/// its_answer_is_derived_from` for the truncation this shape exists to survive).
+const SCENE_CONTEXT_SECTIONS: &[&str] = &["ftsw", "scenes"];
+
 /// Which scenes enable each footswitch of `slot`, for the leveling wizard's SCENE-CONTEXT
 /// picker (D3). PURE apart from ONE field-8 read: every answer comes out of the saved document,
 /// so no scene is recalled on the unit and nothing is measured.
 ///
-/// The frontend preselects [`footswitch::FsSceneContext::suggested`] — the single enabling
-/// scene when there is exactly one, else base — and sends the user's final choice back as
-/// [`FootswitchLevelJob::scene_context`].
+/// The frontend preselects [`footswitch::FsSceneContext::suggested`] — the FIRST scene that
+/// enables this switch when at least one does, else base — and sends the user's final choice
+/// back as [`FootswitchLevelJob::scene_context`].
 #[tauri::command]
 pub(crate) async fn list_footswitch_scene_contexts(
     state: State<'_, AppState>,
     slot: u32,
 ) -> Result<Vec<footswitch::FsSceneContext>, String> {
     with_released_seize(state.session.clone(), move || {
-        // Every row of the picker comes out of `ftsw`, so a body that lost it would show
-        // the player a switch-less preset rather than an error.
-        let (preset, _, _) = read_slot_preset_complete(slot, &["ftsw"])?;
+        let (preset, _, _) = read_slot_preset_complete(slot, SCENE_CONTEXT_SECTIONS)?;
         Ok(footswitch::scene_contexts_for_switches(&preset))
     })
     .await
@@ -200,6 +203,10 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
     profile_id: Option<String>,
     on_result: tauri::ipc::Channel<FootswitchLevelProgressItem>,
 ) -> Result<Vec<leveller::FootswitchLevelResult>, String> {
+    // Gap-2 pre-run guard: refuse under a DISCARD `Scene Change Behavior` snapshot
+    // before anything touches the device — see `scene_discard_guard`'s doc
+    // (`level_scenes.rs`).
+    scene_discard_guard(crate::commands::presets::device_settings_path(&app).as_deref())?;
     let (stim_path, calibration_lufs) = resolve_stimulus_for_leveling(
         &app,
         None,
@@ -284,7 +291,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                     switch: first.switch,
                     status: "active".into(),
                     result: None,
-                    message: Some("waiting for the device to commit the previous save…".into()),
+                    message: Some(leveller::WAITING_FOR_COMMIT_MSG.into()),
                 });
             }
         }
@@ -719,6 +726,52 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // BUG→GATE (2026-09-01, HW preset 28 "Friedman HBE"): the scene-context read required
+    // only `ftsw`, and `scenes` — the section the ANSWER comes from — was left unnamed. That
+    // preset's field-8 read is cut mid-`scenes`, which `ftsw` survives, so the completeness
+    // check passed on a body with no scene overlays at all and every switch silently
+    // reported "no scene enables me" → base context for the whole preset, on a preset whose
+    // complete body was one backup read away. Reverting the const to `["ftsw"]` fails here.
+    //
+    // The assertion walks the DOCUMENT, not the const: for every section whose removal
+    // changes the answer, the const must name it. Iterating the const instead would be the
+    // blind spot that let this ship — a reverted `["ftsw"]` would loop over `ftsw` alone,
+    // find it load-bearing, and pass while `scenes` went unrequired.
+    #[test]
+    fn the_scene_context_read_requires_every_section_its_answer_is_derived_from() {
+        let complete = serde_json::json!({
+            "ftsw": [[], []],
+            "scenes": [
+                { "ftswStates": [false, true] },
+                { "ftswStates": [true, false] }
+            ]
+        });
+        let full = footswitch::scene_contexts_for_switches(&complete);
+        assert_eq!(full.len(), 2, "one row per switch");
+        assert!(
+            full.iter().any(|r| r.suggested.is_some()),
+            "fixture must have a scene-enabled switch, or blanking proves nothing"
+        );
+
+        let sections: Vec<String> = complete
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        for section in sections {
+            let mut cut = complete.clone();
+            cut.as_object_mut().expect("object").remove(&section);
+            if footswitch::scene_contexts_for_switches(&cut) != full {
+                assert!(
+                    SCENE_CONTEXT_SECTIONS.contains(&section.as_str()),
+                    "dropping `{section}` changed the answer, so the completeness check \
+                     must require it"
+                );
+            }
+        }
+    }
 
     fn preset_with_lev_param(value: f64) -> serde_json::Value {
         serde_json::json!({

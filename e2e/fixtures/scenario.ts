@@ -1,7 +1,7 @@
 import { expect, type Page } from "@playwright/test";
 
 // Shared scenario setup for the dual-mode specs. The working presets live at slots
-// 400-409 (the high scratch zone, clear of the user's real presets) and are the SAME
+// 400-410 (the high scratch zone, clear of the user's real presets) and are the SAME
 // fixed presets in both modes (deterministic — same blocks every run, validated against).
 // OFFLINE they are baked into the backup fixture + the startup snapshot, so `ensureScenario`
 // finds them and skips. ONLINE they start empty, so `ensureScenario` imports the identical
@@ -15,8 +15,18 @@ export interface Preset {
   slot: number;
 }
 
+/** A leveling candidate block, as `list_level_blocks` reports it — shared by every leveling
+ *  spec that reads a block back directly (the online Friedman/Plumes arcs, the Preset24
+ *  lazy-commit gap test). */
+export interface LevelBlock {
+  group_id: string;
+  node_id: string;
+  parameter_id: string;
+  value: number;
+}
+
 // Role-based names (not slot numbers): the device stores these at userSlot = listIndex + 1
-// (401/402/.../410), so a slot-numbered name would read off-by-one in the backup view.
+// (401/402/.../411), so a slot-numbered name would read off-by-one in the backup view.
 // WHICH USE CASE EACH FIXTURE CARRIES: e2e/fixtures/COVERAGE.md (the matrix), pinned by
 // `fixture_gates` in src-tauri/src/lib.rs. In brief — Rig: scene overlays, footswitch classes
 // and the two Doctor damage signatures; Pedalboard: scene-free, the Copy source, EXP + link
@@ -24,12 +34,18 @@ export interface Preset {
 // oracle and the off-USB lane, plus (P4-C) a `shared_write_is_scene_local` Boost/Solo
 // anatomy — bypassed in base, un-bypassed ONLY by scene 3 "Solo"; Parallel: both lane amps live (joint-k / rebalance);
 // Hiwatt 3S: a VERBATIM device export (the scene-conformance oracle — do not edit);
-// Preset24: the stale-load / saturated-pedal footswitch fixture (level-fs-preset24.spec.ts).
-// P3 additions (ADDITIONS, not replacements — 404/405 stay untouched): Combined Level: the
-// new-flow leveling fixture (FS-alone, scene-alone "BASE SCENE", scene-that-enables-an-FS,
-// parallel Deluxe Reverb + Marshall Plexi, a post-cab compressor). Doctor Oracle: 14
-// mixed-shape footswitches, one per Doctor spectral check, all bypassed in base. Preset24
-// Min / Hiwatt Min: the smallest presets still reproducing each incident's own bug class.
+// Preset24: the stale-load / saturated-pedal footswitch fixture (level-fs-preset24.spec.ts),
+// amended for the Plumes leveling regression (presetLevel 0.27, Twin outputLevel 0.28, Rat
+// base-ON at 0.62 — see COVERAGE.md and scenario-loudness.json's own "405" comment).
+// P3 additions (ADDITIONS, not replacements — 404/405 stay untouched structurally by P3):
+// Combined Level: the new-flow leveling fixture (FS-alone, scene-alone "BASE SCENE",
+// scene-that-enables-an-FS, parallel Deluxe Reverb + Marshall Plexi, a post-cab compressor).
+// Doctor Oracle: 14 mixed-shape footswitches, one per Doctor spectral check, all bypassed in
+// base. Preset24 Min / Hiwatt Min: the smallest presets still reproducing each incident's own
+// bug class. Friedman 3S (P4, slot 410): a 3-FULL-overlay-scene (Rhythm/Lead/Base Scene)
+// TubeScreamer->MarshallPlexi->CabSimTMS chain — the catalog-verified stand-in for a Friedman
+// HBE-class 3-scene preset (no such amp is cataloged; MarshallPlexi is the closest high-gain
+// British-voiced substitute).
 export const SCENARIO: Preset[] = [
   { slot: 400, name: "E2E Rig" },
   { slot: 401, name: "E2E Pedalboard" },
@@ -41,6 +57,7 @@ export const SCENARIO: Preset[] = [
   { slot: 407, name: "E2E Doctor Oracle" },
   { slot: 408, name: "E2E Preset24 Min" },
   { slot: 409, name: "E2E Hiwatt Min" },
+  { slot: 410, name: "E2E Friedman 3S" },
 ];
 
 export async function invoke(
@@ -115,11 +132,17 @@ export async function openLevel(page: Page): Promise<void> {
   });
 }
 
+/** The Base row's stable identity, mirroring `setupRowHookKey`'s `baseKey(slot)`
+ *  (`leveling.ts`) — the `Pick`'s `tid` for a Base row's target picker is
+ *  `target:${baseRowKey(slot)}`, unique per preset regardless of how many other
+ *  rows (scenes/footswitches) that preset also has selected. */
+export const baseRowKey = (slot: number): string => `p${String(slot)}`;
+
 /** Select ONLY a preset's Base row (never its scenes/footswitches) — expand the caret, then
- *  tick the "Base Preset" child row alone. Every scenario fixture now carries children, so the
- *  top-level whole-preset checkbox is no longer "Base only" for any of them — this helper is
- *  what keeps a base-clamp test isolated to exactly one selected row (one
- *  `data-pick="target:NAME"]` element, no strict-mode collision). */
+ *  tick the "Base Preset" child row alone. Kept even though the target picker no longer
+ *  collides across a preset's other rows (each row now has its own `target:<rowKey>`
+ *  selector) — this still isolates a base-clamp test to exactly the one row it means to
+ *  drive. */
 export async function selectBaseOnly(page: Page, name: string): Promise<void> {
   const filter = page.getByPlaceholder(/Filter by name or slot/i);
   await filter.fill(name);
@@ -131,22 +154,39 @@ export async function selectBaseOnly(page: Page, name: string): Promise<void> {
   await filter.fill("");
 }
 
-/** Pick a per-preset target by its option id ("Rhythm"/"Crunch"/"Lead") on a Base-only
- *  selection. Uses `data-pick-option="target:<name>:<id>"` (Pick.tsx) rather than the
- *  option's TEXT — a text-based `getByText(label,{exact:true}).last()` proved unreliable
- *  once a SECOND preset's picker opens while an earlier preset is already bound to the same
- *  label: Playwright's own actionability wait ("visible, enabled, stable" all pass) still
- *  hung on click, retried hundreds of times, and eventually timed out with "<div></div>
- *  subtree intercepts pointer events" — `.last()`'s re-resolved match apparently isn't a
- *  stable target across retries. The attribute selector is unique per (row, option) pair by
- *  construction, so there is never more than one match to begin with. */
+/** Design 1a auto-opens only the LOWEST-slot preset group in Set up (`useGroupOpen`,
+ *  `SetupPage.tsx`'s `groups[0]`) — every other selected preset's row starts collapsed,
+ *  so its sound rows (and their `data-pick="target:<rowKey>"` triggers) aren't in the DOM
+ *  yet. Click the group header (`data-preset-group={slot}`, `PresetGroupRow.tsx`) to
+ *  expand it before targeting a row inside. A no-op if the group is already open. */
+export async function ensurePresetGroupOpen(
+  page: Page,
+  slot: number,
+): Promise<void> {
+  const trigger = page.locator(`[data-pick="target:${baseRowKey(slot)}"]`);
+  if (!(await trigger.isVisible().catch(() => false))) {
+    await page.locator(`[data-preset-group="${String(slot)}"]`).click();
+  }
+}
+
+/** Pick a Base row's target by its option id ("Rhythm"/"Crunch"/"Lead"). Uses
+ *  `data-pick-option="target:<rowKey>:<id>"` (`Pick.tsx`, keyed by `setupRowHookKey` —
+ *  `leveling.ts`) rather than the option's TEXT — a text-based
+ *  `getByText(label,{exact:true}).last()` proved unreliable once a SECOND preset's picker
+ *  opens while an earlier preset is already bound to the same label: Playwright's own
+ *  actionability wait ("visible, enabled, stable" all pass) still hung on click, retried
+ *  hundreds of times, and eventually timed out with "<div></div> subtree intercepts pointer
+ *  events" — `.last()`'s re-resolved match apparently isn't a stable target across retries.
+ *  The attribute selector is unique per (row, option) pair by construction, so there is
+ *  never more than one match to begin with. */
 export async function pickBaseTarget(
   page: Page,
-  name: string,
+  slot: number,
   label: string,
 ): Promise<void> {
-  await page.locator(`[data-pick="target:${name}"]`).click();
-  await page.locator(`[data-pick-option="target:${name}:${label}"]`).click();
+  const key = baseRowKey(slot);
+  await page.locator(`[data-pick="target:${key}"]`).click();
+  await page.locator(`[data-pick-option="target:${key}:${label}"]`).click();
 }
 
 /** Drive the Level wizard's Base flow end to end for one or more presets: select each
@@ -166,17 +206,18 @@ export async function runBaseLevel(
     .click();
   await page.getByText(/I.ve backed up with Pro Control/i).click();
   for (const { preset, label } of targets) {
-    await pickBaseTarget(page, preset.name, label);
+    await ensurePresetGroupOpen(page, preset.slot);
+    await pickBaseTarget(page, preset.slot, label);
   }
   // The picks must actually BIND — assert each row's trigger now reads its target (guards
   // a silent display-vs-value no-op an always-solving fake re-amp would otherwise hide).
   for (const { preset, label } of targets) {
     await expect(
-      page.locator(`[data-pick="target:${preset.name}"]`),
+      page.locator(`[data-pick="target:${baseRowKey(preset.slot)}"]`),
     ).toContainText(label);
   }
   await page
-    .getByRole("button", { name: new RegExp(`Level ${n} sound`) })
+    .getByRole("button", { name: new RegExp(`Start.*${n} sound`) })
     .click();
   await expect(
     page.getByRole("button", { name: /^(Done|Accept)$/ }),

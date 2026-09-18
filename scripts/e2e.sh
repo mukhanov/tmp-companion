@@ -108,14 +108,18 @@ VALIDATE_WAV_DIR="$LOG_DIR/level-validate-wavs"
 # server already spent writing it — generous on purpose, but a POLICY rather than an
 # accident: a runaway spec must announce that rows were dropped, not silently truncate.
 VALIDATE_MAX_ROWS="${TMP_E2E_VALIDATE_MAX_ROWS:-40}"
-# Row-count FLOOR for the strict lane. `level.online.spec.ts`'s strict arc (formerly
-# level-strict.spec.ts, absorbed into it — ONLINE e2e consolidation) re-measures exactly
-# nine sounds from the saved state — 1 base + 4 scenes (`for scene of [0,1,2,3]`) + 4
-# footswitches (`SWITCH_JOBS`) — and each one is supposed to append a row here. Anything
-# short means re-measures died before their capture, which emits NO row at all: the judge
-# can only grade what it is handed, so a truncated log used to sail through as "fewer rows,
-# all green". Keep in step with that spec if its sound set ever changes.
-VALIDATE_STRICT_MIN_ROWS=9
+# Exact row count for the strict lane, READ FROM THE SPEC so there is one source of truth and
+# nothing to keep in step by hand. Compared by EQUALITY: short means a re-measure died before
+# its capture (it emits no row, and the judge grades only what it is handed — how a truncated
+# log used to sail through as "fewer rows, all green"); long means an unbudgeted sound.
+VALIDATE_SPEC_FILE="$REPO/e2e/specs/level.online.spec.ts"
+VALIDATE_STRICT_ROWS="$(grep -c '^// STRICT_VALIDATE_ROWS=' "$VALIDATE_SPEC_FILE" 2>/dev/null || echo 0)"
+if [ "$VALIDATE_STRICT_ROWS" != "1" ]; then
+  printf '\033[31m✗ expected ONE STRICT_VALIDATE_ROWS marker line in %s, found %s\033[0m\n' \
+    "$VALIDATE_SPEC_FILE" "$VALIDATE_STRICT_ROWS" >&2
+  exit 2
+fi
+VALIDATE_STRICT_ROWS="$(sed -n 's|^// STRICT_VALIDATE_ROWS=\([0-9][0-9]*\)$|\1|p' "$VALIDATE_SPEC_FILE")"
 # The validation tolerance the JUDGE will use, PINNED for this lane. `level-validate.sh`
 # reads TMP_E2E_LEVEL_TOL_LU as its default tolerance, so an ambient export of, say, 50
 # would make every row pass by arithmetic — a rubber stamp wearing a gate's clothes. The
@@ -567,8 +571,60 @@ if [ "$MODE" = soak ]; then
   exit $(( fail_total > 0 ))
 fi
 
+# ── Scene Change Behavior pre-flight (gap 2) ────────────────────────────────────
+# `level.online` drives the DEFERRED-WRITE leveling lanes (`level_scenes_apply_batched`,
+# `level_footswitches_apply`), and `scene_discard_guard` refuses those outright when the
+# device's global Scene Change Behavior reads DISCARD CHANGES. Unchecked, that refusal
+# lands ~13 min into the run — after doctor.online has already spent its 8 — and takes
+# level.online's other three tests down with it (`describe.serial`). Seconds here instead.
+#
+# The snapshot must be REFRESHED, not merely read. It is written by a backup scan, so a
+# run that aborted on a stale DISCARD file would never rewrite it: the user could fix the
+# touchscreen setting, replug, and still be refused forever. `read_library_via_backup` is
+# the read that persists it (read-only on the device, ~20 s), and the verdict comes back
+# as a SERVER LOG line rather than a file this script would have to find — that path is
+# `app_config_dir()`-derived, so it varies by OS and bundle identifier. The line is
+# emitted by `commands::presets::persist_device_settings`; its three verdict words are a
+# contract with this function.
+#
+# Advisory on its own failure: a backup read that doesn't land leaves the real in-run
+# guard as the backstop, which is exactly today's behaviour. Only a positively-read
+# DISCARD stops the run.
+scene_change_preflight() {
+  log "pre-flight: refreshing the device settings snapshot (Scene Change Behavior)…"
+  if ! bridge_post '{"cmd":"read_library_via_backup","args":{}}' 180 | grep -q '"ok":true'; then
+    err "pre-flight: device backup read failed — skipping the Scene Change Behavior check"
+    return 0
+  fi
+  # LAST occurrence only: the log accumulates, and the refresh above is the current truth.
+  case "$(grep -o 'sceneChangeBehavior=[A-Za-z]*' "$SERVER_LOG" | tail -1)" in
+    *=DISCARD)
+      err "this device's Scene Change Behavior is set to DISCARD CHANGES."
+      err "  level.online drives the deferred-write leveling lanes, which refuse under it:"
+      err "  they accumulate UNSAVED scene edits across recalls and save once at the end,"
+      err "  and DISCARD silently reverts each edit on every recall."
+      err "  On the unit's touchscreen set SETTINGS -> Scene Change Behavior ->"
+      err "  MAINTAIN CHANGES, then unplug and replug the USB cable and rerun."
+      return 1 ;;
+    *=MAINTAIN) log "pre-flight: Scene Change Behavior is MAINTAIN — proceeding" ;;
+    *) log "pre-flight: Scene Change Behavior unreadable — proceeding (the in-run guard still applies)" ;;
+  esac
+  return 0
+}
+
 log "ONLINE e2e (real device) — seeding the scenario presets before the server starts"
 start_online_server
+
+# Only the deferred-write lanes are affected, so `scripts/e2e.sh online songs` (or copy,
+# or doctor.online) keeps running fine on a DISCARD unit — don't spend a backup read, or
+# refuse a legitimate run, for a spec set that never touches them.
+needs_scene_preflight=0
+for s in "${SPECS[@]:-}"; do
+  [ "$s" = "level.online" ] && needs_scene_preflight=1
+done
+if [ "$needs_scene_preflight" -eq 1 ]; then
+  scene_change_preflight || exit 1
+fi
 
 # Snapshot the tree KEY now, covering the whole ~40-min spec + validation window below
 # (seeding/server start are device work, not tracked-file work, so starting the window
@@ -649,20 +705,17 @@ if [ "$fail" -eq 0 ]; then
     if [ -s "$VALIDATE_LOG" ]; then
       rows="$(grep -c . "$VALIDATE_LOG" 2>/dev/null || echo 0)"
     fi
-    # ROW FLOOR — the false-green this branch used to be. "No rows emitted" was logged and
+    # ROW COUNT — the false-green this branch used to be. "No rows emitted" was logged and
     # passed over unconditionally, which is only honest when nothing in the run was
-    # SUPPOSED to emit any. When level.online's strict arc ran, nine rows were promised
-    # (see VALIDATE_STRICT_MIN_ROWS at the top of this file); zero — or four — means
-    # captures died before they could be recorded and the judge silently graded a subset.
-    # The floor only applies when that spec actually ran, so `scripts/e2e.sh online songs`
-    # keeps its legitimate skip, as does an ffmpeg-less box (handled above).
+    # SUPPOSED to emit any (see VALIDATE_STRICT_ROWS at the top of this file). Only applies
+    # when that spec ran, so `scripts/e2e.sh online songs` keeps its legitimate skip.
     ran_strict=0
     for s in "${SPECS[@]:-}"; do
       [ "$s" = "level.online" ] && ran_strict=1
     done
-    if [ "$ran_strict" -eq 1 ] && [ "$rows" -lt "$VALIDATE_STRICT_MIN_ROWS" ]; then
-      err "external validation ROW FLOOR: level.online's strict arc ran but only $rows expectation row(s) were emitted, expected at least $VALIDATE_STRICT_MIN_ROWS (1 base + 4 scenes + 4 footswitches)"
-      err "  → $((VALIDATE_STRICT_MIN_ROWS - rows)) sound(s) were never independently measured; a re-measure died before its capture. See $SERVER_LOG"
+    if [ "$ran_strict" -eq 1 ] && [ "$rows" -ne "$VALIDATE_STRICT_ROWS" ]; then
+      err "external validation ROW COUNT: level.online ran but $rows expectation row(s) were emitted, expected exactly $VALIDATE_STRICT_ROWS (level.online.spec.ts's own STRICT_VALIDATE_ROWS)"
+      err "  → too few: a sound was never independently measured. Too many: an unbudgeted row. See $SERVER_LOG"
       fail=1
     fi
     if [ "$rows" -eq 0 ]; then

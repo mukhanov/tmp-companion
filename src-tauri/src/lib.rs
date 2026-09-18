@@ -96,10 +96,10 @@ pub(crate) use probe_api::scene_bench::knob_bounds;
 // same extraction, so the only remaining callers resolve them directly, module-internally —
 // re-exporting an unused name here is a dead `pub(crate) use`, caught by `-D warnings`.
 pub(crate) use probe_api::scene_jobs::{
-    base_handle_candidates_scanned, build_scene_jobs, build_scene_jobs_with_handles,
-    is_amp_model_id, is_amp_output_level_param, last_loaded_scene, prepass_scene_docs_via,
-    read_saved_preset, read_saved_preset_complete, scan_node_graph, scene_handle_rows,
-    scene_handle_rows_scanned, scene_overlay, scene_write_verdict_for_param, scenes_restating_base,
+    base_handle_candidates_scanned, build_scene_jobs_with_handles, is_amp_model_id,
+    is_amp_output_level_param, last_loaded_scene, prepass_scene_docs_via, read_saved_preset,
+    read_saved_preset_complete, scan_node_graph, scene_handle_rows, scene_handle_rows_scanned,
+    scene_overlay, scene_write_verdict_for_param, scenes_restating_base,
     warn_missing_restore_scene, SceneHandleSpec, SceneOverlay, SceneWriteVerdict,
 };
 // `pub`, not `pub(crate)`: `backup_read::BackupPresetRow.scene_handles`/`.base_handles` (both
@@ -263,9 +263,10 @@ mod fixture_gates {
             .collect();
         assert_eq!(
             out.len(),
-            10,
-            "the scenario set is ten presets at 400-409 (400-405 the original set, \
-             406-409 the P3 leveling-doctor-fixtures additions)"
+            11,
+            "the scenario set is eleven presets at 400-410 (400-405 the original set, \
+             406-409 the P3 leveling-doctor-fixtures additions, 410 the P4 Friedman-HBE-class \
+             3-scene addition)"
         );
         out
     }
@@ -427,7 +428,9 @@ mod fixture_gates {
     #[test]
     fn e2e_fixtures_stay_inside_the_field8_read_budget() {
         const BUDGET: usize = 16 * 1024;
-        const HIWATT_BYTES: usize = 20_012;
+        // Includes the one byte the #r10 FIXTURE_SOURCE_STAMP costs over #r9 in this
+        // fixture's own `info.source_id` — the stamp growing, not an edit to its substance.
+        const HIWATT_BYTES: usize = 20_013;
         for (idx, name, js, _) in fixtures() {
             if name == "E2E Hiwatt 3S" {
                 assert_eq!(
@@ -793,9 +796,7 @@ mod fixture_gates {
                     "ACD_Boost",
                     "gain",
                 ),
-                crate::probe_api::scene_jobs::SceneWriteVerdict::WriteDirect {
-                    lands_on_base: true
-                }
+                crate::probe_api::scene_jobs::SceneWriteVerdict::WriteDirect
             ),
             "scene 3 'Solo': a scene-scoped write of ACD_Boost.gain must be allowed through \
              as a scene-local base write, not refused as shared_with_base"
@@ -828,8 +829,11 @@ mod fixture_gates {
     /// pinned by the size gate above); 405's amendment must not have disturbed the
     /// lazy-save incident's own shape: the four drive pedals, their block-acting
     /// switches and the amp node are all untouched, and only a cab was appended.
+    ///
+    /// Pins the CURRENT measurement shapes a leveling spec depends on (405's amp/pedal knobs,
+    /// the C table, `leveledParams`) — not immutability; 405's values may be amended again.
     #[test]
-    fn incident_fixtures_keep_their_shapes() {
+    fn incident_fixtures_pin_their_measurement_shapes() {
         let (name, _, hiwatt) = fixture(404);
         assert_eq!(name, "E2E Hiwatt 3S");
         assert_eq!(hiwatt["lastLoadedScene"], 3, "the saved non-base context");
@@ -854,14 +858,81 @@ mod fixture_gates {
                 "ACD_CabSimTMS", // appended for the cab rule; nothing upstream moved
             ]
         );
+        // BUG→GATE: each of 405's four drive pedals must author the parameter NAME the
+        // real hardware actually exposes for that block. HW-confirmed from a field-8 read
+        // of the user's own real "Plumes+BD2+OCD" preset (2026-08-31): the block's
+        // parameters read `blend, bypass, bypassType, drive, filter, tone, volume` — there
+        // is NO `level`. `ACD_Plumes` and `ACD_BluesDriver` do carry `level` in that same
+        // read, and `ACD_Rat` carries `volume`, so `ACD_ObsessiveDrive` is the odd one out
+        // despite superficially matching its Plumes/BluesDriver siblings. A fixture that
+        // declares a parameter name the block does not have is INVISIBLE offline: the
+        // sim's saturated-pedal model (`sim_device.rs::saturated_pedal_lufs`) keys
+        // `leveledParams` purely by whatever name the fixture declares, so an offline run
+        // stays self-consistent regardless of whether that name exists on the device.
+        // Online, a write to a nonexistent parameter reaches the device, the capture never
+        // responds, and the solver's flat-response branch clamps the row at zero — this is
+        // exactly how the `ACD_ObsessiveDrive` "level" mistake was caught (footswitch 7's
+        // row clamped to 0.0 while its siblings converged normally).
+        for (node, param) in [
+            ("ACD_Plumes", "level"),
+            ("ACD_BluesDriver", "level"),
+            ("ACD_ObsessiveDrive", "volume"),
+            ("ACD_Rat", "volume"),
+        ] {
+            let node_json = p24["audioGraph"]["guitarNodes"]["G1"]
+                .as_array()
+                .expect("G1")
+                .iter()
+                .find(|n| n["FenderId"].as_str() == Some(node))
+                .unwrap_or_else(|| panic!("405 has no {node} node"));
+            assert!(
+                node_json["dspUnitParameters"].get(param).is_some(),
+                "405's {node} must author a {param:?} dspUnitParameter — HW-confirmed \
+                 from a field-8 read of the real device; a wrong name here is invisible \
+                 offline (see comment above)"
+            );
+            // And ONLY that one: a node carrying both names would satisfy the presence
+            // check above while still shipping a parameter the block does not have, which
+            // is the same invisible-offline defect in a form the presence check misses.
+            let wrong = if param == "level" { "volume" } else { "level" };
+            assert!(
+                node_json["dspUnitParameters"].get(wrong).is_none(),
+                "405's {node} must NOT author a {wrong:?} dspUnitParameter — the real \
+                 block has no such control"
+            );
+        }
+        // Plumes-regression amendment: the amp's outputLevel and the preset's own
+        // presetLevel both moved (0.28/0.27, from 1.0/1.0) and both are now baked into
+        // scenario-loudness.json's "405" C — a drift here silently invalidates that C.
         assert_eq!(
-            p24["audioGraph"]["guitarNodes"]["G1"][4]["dspUnitParameters"]["outputLevel"], 1.0,
-            "the saturated amp's own knob is untouched — the offline C table and the \
-             `leveledParams` pedal curve both key off it"
+            p24["audioGraph"]["guitarNodes"]["G1"][4]["dspUnitParameters"]["outputLevel"], 0.28,
+            "the saturated amp's own knob — the offline C table and the `leveledParams` \
+             pedal curve both key off it"
+        );
+        assert_eq!(
+            p24["audioGraph"]["presetLevel"], 0.27,
+            "the preset's own presetLevel — every capture's PT term keys off it"
+        );
+        assert_eq!(
+            p24["audioGraph"]["guitarNodes"]["G1"][3]["dspUnitParameters"]["bypass"], false,
+            "Rat is now base-ON (was true) — the fixture's second measurement regime, \
+             isolated to Rat's own footswitch capture"
         );
         assert!(p24["scenes"].as_array().expect("scenes").is_empty());
         let fs = crate::footswitch::enumerate_block_footswitches(&p24["ftsw"], &p24);
         assert_eq!(fs.len(), 4, "the four drive-pedal switches (ftsw 5-8)");
+
+        let (name, _, friedman) = fixture(410);
+        assert_eq!(name, "E2E Friedman 3S");
+        assert_eq!(
+            friedman["audioGraph"]["guitarNodes"]["G1"][1]["dspUnitParameters"]["outputLevel"], 1.0,
+            "the base amp's outputLevel stays at 1.0 — load-bearing so a base capture is \
+             never boosted and the fader is never written outside a scene job"
+        );
+        assert_eq!(
+            friedman["lastLoadedScene"], 1,
+            "loads into Lead, not base — the ≠-base premise this fixture exists for"
+        );
     }
 
     /// A node's `dspUnitParameters.bypass`, by nodeId, walked from `p`'s base graph via
@@ -1297,7 +1368,8 @@ mod fixture_gates {
         );
         assert_eq!(
             p408["audioGraph"]["guitarNodes"]["G1"][1]["dspUnitParameters"]["outputLevel"], 1.0,
-            "the saturated amp's own knob stays untouched, same as 405"
+            "the saturated amp's own knob stays untouched — 408 is its own minimal fixture, \
+             unaffected by 405's Plumes-regression amendment (see `incident_fixtures_pin_their_measurement_shapes`)"
         );
 
         // 409 "E2E Hiwatt Min" — the scene/overlay-conformance class needs only a
@@ -1415,13 +1487,17 @@ mod fixture_gates {
     /// fixture the same defect class can hide in.
     ///
     /// `backup_read::tests::scenario_fixture_matches_scenario_presets_json` (the
-    /// drift lock between this file and `scenario-presets.json`) does NOT catch a
-    /// stale `product_id`/`preset_id`: it compares decoded `BackupPresetRow`s, and
-    /// that struct never carries either field, so two archives that disagree on
-    /// them still compare equal. This test reads the raw `presetJson` column
-    /// directly (mirroring `backup_read::read_backup_archive`'s own LZ4-frame +
-    /// tar + `sqlite3` decode) instead of going through `BackupPresetRow`, so the
-    /// two fields the drift lock is blind to are actually checked.
+    /// drift lock between this file and `scenario-presets.json`) is now only HALF
+    /// blind: it compares decoded `BackupPresetRow`s, and that struct has carried
+    /// `preset_id` since #155, so a stale `preset_id` now fails that equality
+    /// compare. It stays blind to `product_id` — that field never made it onto the
+    /// struct — and even for `preset_id` an equality compare can't check the things
+    /// this raw-bytes gate exists for: that every `preset_id` is non-empty and that
+    /// no two presets in the fixture share one. This test reads the raw `presetJson`
+    /// column directly (mirroring `backup_read::read_backup_archive`'s own
+    /// LZ4-frame + tar + `sqlite3` decode) instead of going through
+    /// `BackupPresetRow`, so `product_id` drift and `preset_id`
+    /// uniqueness/non-emptiness are both actually checked.
     #[test]
     fn backup_fixture_uses_device_product_id_and_unique_preset_ids() {
         use std::io::Read;
@@ -1703,7 +1779,9 @@ mod fixture_gates {
         // different amp state than the physical footswitch tap; see `danger.md`'s
         // OPEN scene-0 item); 407 "E2E Doctor Oracle" carries 2 (SCRATCH filler + the
         // scene-consistency oracle's own big-outputLevel-jump scene); 409
-        // "E2E Hiwatt Min" carries 2 (the minimal scene/overlay-conformance repro).
+        // "E2E Hiwatt Min" carries 2 (the minimal scene/overlay-conformance repro). 410
+        // "E2E Friedman 3S" (P4) carries 3, all judged FULL-overlay rows: Rhythm/Lead/
+        // Base Scene, each carrying only its own amp outputLevel overlay.
         let expected_scenes: std::collections::HashMap<u32, usize> = [
             (400u32, 4usize),
             (402, 8),
@@ -1712,6 +1790,7 @@ mod fixture_gates {
             (406, 3),
             (407, 2),
             (409, 2),
+            (410, 3),
         ]
         .into_iter()
         .collect();

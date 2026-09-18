@@ -441,6 +441,13 @@ pub fn probe_held_reengage(
 /// a reference level, solve the linear model for the exact `presetLevel` that
 /// hits `target_lufs`, set it, and (if `save`) persist. Optionally re-measures
 /// on a second fresh connection to confirm. Re-amp is always restored OFF.
+///
+/// Base isolation matches production's Base leveling arm — every footswitch-owned on-off
+/// block forced OFF via the shared `base_isolation_or_refuse`, so an unreadable/truncated
+/// `ftsw` REFUSES rather than measuring a guess. Measuring base as SAVED instead diverges by
+/// whatever the preset's engaged pedals add (2026-08-31 bisect: C=-11.95 vs production's
+/// C≈-28.2 on "Plumes+BD2+OCD"), which is what made this arm useless for cross-checking a
+/// base-clamp regression against production.
 pub fn probe_level_preset(
     slot: u32,
     target_lufs: f64,
@@ -460,15 +467,14 @@ pub fn probe_level_preset(
         verify,
         ..Default::default()
     };
-    // A saving run must re-stamp the preset's original `lastLoadedScene` (the base-context
-    // measurement leaves base active at save time); a dry run never saves, so skip the read.
-    if save {
-        opts.restore_scene =
-            crate::read_saved_preset(slot).and_then(|doc| crate::last_loaded_scene(&doc));
-        std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
-    }
-    // probe = raw benchmark behavior: no idempotency skip, always measure+apply+save.
-    let result = leveller::level_preset(slot, &stim, target_lufs, opts, &[], None, || false);
+    // `read_base_isolation` owns the read, the refusal and the HID gap the leveller's first
+    // connect needs.
+    let (_, _, force, restore_scene) = crate::commands::doctor::read_base_isolation(slot)?;
+    opts.restore_scene = restore_scene;
+    // probe stays skip-free: NO `previous_level` idempotency skip (production treats a
+    // matching saved level as a no-op and reloads without writing) — don't cargo-cult that
+    // skip in here. This is a raw benchmark: always measure+apply+save.
+    let result = leveller::level_preset(slot, &stim, target_lufs, opts, &force, None, || false);
     // Run-end backstop, success or failure (see `reamp_off_guaranteed`: the
     // device drops an in-session OFF sent after ~1 s of idle — every capture).
     leveller::reamp_off_guaranteed("probe --levelpreset");

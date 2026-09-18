@@ -19,8 +19,8 @@
 #   4. levels the base (`probe --levelpreset … save`), optionally the FS scenes
 #      (`probe --level-preset-scenes`) and optionally block-acting footswitches
 #      (`probe --level-footswitch … --commit`);
-#   5. WAITS OUT THE COMMIT WINDOW (see COMMIT_WINDOW_WAIT below) — mandatory, not
-#      politeness;
+#   5. WAITS OUT THE COMMIT WINDOW (see COMMIT_WINDOW_WAIT below) after every save
+#      and before the next load — mandatory, not politeness;
 #   6. re-measures each leveled foundation, EMITTING one expectation row + WAV per sound:
 #      base/scenes via `probe --measure-scene … --target … --dump-wav`, footswitches via
 #      `probe --measure-footswitch … --target … --dump-wav` (P5 closed that hole; FS rows
@@ -40,7 +40,9 @@
 # `probe` invocation is a FRESH PROCESS whose `SLOT_SAVE_REGISTRY` is empty, so it has
 # nothing to wait on and would happily load stale bytes. Every re-measure in step 6
 # begins with a load, so without this wait the whole validation reads the PRE-leveling
-# preset and fails a perfectly correct run. The script waits once, after the last save.
+# preset and fails a perfectly correct run. The script waits before EVERY load that
+# follows a save — each leveling step below loads the slot — and once more before the
+# re-measures.
 #
 # Which probe flags this script uses: `--fw` (connect check), `--import-file`
 # (occupied-target-safe import), `--slot-json` (non-destructive confirm read), `--fs-list`
@@ -81,8 +83,8 @@
 #   --no-clear                leave the imported preset in the slot instead of clearing it
 #
 # Exit: 0 = every row PASSed or SKIPped, with at least one row actually MEASURED · 1 = a
-#       leveling step failed, a row FAILed, or an expectation row was never emitted
-#       (MISSING) · 2 = usage/precondition error · 3 = validation SKIPPED (ffmpeg absent —
+#       leveling step failed, a row FAILed or CLAMPED, or an expectation row was never
+#       emitted (MISSING) · 2 = usage/precondition error · 3 = validation SKIPPED (ffmpeg absent —
 #       nothing was independently checked; the leveling itself still ran) · 4 = validation
 #       VACUOUS (every emitted row was clamped/persist-mismatched — nothing was
 #       independently verified; the leveling itself still ran and is saved).
@@ -106,7 +108,7 @@ err()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; }
 # ── SCRATCH_SLOTS mirror (`src-tauri/src/probe_api/mod.rs`) — the ONE declaration every
 # destructive/working-copy-writing probe guard checks; this script must never touch a slot
 # outside it. If that Rust constant ever widens, update this line in the SAME commit. ──
-SCRATCH_SLOTS="400 401 402 403 404 405 406 407 408 409"
+SCRATCH_SLOTS="400 401 402 403 404 405 406 407 408 409 410"
 BASE_SCENE_SLOT=8   # session::BASE_SCENE_SLOT — the wire scene-slot sentinel for "base"
 
 # The lazy-save commit window, in seconds. Mirrors `leveller::COMMIT_WINDOW_SECS` (150),
@@ -114,6 +116,13 @@ BASE_SCENE_SLOT=8   # session::BASE_SCENE_SLOT — the wire scene-slot sentinel 
 # script's header and `.claude/rules/danger.md`'s lazy-commit entry. A fresh `probe`
 # process cannot consult the in-process save registry, so this wait IS the barrier.
 COMMIT_WINDOW_WAIT=150
+PENDING_SAVE=0
+settle_commit() {
+  [ "$PENDING_SAVE" -eq 1 ] || return 0
+  log "waiting ${COMMIT_WINDOW_WAIT}s for the device's LAZY save commit before the next load…"
+  sleep "$COMMIT_WINDOW_WAIT"
+  PENDING_SAVE=0
+}
 
 # Print the file's own comment header as the help text. The range ends at the last line
 # before `set -euo pipefail`, found at runtime so an edit to the header can never leave
@@ -296,9 +305,12 @@ gap
 
 # ── 4a. level base ────────────────────────────────────────────────────────────────
 log "[4a] leveling base → $TARGET LUFS…"
-TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe --levelpreset "$SLOT" "$TARGET" save \
-  >"$OUT_DIR/level-base.log" 2>&1 \
-  || { err "base leveling failed (see $OUT_DIR/level-base.log)"; FAILED=1; }
+if TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe --levelpreset "$SLOT" "$TARGET" save \
+  >"$OUT_DIR/level-base.log" 2>&1; then
+  PENDING_SAVE=1
+else
+  err "base leveling failed (see $OUT_DIR/level-base.log)"; FAILED=1
+fi
 cat "$OUT_DIR/level-base.log"
 gap
 
@@ -308,14 +320,17 @@ gap
 if [ "$FAILED" -ne 0 ]; then
   log "[4b] skipping scene leveling — the base leveling step already failed above"
 elif [ -n "$SCENE_TARGET" ]; then
+  settle_commit
   log "[4b] leveling FS scenes → default $SCENE_TARGET LUFS (${#SCENE_OVERRIDES[@]} override(s))…"
   set -- --level-preset-scenes "$SLOT" "$SCENE_TARGET" "$TOPOLOGY" 1
   for ov in "${SCENE_OVERRIDES[@]:-}"; do
     [ -n "$ov" ] && set -- "$@" "$ov"
   done
-  TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe "$@" \
-    >"$OUT_DIR/level-scenes.log" 2>&1 \
-    || { err "scene leveling failed (see $OUT_DIR/level-scenes.log)"; FAILED=1; }
+  if TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe "$@" >"$OUT_DIR/level-scenes.log" 2>&1; then
+    PENDING_SAVE=1
+  else
+    err "scene leveling failed (see $OUT_DIR/level-scenes.log)"; FAILED=1
+  fi
   cat "$OUT_DIR/level-scenes.log"
   gap
   # Honest-count gate: the enumeration must see every scene the SOURCE preset
@@ -342,6 +357,13 @@ PY
       log "[4b] scene count check: enumerated $ENUM_SCENES == source $SRC_SCENES"
     fi
   fi
+  # A count match only proves enumeration; a SKIPped row was enumerated and never leveled,
+  # and its re-measure can still land in tolerance by luck (HW: Friedman scene 3, 2026-09-02).
+  if [ "$FAILED" -eq 0 ] && grep -q '\[SKIP:' "$OUT_DIR/level-scenes.log"; then
+    err "a scene row was SKIPped — enumerated but never leveled:"
+    grep '\[SKIP:' "$OUT_DIR/level-scenes.log" >&2
+    FAILED=1
+  fi
 else
   log "[4b] no --scene-target given — skipping scene leveling"
 fi
@@ -355,11 +377,15 @@ elif [ "${#FOOTSWITCHES[@]}" -gt 0 ]; then
     grp="${rest%%:*}"; rest="${rest#*:}"
     node="${rest%%:*}"; rest="${rest#*:}"
     param="${rest%%:*}"; fstarget="${rest#*:}"
+    settle_commit
     log "[4c] leveling footswitch $sw ($grp/$node/$param) → $fstarget LUFS…"
-    TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe \
+    if TMP_LEVELLER_STIMULUS="$STIM_PATH" run_probe \
       --level-footswitch "$SLOT" "$sw" "$grp" "$node" "$param" "$fstarget" --commit \
-      >"$OUT_DIR/level-fs-$sw.log" 2>&1 \
-      || { err "footswitch $sw leveling failed (see $OUT_DIR/level-fs-$sw.log)"; FAILED=1; }
+      >"$OUT_DIR/level-fs-$sw.log" 2>&1; then
+      PENDING_SAVE=1
+    else
+      err "footswitch $sw leveling failed (see $OUT_DIR/level-fs-$sw.log)"; FAILED=1
+    fi
     cat "$OUT_DIR/level-fs-$sw.log"
     gap
   done
@@ -369,10 +395,9 @@ fi
 
 # ── 5. THE COMMIT-WINDOW WAIT — see the WHY note in this script's header ────────────
 if [ "$FAILED" -eq 0 ]; then
-  log "[5] waiting ${COMMIT_WINDOW_WAIT}s for the device's LAZY save commit before any re-measure loads…"
-  log "    (danger.md: a same-slot load inside T+45–100s materializes the PRE-save preset,"
+  log "[5] (danger.md: a same-slot load inside T+45–100s materializes the PRE-save preset,"
   log "     and a fresh probe process has no in-process save registry to wait on)"
-  sleep "$COMMIT_WINDOW_WAIT"
+  settle_commit
   ok "commit window elapsed"
 fi
 
@@ -508,6 +533,14 @@ fi
 if [ "$MISSING" -ne 0 ]; then
   err "validate-hbe: FAIL — $MISSING expectation row(s) were never emitted; that many sounds"
   err "                     went unvalidated. Named above; per-measure logs in $OUT_DIR"
+  exit 1
+fi
+# A clamped row sits at its knob's end stop, not on a solved value: first-pass leveling means
+# no clamps, so it fails the run even when its re-measure lands in tolerance.
+CLAMPED="$(grep -h 'CLAMPED' "$OUT_DIR"/level-*.log || true)"
+if [ -n "$CLAMPED" ]; then
+  err "validate-hbe: FAIL — clamped row(s), leveled at a knob end stop, not a solved value:"
+  printf '%s\n' "$CLAMPED" >&2
   exit 1
 fi
 # Branch every known code explicitly — a SKIP or a VACUOUS pass must not read as a miss,

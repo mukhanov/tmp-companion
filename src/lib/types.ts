@@ -16,6 +16,8 @@
 export interface AppInfo {
   name: string;
   version: string;
+  /** Compile-time target OS ("macos", "linux", …) — see `hasUpdateChannel`. */
+  os: string;
 }
 
 /** Result of `save_support_bundle` (mirrors commands::support::SupportBundleResult). */
@@ -110,6 +112,16 @@ export interface LevelJob {
   block_value: number | null;
 }
 
+/** Keeps the wizard's already-force-appended BASE job alive through the scene batch's
+ * prepass + headroom-trade phases (it is stripped again before the per-scene solve) —
+ * mirrors `commands::level_scenes::BaseAnchorArg`, camelCase wire form (this command's
+ * arg structs follow the `SceneLevelJobWire` camelCase convention, not `LevelJob`'s
+ * snake_case one). Omit the whole `baseAnchor` key when the run has no base row for
+ * this preset — there is nothing to anchor. */
+export interface BaseAnchor {
+  targetLufs: number;
+}
+
 /** One entry in a setlist common-target job (mirrors lib::SetlistJobEntry).
  * Keys snake_case (nested inside `{ entries: [...] }`). */
 export interface SetlistJobEntry {
@@ -146,15 +158,17 @@ export interface LevelResult {
    * Null when the measuring path has no full-capture meter. */
   dynamic_spread_lu: number | null;
   /** Set with `clamped` for the "no authority" case — the amp's outputLevel doesn't
-   * reach the USB 1/2 capture (off-branch / off-USB). Shown verbatim instead of a
-   * generic clamp. Null for the preset-level path / an ordinary headroom clamp. */
+   * reach the USB 1/2 capture (off-branch / off-USB). Not surfaced in the UI (design
+   * 1a shows one generic clamp message regardless of cause); used only to classify
+   * the row as offbranch. Null for the preset-level path / an ordinary headroom clamp. */
   clamp_reason: string | null;
   /** Rebalance "verify by ear": the lane-mute floor was too shallow to trust the
    * equal-solo balance (the overall target still landed). ORed with the spread flag. */
   verify_by_ear: boolean;
-  /** The preset's saved `presetLevel` BEFORE this run wrote it — the revert anchor
-   * for "Restore original". Null when the pre-run read failed or the path doesn't
-   * write `presetLevel` (block-knob / scene rows). */
+  /** The preset's saved `presetLevel` BEFORE this run wrote it — internal re-run
+   * idempotency data (a same-level re-run reloads the stored preset instead of
+   * rewriting it), not surfaced in the UI. Null when the pre-run read failed or the
+   * path doesn't write `presetLevel` (block-knob / scene rows). */
   previous_level: number | null;
   /** PREDICTED true peak (dBTP) at final_level, extrapolated from the reference
    * capture's measured true peak — an ESTIMATE, never a re-measurement. Only the
@@ -167,13 +181,20 @@ export interface LevelResult {
   /** The clamp's CAUSE from the shared taxonomy (mirrors `headroom_trade::ClampKind`) —
    * null when the row is not clamped. Additive alongside `clamp_reason`, whose contract
    * ("the leveled signal isn't reaching USB 1/2") is unchanged: this is the
-   * machine-readable cause. Render its `CLAMP_MESSAGES[kind]` verbatim — never re-word it. */
+   * machine-readable cause. Wire-only: design 1a's UI no longer surfaces it — every
+   * clamped row shows one generic message regardless of cause. */
   clamp_kind: ClampKind | null;
   /** THE HEADROOM TRADE this run made (or, on a preview, WOULD make) — see `TradeSummary`.
    * Stamped on EVERY row of a batch that traded (the trade moved the whole preset's gain
    * structure, not one row's). Null on every untraded run and on every lane that has no
    * trade (base, block, footswitch). */
   trade: TradeSummary | null;
+  /** THE BASE-PAIR BOOST this run made (or, when it couldn't apply one, WHAT IT WOULD
+   * MAKE) — see `BaseBoostSummary`. Phase 2 of the plumes/BD2/OCD-class regression fix:
+   * base's OWN `presetLevel`/amp-fader pair. Null on every run whose base pair never
+   * entered the `Boost` regime, and on every lane that isn't the base row (block,
+   * footswitch, scene). */
+  base_boost: BaseBoostSummary | null;
 }
 
 /** WHICH sound a trade row / clamp error describes (mirrors `headroom_trade::SoundId`,
@@ -196,24 +217,6 @@ export type ClampKind =
   | "partial_trade"
   | "no_authority";
 
-/** One user-facing sentence per `ClampKind` — the UI's OWN copy for the backend's clamp
- * taxonomy (keyed by `ClampKind`, mirrors `headroom_trade::ClampKind`). This is a SEPARATE
- * wording from `ClampKind::message()`, whose only caller builds an internal Rust error
- * string; nothing cross-checks the two, so a taxonomy change on the backend does not fail
- * loudly here — update this table by hand alongside it. */
-export const CLAMP_MESSAGES: Record<ClampKind, string> = {
-  scene_ceiling:
-    "this sound cannot reach the target — its level control is already at the limit",
-  wet_floor:
-    "this sound cannot reach the target without dropping the mix below the level that preserves the effect",
-  trade_floor:
-    "the base amp level ran out of room holding the base sound on target while headroom was traded for this one",
-  partial_trade:
-    "the traded headroom was backed out because a dependent write did not land — nothing was saved",
-  no_authority:
-    "the level control has no effect on the USB 1/2 output for this sound",
-};
-
 /** Why a headroom-trade raise was trimmed below what the worst benefiting deficit wanted
  * (mirrors `headroom_trade::TradeCap`, snake_case). */
 export type TradeCap = "preset_level_max" | "base_fader_floor";
@@ -227,8 +230,12 @@ export interface TradeAmpMove {
   parameter_id: string;
   /** The `outputLevel` the preset carried BEFORE the trade — the Restore anchor. */
   previous_value: number;
-  /** The SOLVED value the hold landed on. Null on an advisory: the fader response isn't
-   * algebraically predictable, so a run that didn't actually solve it invents nothing. */
+  /** The SOLVED value the hold landed on. Null on a TRADE advisory: the fader response
+   * isn't algebraically predictable, so a run that didn't actually solve it invents
+   * nothing. Exception: a BOOST advisory (`BaseBoostSummary.applied === false`) populates
+   * this with the planner's SEED (`fader_target`) instead — not a solved prediction, but
+   * the disclosure sentence needs a concrete number even before any closed-loop solve has
+   * run (see `BaseBoostSummary`'s own doc). */
   value: number | null;
 }
 
@@ -249,6 +256,30 @@ export interface TradeSummary {
   cap: TradeCap | null;
   /** The sounds the raise was bought for, by identity. */
   benefiting: SoundId[];
+}
+
+/** A BASE-PAIR BOOST disclosure (mirrors `headroom_trade::BaseBoostSummary`, snake_case —
+ * see `TradeSummary`'s doc for the layer rule). Phase 2 of the plumes/BD2/OCD-class
+ * regression fix: base's OWN `presetLevel`/amp-fader pair — `presetLevel` pinned at its
+ * ceiling and the base amp's fader RAISED to close what's left, because base has no
+ * benefiting-row deficit to redistribute against (it IS the row that's short).
+ *
+ * Same `applied` discriminator as `TradeSummary`:
+ * - `true` — the pair was solved and (on a save run) persisted; `base_amps[0].value` is the
+ *   solved fader.
+ * - `false` — ADVISORY. The plan calls for a boost but this run's shape can't apply it this
+ *   cycle (no `save`, or a scene preset — v1 scopes the full continuation to scene-less
+ *   presets only), so the row still clamps honestly at `presetLevel`'s ceiling and
+ *   `base_amps[0].value` is the planner's SEED (`fader_target`), not a solved prediction — see
+ *   `TradeAmpMove.value`'s own doc for why a BOOST advisory is the one case that populates
+ *   this field instead of leaving it `null`. */
+export interface BaseBoostSummary {
+  applied: boolean;
+  /** The raised `presetLevel` — exact either way, so an advisory can state it without
+   * measuring. */
+  preset_level: number;
+  /** The base amp candidate the boost moves. Exactly one element. */
+  base_amps: TradeAmpMove[];
 }
 
 /** Result of leveling one block-acting footswitch's engaged state
@@ -328,6 +359,13 @@ export interface SceneHandleCandidate {
   /** "full" = room in both directions. "lowers_only" = already at (or within a whisker
    * of) the top of its range — this handle can only make the scene QUIETER. */
   headroom: "full" | "lowers_only";
+  /** True iff this scene's overlay UN-BYPASSES a node the base graph has bypassed (and
+   * the node carries at least one levelable param) — the scene's whole reason to exist
+   * is turning this block on, so its own control is the natural default handle, not the
+   * active amp's `outputLevel`. Optional: older data (a carried-forward re-level pick,
+   * or a backend that predates this field) omits it — treat missing as `false`, never
+   * as "unknown/preselect anyway". */
+  enablesBlock?: boolean;
 }
 
 /** The handle candidates for ONE scene (mirrors `commands::SceneHandleRow`). */
@@ -753,9 +791,22 @@ export interface AmpCandidate {
 export interface BackupPresetRow {
   slot: number;
   name: string;
+  /** The preset doc's identity uuid (`info.preset_id`), parsed from the same
+   * `presetJson` as every other field on this row. Null for an unparseable
+   * row and for bodies written without the key (the showcase fixture). Read-only
+   * metadata — no frontend behaviour keys on it; the backend's cross-connection
+   * backup-row guards do. */
+  preset_id: string | null;
   scene_count: number;
   scenes: SceneInfo[];
   amp_candidates: AmpCandidate[];
+  /** Count of `amp_candidates` nodes NOT bypassed in the base graph (`lib::backup_read`,
+   * derived alongside `amp_candidates`) — the redistribute gate's single-amp signal. A
+   * global bypass filter on `amp_candidates` itself is forbidden (amp-flip presets need
+   * bypassed-in-base amps as candidates too), so this rides as a separate count instead.
+   * `=== 1`, not `<= 1`: a genuinely blockless base (0) must not offer a doomed
+   * redistribute. */
+  base_active_amp_count: number;
   /** Every block in the preset's audioGraph (`lib::BackupBlock`). Drives the
    * per-preset CPU total + "blocks present in the selection" lists. */
   blocks: BackupBlock[];
@@ -869,9 +920,12 @@ export interface CopyJob {
 }
 
 /** One preset's outcome from a `copy_apply` run (`lib::CopyApplyItem`). Like
- * `BulkReplaceItem` plus the post-save signal graph, so the Copy view can patch its
- * cached library in place (no re-scan) after a write — `graph` is omitted when the
- * preset wasn't saved or its graph couldn't be read back. */
+ * `BulkReplaceItem` plus the signal graph the device's WORKING COPY showed in a re-prompt
+ * taken after the last confirmed op and BEFORE the save (the save itself is
+ * unacknowledged), so the Copy view can patch its cached library in place (no re-scan)
+ * after a write — `graph` is omitted when the preset wasn't saved, the edit left the block
+ * roster unchanged (a same-model re-stamp — unverifiable, never read), no reply landed, or
+ * the reply didn't show the blocks the acked ops produced (ignored). */
 export interface CopyApplyItem {
   slot: number;
   name: string;

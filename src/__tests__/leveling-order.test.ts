@@ -12,6 +12,7 @@ import {
   defaultParamIndex,
   footswitchName,
   fswKey,
+  runRank,
   sceneKeyOf,
   targetFromCandidate,
 } from "../views/level/leveling";
@@ -108,9 +109,20 @@ describe("chosenFrom run-order", () => {
     });
   });
 
-  it("emits footswitches AFTER scenes, defaulting to its tone-safe candidate (D2)", () => {
+  // BUG→GATE (2026-08-31 HW, online 410 arc): the run leveled a preset's scenes before its
+  // footswitches, and the footswitch pass then moved every scene it had just finished. 410's
+  // ACD_TubeScreamer is left ON in the preset's base state and each of its three scenes
+  // overlays only the amp, so all three render the screamer — cutting that switch's own
+  // handle 2.0 dB put all three already-leveled scenes 2.0 dB under target.
+  //
+  // RE-CONFIRMED 2026-09-01 by independent ffmpeg validation: ranking every footswitch after
+  // the scenes reproduced this exactly (all 3 scenes 2.011 LU under target) EVEN THOUGH 410's
+  // scenes enable no switches at all. `ftswStates` records whether a switch is ENGAGED in a
+  // scene, not whether its block is ACTIVE — a base-ON block is rendered by every scene
+  // either way. So a BASE-context switch must still run before scenes.
+  it("emits a base-context footswitch BEFORE scenes, defaulting to its tone-safe candidate (D2)", () => {
     // Alpha (slot 0): 2 scenes + 1 footswitch (switch index 4 → tag FS5). Order must be
-    // Base → scenes → footswitch. Every row levels now (D2 — the backend removed the
+    // Base → footswitch → scenes. Every row levels now (D2 — the backend removed the
     // verify-only footswitch mode entirely): the default target is the switch's
     // (only, here) candidate, measured against the preset's BASE sound (D3's
     // `sceneContext: null`) until the Set up step's picker resolves a `suggested` scene.
@@ -124,11 +136,11 @@ describe("chosenFrom run-order", () => {
     const out = chosenFrom(sel, rows, sceneInfo, fswInfo);
     expect(out.map((o) => o.key)).toEqual([
       baseKey(0),
+      fswKey(0, 0),
       sceneKeyOf(0, 0),
       sceneKeyOf(0, 1),
-      fswKey(0, 0),
     ]);
-    expect(out[3]).toMatchObject({
+    expect(out[1]).toMatchObject({
       isBase: false,
       sceneName: "Solo",
       tag: "FS5", // switch index 4 → human FS number 5
@@ -355,6 +367,61 @@ describe("chosenFrom run-order", () => {
     expect(out.map((o) => o.key)).toEqual([baseKey(1), fswKey(1, 0)]);
     expect(out[0]).toMatchObject({ isBase: true, sceneName: "Base Preset" });
     expect(out[1]).toMatchObject({ tag: "FS1", sceneName: "Drive" });
+  });
+});
+
+// `chosenFrom` emitting the right order is not enough on its own: `useLevelingFlow` sorts
+// its work list by `runRank` so the run holds however the items were assembled (a resumed
+// run, a re-ordered selection, a future caller that builds items itself). These pin the
+// rank the sort reads — the same BUG→GATE as the emission test above.
+describe("runRank — the run's dependency order", () => {
+  const base = { isBase: true };
+  const footswitch = { isBase: false, footswitch: { switchIndex: 4 } };
+  const scene = { isBase: false };
+
+  const sceneFootswitch = {
+    isBase: false,
+    footswitch: { switchIndex: 2, sceneContext: 1 },
+  };
+
+  it("ranks base, then base-context footswitches, then scenes, then scene-context ones", () => {
+    expect(runRank(base)).toBe(0);
+    expect(runRank(footswitch)).toBe(1);
+    expect(runRank(scene)).toBe(2);
+    expect(runRank(sceneFootswitch)).toBe(3);
+  });
+
+  it("sorts a scenes-first selection back into dependency order", () => {
+    // The shape that produced the HW miss: scenes ahead of the base-context footswitch
+    // whose base-ON handle every one of them renders through.
+    const work = [scene, footswitch, base];
+    const sorted = [...work].sort((a, b) => runRank(a) - runRank(b));
+    expect(sorted).toEqual([base, footswitch, scene]);
+  });
+
+  // BUG→GATE, and the split is PER-ROW because each half is separately HW-measured.
+  // Ranking every footswitch LATE was tried on hardware and reproduced the 410 regression
+  // (3 scenes 2.011 LU under target by independent ffmpeg read) even though 410's scenes
+  // enable no switches — `ftswStates` means ENGAGED, not ACTIVE, and a base-ON block is
+  // rendered by every scene regardless. Ranking every footswitch EARLY is the other error:
+  // a scene-context row would be solved against a scene not yet on target, which is what
+  // made a real preset's overdrive report an unreachable ceiling.
+  it("splits footswitches by context: base-context before scenes, scene-context after", () => {
+    const work = [sceneFootswitch, scene, footswitch, base];
+    const sorted = [...work].sort((a, b) => runRank(a) - runRank(b));
+    expect(sorted).toEqual([base, footswitch, scene, sceneFootswitch]);
+  });
+
+  // `sceneContext` reaches the sort as `undefined` on rows the setup page has not resolved.
+  // Absent must read as BASE context — the conservative side — never as scene 0.
+  it("treats an unresolved scene context as base, not as scene 0", () => {
+    const unresolved = { isBase: false, footswitch: { switchIndex: 0 } };
+    const sceneZero = {
+      isBase: false,
+      footswitch: { switchIndex: 0, sceneContext: 0 },
+    };
+    expect(runRank(unresolved)).toBe(1);
+    expect(runRank(sceneZero)).toBe(3);
   });
 });
 

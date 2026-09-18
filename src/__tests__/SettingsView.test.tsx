@@ -56,6 +56,7 @@ function makeStubUpdater(): UpdaterApi {
     percent: 0,
     autoInstall: true,
     currentVersion: "1.2.3",
+    hasUpdateChannel: true,
     setAutoInstall: setAutoInstallFn,
     check: checkFn,
     review: vi.fn(),
@@ -67,10 +68,13 @@ function makeStubUpdater(): UpdaterApi {
   };
 }
 
-function renderView() {
+function renderView(updaterOverrides: Partial<UpdaterApi> = {}) {
   render(
     <ThemeProvider>
-      <SettingsView connected={false} updater={makeStubUpdater()} />
+      <SettingsView
+        connected={false}
+        updater={{ ...makeStubUpdater(), ...updaterOverrides }}
+      />
     </ThemeProvider>,
   );
 }
@@ -210,6 +214,26 @@ describe("SettingsView — app updates", () => {
 
     expect(checkFn).toHaveBeenCalled();
     expect(await screen.findByText("up to date")).toBeInTheDocument();
+  });
+
+  // Linux ships .deb/.rpm and latest.json carries only darwin-* keys, so a check
+  // there can only ever come back empty. Reporting that as "up to date" told
+  // Linux users they were current forever.
+  it("with no update channel, offers no check and no auto-install toggle", async () => {
+    const user = userEvent.setup();
+    renderView({ hasUpdateChannel: false });
+    await screen.findByText("Rhythm");
+    await openCategory(user, "About & updates");
+    await screen.findByText("Version 1.2.3");
+
+    expect(
+      screen.queryByRole("button", { name: /check for updates/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Install updates automatically"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("up to date")).not.toBeInTheDocument();
+    expect(screen.getByText(/releases\/latest$/)).toBeInTheDocument();
   });
 
   it("toggles auto-install", async () => {

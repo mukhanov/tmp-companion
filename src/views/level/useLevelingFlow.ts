@@ -14,6 +14,12 @@
 // backup acknowledgment is an inline checkbox in the Set-up footer (no separate step)
 // that gates the commit. Leveling always WRITES (save:true). Each step is isolated: a
 // per-item failure becomes "skipped", never aborting the run.
+//
+// No revert of any kind lives in this flow (design 1a, user directive): the backup
+// acknowledgment is the one revert path (restore from a Pro Control backup), so this
+// hook carries no gain-budget redistribution, reachable-common-target, or per-row
+// "Restore original" state — a clamped row is reported and left for the user to
+// re-level at a lower target, nothing more.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -25,25 +31,19 @@ import {
   cancelSceneLeveling,
   levelFootswitchesApply,
   cancelFootswitchLeveling,
-  redistributeHeadroom,
-  restoreRedistribution,
-  commonReachableTarget,
   toFootswitchJobWire,
-  type CeilingArg,
-  type PreviousKnob,
 } from "../../lib/invoke";
 import { onLevelingLufs } from "../../lib/liveEvents";
 import { MODELS } from "../../models/catalog";
 import { resolveDeviceId } from "../../models/blockArt";
 import {
-  BASE_SCENE_SLOT,
   buildLevelJob,
-  ceilingOf,
   chosenFrom,
   DYNAMIC_SPREAD_LU,
   optionToRunItem,
   resolvedTargetLufs,
   runItemToOption,
+  runRank,
   type RunItem,
   type SetupOption,
   type SetupChoice,
@@ -58,8 +58,6 @@ import type {
   Profile,
   LevelBlock,
   SilenceHint,
-  ClampKind,
-  TradeSummary,
 } from "../../lib/types";
 
 // AMP model ids (the catalog's amp categories) — the amp's outputLevel knob is the
@@ -132,11 +130,6 @@ interface LevelOutcomeFields {
   /** Footswitch rows only: the clamp's pinned bound is the wet/mix floor, not headroom —
    *  see `FootswitchLevelResult.wet_floor`. */
   wet_floor?: boolean;
-  /** The clamp's CAUSE from the shared taxonomy — see `LevelResult.clamp_kind`. */
-  clamp_kind?: ClampKind | null;
-  /** THE HEADROOM TRADE this row's batch made — see `LevelResult.trade`. Footswitch
-   *  results have no trade lane, so this stays optional/undefined there. */
-  trade?: TradeSummary | null;
 }
 
 // A `clamp_reason` is set ONLY when the leveled signal isn't effectively reaching the USB 1/2
@@ -174,11 +167,11 @@ const byEarCause = (r: LevelOutcomeFields): RunItem["verifyByEar"] =>
         : undefined;
 
 /** A run row that levels via amp `outputLevel` in scene mode — not Base (`presetLevel`), not
- *  a block-acting footswitch. The run loop batches these; redistribution compensates them. */
+ *  a block-acting footswitch. The run loop batches these. */
 const isSceneItem = (it: RunItem): boolean =>
   !it.isBase && it.footswitch == null && it.sceneSlot != null;
 
-/** The run's live state, published by the run loop and read by RunBody/SummaryBody. */
+/** The run's live state, published by the run loop and read by RunPage/SummaryPage. */
 export interface RunState {
   items: RunItem[];
   currentIndex: number;
@@ -188,6 +181,13 @@ export interface RunState {
   /** A stop was requested and the in-flight item is still winding down. Drives the
    *  "Stopping…" feedback so the user isn't left staring at a "leveling…" spinner. */
   stopping: boolean;
+  /** A batch-wide caption ("Saving…" / "Verifying…") from a `SceneLevelProgressItem.tail`
+   *  (issue 6b) — the deferred-save/persist-verify phase AFTER every scene in the group
+   *  already resolved, so no row's own status can show it. `RunPage`'s header renders
+   *  this in preference while set. Cleared on the run's completion and whenever a NEW
+   *  row goes active (both already `publish` every time), so it can't outlive the
+   *  window it describes. */
+  tailMessage: string | null;
 }
 
 const EMPTY_RUN: RunState = {
@@ -197,6 +197,7 @@ const EMPTY_RUN: RunState = {
   done: false,
   stopped: false,
   stopping: false,
+  tailMessage: null,
 };
 
 export interface UseLevelingFlowDeps {
@@ -239,7 +240,6 @@ export function useLevelingFlow({
   // the body swaps. `stage === "closed"` ⇒ the wizard is unmounted.
   const [stage, setStage] = useState<Stage>("closed");
   const [chosen, setChosen] = useState<SetupOption[]>([]);
-  const [flowPresetCount, setFlowPresetCount] = useState(0);
   const [isRelevel, setIsRelevel] = useState(false);
   const [run, setRun] = useState<RunState>(EMPTY_RUN);
   // Advisory live measured loudness for the active run row's "measuring…" readout. Held
@@ -276,7 +276,7 @@ export function useLevelingFlow({
   // Opt-in: equalize a path-MERGE scene's two parallel-amp lanes before joint-k. A no-op
   // on series / single-amp / split-output scenes (the backend only rebalances scenes it
   // classifies as mergeable). Held in a REF so toggling it never re-renders the flow;
-  // SetupBody owns the visible pill and pushes its value here via `setRebalance` — incl.
+  // SetupPage owns the visible pill and pushes its value here via `setRebalance` — incl.
   // on mount, so a remount (re-level / Back→Continue / new flow) resets the ref to the
   // freshly-defaulted (off) pill rather than leaking a stale ON. Read at run time.
   const rebalanceRef = useRef(false);
@@ -296,7 +296,6 @@ export function useLevelingFlow({
       if (options.length === 0) return;
       setChosen(options);
       setIsRelevel(false);
-      setFlowPresetCount(new Set(options.map((o) => o.slot)).size);
       setStage("setup");
     },
     [rows, sceneInfo, footswitchInfo],
@@ -325,25 +324,29 @@ export function useLevelingFlow({
       const isCancelled = () => cancelRef.current;
       const candCache = new Map<number, Candidate[]>();
       const work = items.map((it) => ({ ...it }));
-      // Base-first within each preset: a preset's Base levels `presetLevel` — a global
-      // multiplier over its scenes — so it MUST run before its FS scenes, else the base
-      // write shifts every already-leveled scene off-target. `chosenFrom` already emits
-      // this order; this stable sort (0 for differing slots ⇒ input order preserved)
-      // guarantees it regardless of how `items` was assembled.
-      const baseRank = (it: RunItem) => (it.isBase ? 0 : 1);
-      work.sort((a, b) => (a.slot === b.slot ? baseRank(a) - baseRank(b) : 0));
+      // Dependency order documented on `runRank`. Stable sort (0 for differing slots ⇒
+      // input order preserved) guarantees it regardless of how `items` was assembled.
+      work.sort((a, b) => (a.slot === b.slot ? runRank(a) - runRank(b) : 0));
       const total = work.length;
 
       // `work` is mutated in place between publishes; pass a fresh ARRAY each time
       // (new ref so React renders) but skip the per-item spread — the bodies only read
       // items during render, never hold them across renders.
+      // `lastPublishedIndex` lets a tail-only progress item (no row of its own — see
+      // `batchResolve` below) re-publish the caption without inventing a step index.
+      let lastPublishedIndex = 0;
       const publish = (
         currentIndex: number,
         done: boolean,
         stopped: boolean,
+        tailMessage: string | null = null,
       ) => {
+        lastPublishedIndex = currentIndex;
         // Once cancel is requested, every publish carries `stopping` until the final
-        // done publish clears it (done ⇒ either "complete" or "stopped").
+        // done publish clears it (done ⇒ either "complete" or "stopped"). Every call
+        // site but the tail-caption one below omits `tailMessage`, so the default
+        // `null` clears it on the run's completion AND on every row activation —
+        // exactly the two points issue 6b's contract requires.
         setRun({
           items: [...work],
           currentIndex,
@@ -351,6 +354,7 @@ export function useLevelingFlow({
           done,
           stopped,
           stopping: isCancelled() && !done,
+          tailMessage,
         });
       };
 
@@ -360,7 +364,7 @@ export function useLevelingFlow({
       // INVARIANT (BUG 2): at most ONE row is ever "active". The reported bug — several
       // rows all rendering "leveling · <the same LUFS>" at once — traced to nothing ever
       // clearing a row OUT of "active" when the channel (or the optimistic
-      // `markGroupActive` pre-flip) named a NEW one active; `RunBody` renders the one
+      // `markGroupActive` pre-flip) named a NEW one active; `RunPage` renders the one
       // shared `liveLufs` on every row whose `status === "active"`, so a stale active row
       // kept showing the new row's live number too. Every site that flips a row active
       // must go through this so a future call site can't reintroduce the bug — it demotes
@@ -414,7 +418,17 @@ export function useLevelingFlow({
           status: string,
           result: LevelOutcomeFields | null,
           message?: string | null,
+          tail?: string | null,
         ) => {
+          // Issue 6b: a `tail` caption ("Saving…" / "Verifying…") rides on a batch-wide
+          // progress item that carries NO VALID row key — handle it BEFORE the entry
+          // lookup below, independent of whatever key/status/result also arrived on the
+          // same item, or it would be silently swallowed by the "unknown key" guard
+          // exactly like the rows that guard already drops. Re-publish at the CURRENT
+          // step (never invents progress) so the header subtitle picks it up.
+          if (tail != null) {
+            publish(lastPublishedIndex, false, false, tail);
+          }
           const entry = entries.get(key);
           if (!entry) return;
           if (status === "active") {
@@ -422,7 +436,7 @@ export function useLevelingFlow({
             // The row's caption: the ceiling prepass's "measuring" (rendered as the verb
             // before the live number, since a capture IS streaming), or the freshness
             // barrier's "waiting for the device to commit the previous save…" (shown
-            // verbatim, since nothing is). See RunBody's rowStatus. Cleared once the row
+            // verbatim, since nothing is). See RunPage's rowStatus. Cleared once the row
             // resolves — or when a cancelled sweep reverts it — so a later re-run's default
             // "connecting…" isn't shadowed by a stale message.
             entry.item.activeMessage = message ?? null;
@@ -431,8 +445,6 @@ export function useLevelingFlow({
             entry.item.activeMessage = null;
             entry.item.outcome = outcomeOf(result);
             entry.item.value = valueOf(result);
-            entry.item.clampKind = result.clamp_kind ?? null;
-            entry.item.trade = result.trade ?? null;
             entry.item.spreadLu = result.dynamic_spread_lu;
             entry.item.verifyByEar = causeOf(result);
             finishItem(entry.item, entry.idx);
@@ -524,11 +536,9 @@ export function useLevelingFlow({
               it.value = valueOf(res);
               it.ceilingLufs = res.constant_c;
               it.spreadLu = res.dynamic_spread_lu;
-              it.previousLevel = res.previous_level;
               it.truePeakDbtp = res.true_peak_dbtp;
               it.verifyByEar = causeOf(res);
-              it.clampKind = res.clamp_kind ?? null;
-              it.trade = res.trade ?? null;
+              it.baseBoost = res.base_boost;
             } else {
               // A scene item with no wire slot — nothing to level.
               it.outcome = "skipped";
@@ -645,6 +655,21 @@ export function useLevelingFlow({
         );
         const resolveScene = batchResolve(byScene, causeOf);
         markGroupActive(byScene, i);
+        // Keep this preset's already-force-appended BASE job alive through the batch's
+        // prepass + headroom-trade phases (issue 1 — the trade is otherwise unreachable
+        // from the wizard, which levels Base via the separate `levelPreset` lane). The
+        // base row for this slot ran FIRST (the run's base-first sort) and already holds
+        // its result by the time this group dispatches, so its TARGET is available here —
+        // look it up in `work`, not `group` (the base row is never part of a scene group).
+        // Omit the key entirely (not `null`) when the preset has no base row selected:
+        // conditional spread drops it from the serialized args, matching "no trade to
+        // plan" rather than sending an anchor nothing asked for. The trade itself is
+        // still a backend-internal behavior (see `notes/leveling.md`); the wizard no
+        // longer surfaces which rows benefited from it.
+        const baseItem = work.find((w) => w.slot === it.slot && w.isBase);
+        const baseAnchor = baseItem
+          ? { targetLufs: targetOf(baseItem) }
+          : undefined;
         // ponytail: per-scene outcomes arrive via the Channel (`onResult`), NOT the returned
         // Promise value (deliberately discarded). `LevelResult` DOES now carry `scene_slot`
         // (identity, not position — the batch filters failed scenes out of the array it
@@ -673,6 +698,7 @@ export function useLevelingFlow({
               topologyId: profile?.topology_id ?? null,
               calibrationLufs: profile?.calibration_lufs ?? null,
               profileId: profile?.id ?? null,
+              ...(baseAnchor ? { baseAnchor } : {}),
             },
             (item) => {
               resolveScene(
@@ -680,6 +706,7 @@ export function useLevelingFlow({
                 item.status,
                 item.result,
                 item.message,
+                item.tail,
               );
             },
           );
@@ -739,239 +766,21 @@ export function useLevelingFlow({
     setStage("summary");
   }, []);
 
-  // Summary "Re-level clamped…" → re-enter at Set up with just the clamped subset
-  // (re-level mode: the Set-up body hides the backup acknowledgment — already given).
-  const onRelevel = useCallback((clamped: RunItem[]) => {
-    const options: SetupOption[] = clamped.map(runItemToOption);
+  // Summary "Re-level clamped…" / "Re-run off target…" → re-enter at Set up with just
+  // that subset (re-level mode: the Set-up body hides the backup acknowledgment —
+  // already given).
+  const onRelevel = useCallback((subset: RunItem[]) => {
+    const options: SetupOption[] = subset.map(runItemToOption);
     setChosen(options);
     setIsRelevel(true);
-    setFlowPresetCount(new Set(clamped.map((it) => it.slot)).size);
     setStage("setup");
   }, []);
-
-  // ── Gain-budget redistribution (loud-preset clamp class, single-amp v1) ──────────────
-  // Per-preset recorded pre-redistribution values (the one-click Restore anchor), keyed by
-  // 0-based slot.
-  const [redistUndo, setRedistUndo] = useState<
-    Map<number, { presetLevel: number; knobs: PreviousKnob[]; name: string }>
-  >(new Map());
-
-  // Which presets in a finished run can be redistributed: a SINGLE-amp preset whose Base was
-  // leveled and did NOT clamp (presetLevel < 1.0 ⇒ headroom) with ≥1 headroom-clamped scene.
-  // Multi-amp presets are excluded in v1 (compensating one amp would drift the others).
-  const redistributablePresets = useCallback(
-    (items: RunItem[]): number[] =>
-      [...new Set(items.map((it) => it.slot))].filter((slot) => {
-        const group = items.filter((it) => it.slot === slot);
-        const base = group.find((it) => it.isBase);
-        const clamps = group.filter(
-          (it) => isSceneItem(it) && it.outcome === "clamped",
-        );
-        const nodes = new Set(
-          (ampCandidates.get(slot) ?? [])
-            .filter((a) => a.parameterId === "outputLevel")
-            .map((a) => a.nodeId),
-        );
-        return (
-          base?.outcome === "done" && clamps.length > 0 && nodes.size === 1
-        );
-      }),
-    [ampCandidates],
-  );
-
-  // What a redistribution would rewrite (for the Summary's opt-in enumeration), or null when
-  // it doesn't apply. `scenes` counts the FS scenes compensated across the affected presets;
-  // the base amp + presetLevel of each are always rewritten too.
-  const redistributePlan = useCallback(
-    (items: RunItem[]): { presets: number; scenes: number } | null => {
-      const slots = redistributablePresets(items);
-      if (slots.length === 0) return null;
-      const scenes = items.filter(
-        (it) => slots.includes(it.slot) && isSceneItem(it),
-      ).length;
-      return { presets: slots.length, scenes };
-    },
-    [redistributablePresets],
-  );
-
-  // Summary "Give clamped scenes headroom" → for each redistributable preset, raise
-  // presetLevel and re-level the base amp + every scene back to target (the backend streams
-  // per-sound progress; the run stage shows it). Records the pre-values for Restore.
-  const redistribute = useCallback(
-    async (items: RunItem[]) => {
-      const slots = redistributablePresets(items);
-      if (slots.length === 0) return;
-      const work = items.map((it) => ({ ...it }));
-      const total = work.length;
-      cancelRef.current = false;
-      const isCancelled = () => cancelRef.current; // getter defeats the always-false narrowing
-      setStage("run");
-      const publish = (idx: number, done: boolean, stopped = false) => {
-        setRun({
-          items: [...work],
-          currentIndex: idx,
-          total,
-          done,
-          stopped,
-          stopping: isCancelled() && !done,
-        });
-      };
-      publish(0, false);
-      const newUndo: [
-        number,
-        { presetLevel: number; knobs: PreviousKnob[]; name: string },
-      ][] = [];
-      for (const slot of slots) {
-        const group = work.filter((it) => it.slot === slot);
-        const base = group.find((it) => it.isBase);
-        if (!base) continue;
-        const scenes = group.filter(isSceneItem);
-        const profile = profileById(base.instId);
-        const bySound = new Map<number, RunItem>([[BASE_SCENE_SLOT, base]]);
-        for (const s of scenes)
-          if (s.sceneSlot != null) bySound.set(s.sceneSlot, s);
-        const jobs = [...bySound].map(([sceneSlot, it]) => ({
-          sceneSlot,
-          targetLufs: targetLufsByName(it.targetName),
-        }));
-        const worst = Math.max(
-          ...scenes
-            .filter((s) => s.outcome === "clamped")
-            .map(
-              (s) => targetLufsByName(s.targetName) - (s.value ?? -Infinity),
-            ),
-        );
-        try {
-          const res = await redistributeHeadroom(
-            {
-              slot,
-              jobs,
-              candidates: ampCandidates.get(slot) ?? [],
-              worstClampedDeficitDb: worst,
-              topologyId: profile?.topology_id ?? null,
-              calibrationLufs: profile?.calibration_lufs ?? null,
-              profileId: profile?.id ?? null,
-            },
-            (item) => {
-              const target = bySound.get(item.sceneSlot);
-              if (!target) return;
-              if (item.status === "active") {
-                target.status = "active";
-              } else if (item.status === "done" && item.result) {
-                target.outcome = outcomeOf(item.result);
-                target.value = valueOf(item.result);
-                target.status = "result";
-              } else if (item.status === "error") {
-                target.outcome = "skipped";
-                target.skipReason = item.message ?? null;
-                target.status = "result";
-              }
-              publish(work.indexOf(target), false);
-            },
-          );
-          newUndo.push([
-            slot,
-            {
-              presetLevel: res.previousPresetLevel,
-              knobs: res.previousKnobs,
-              name: base.presetName,
-            },
-          ]);
-        } catch {
-          // Redistribution aborted (a compensating write didn't land): nothing persisted for
-          // this preset — leave its rows as the run left them.
-        }
-        // ponytail: per-PRESET cancel ceiling — redistributeHeadroom has no backend cancel
-        // lane, so Stop lets the in-flight preset finish and halts before the next one.
-        if (isCancelled()) break;
-      }
-      setRedistUndo((m) => new Map([...m, ...newUndo]));
-      publish(total, true, isCancelled());
-      await refresh(); // non-throwing: runLoad catches into the error phase
-      setStage("summary");
-    },
-    [
-      redistributablePresets,
-      profileById,
-      targetLufsByName,
-      ampCandidates,
-      refresh,
-    ],
-  );
-
-  // Undo every redistribution this Summary applied (writes the recorded pre-values back).
-  const undoRedistribute = useCallback(async () => {
-    const entries = [...redistUndo];
-    for (const [slot, rec] of entries) {
-      try {
-        await restoreRedistribution(slot, rec.presetLevel, rec.knobs, rec.name);
-      } catch {
-        /* a drifted slot fails the name guard — leave it, the user is told */
-      }
-    }
-    setRedistUndo(new Map());
-    await refresh();
-  }, [redistUndo, refresh]);
-
-  // ── Reachable common target (quiet-preset clamp fallback, PR6) ───────────────────────
-  // Can the finished run's clamps be fixed by lowering everything to a REACHABLE common
-  // target? True when a sound clamped (a quiet preset whose ceiling sits below every shipped
-  // target even at max, or a louder preset clamped against a too-loud target) and at least
-  // one measured ceiling exists to derive `min(ceiling) − headroom` from. The banner renders
-  // the binding ceiling itself; this only gates the offer.
-  const commonTargetPlan = useCallback(
-    (items: RunItem[]): boolean =>
-      items.some((it) => it.outcome === "clamped") &&
-      items.some((it) => ceilingOf(it) != null),
-    [],
-  );
-
-  // Summary "Re-level everything to a reachable common target" → derive the target from the
-  // ALREADY-measured ceilings (backend, offset-adjusted; zero re-capture) and re-level every
-  // measured sound to it via the existing run loop. Signal-less rows are excluded from the
-  // re-capture but kept visible (`skipRelevel`). Idempotent: the ceilings are intrinsic, so a
-  // repeat derives the same target and the base unchanged-skip makes the re-level a no-op.
-  const relevelToCommonTarget = useCallback(
-    async (items: RunItem[]) => {
-      const ceilings: CeilingArg[] = items.flatMap((it) => {
-        const c = ceilingOf(it);
-        return c != null
-          ? [
-              {
-                cLufs: c,
-                topologyId: profileById(it.instId)?.topology_id ?? null,
-              },
-            ]
-          : [];
-      });
-      if (ceilings.length === 0) return;
-      let target: number;
-      try {
-        target = await commonReachableTarget(ceilings);
-      } catch {
-        return; // no reachable ceilings — leave the summary as-is
-      }
-      const work = items.map((it) =>
-        ceilingOf(it) != null
-          ? {
-              ...it,
-              targetOverrideLufs: target,
-              status: "queued" as const,
-              outcome: undefined,
-              value: undefined,
-            }
-          : { ...it, skipRelevel: true },
-      );
-      await runLeveling(work);
-    },
-    [profileById, runLeveling],
-  );
 
   // Summary "Accept" / "Done" → close, deselecting just the leveled sounds.
   const onAccept = closeFlow;
 
   // Toggle the opt-in rebalance (read at run time). Stored in a ref so toggling it
-  // doesn't re-render the flow; the SetupBody owns its own checkbox state.
+  // doesn't re-render the flow; SetupPage owns its own checkbox state.
   const setRebalance = useCallback((on: boolean) => {
     rebalanceRef.current = on;
   }, []);
@@ -979,7 +788,6 @@ export function useLevelingFlow({
   return {
     stage,
     chosen,
-    flowPresetCount,
     isRelevel,
     run,
     liveLufs,
@@ -992,17 +800,5 @@ export function useLevelingFlow({
     onRelevel,
     onAccept,
     setRebalance,
-    // Gain-budget redistribution (loud-preset clamp class, single-amp v1).
-    redistribution: {
-      plan: redistributePlan,
-      run: redistribute,
-      undoCount: redistUndo.size,
-      undo: undoRedistribute,
-    },
-    // Reachable common target (quiet-preset clamp fallback).
-    commonTarget: {
-      plan: commonTargetPlan,
-      run: relevelToCommonTarget,
-    },
   };
 }

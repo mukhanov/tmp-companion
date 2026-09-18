@@ -278,8 +278,8 @@ export function LevelView({
         title="Presets live on the Tone Master Pro"
         body={
           <>
-            Connect your unit over <UsbC /> and power it on to list your presets
-            — it will connect automatically.
+            Connect your unit over <UsbC /> and power it on. Your presets will
+            show up on their own.
           </>
         }
         onScan={onScan}
@@ -358,7 +358,6 @@ export function LevelView({
         <LevelingWizard
           stage={flow.stage}
           chosen={flow.chosen}
-          flowPresetCount={flow.flowPresetCount}
           isRelevel={flow.isRelevel}
           instrumentOptions={instOptions}
           targetOptions={targetOptions}
@@ -374,14 +373,13 @@ export function LevelView({
           runStopping={flow.run.stopping}
           liveLufs={flow.liveLufs}
           liveTrace={flow.liveTrace}
+          runTailMessage={flow.run.tailMessage}
           onCancel={flow.onCancel}
           onStart={flow.onSetupStart}
           onRunCancel={flow.onRunCancel}
           onRunComplete={flow.onRunComplete}
           onAccept={flow.onAccept}
           onRelevel={flow.onRelevel}
-          redistribution={flow.redistribution}
-          commonTarget={flow.commonTarget}
           onRebalanceChange={flow.setRebalance}
           onCalibrate={onCalibrate}
         />

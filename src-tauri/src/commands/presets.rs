@@ -116,13 +116,21 @@ pub(crate) fn preset_scenes_look_truncated(
     footswitch::max_referenced_scene(doc).is_some_and(|m| scenes.scenes.len() <= m as usize)
 }
 
-/// Build [`PresetScenes`] from the backup row matching `list_index`, guarded on BOTH
-/// slot and name — see [`read_preset_scenes_complete`]'s doc comment for why. `field8_name`
-/// is the field-8 partial's own `info.displayName` (read from the TRUNCATION-PROOF prefix,
-/// well before the scene-tail cut). Pure (no device I/O), so it's testable without hardware.
+/// Build [`PresetScenes`] from the backup row matching `list_index`, guarded on slot,
+/// name, AND `info.preset_id` — see [`read_preset_scenes_complete`]'s doc comment for
+/// why (`probe_api/slot_write.rs`'s `preset_id`-over-`displayName` precedent REFUSES
+/// outright on an absent id; this fallback instead warns-and-accepts on slot+name
+/// alone — a deliberate divergence, not an oversight to "restore consistency").
+/// `field8_name` is the field-8 partial's own `info.displayName` (read from the
+/// TRUNCATION-PROOF prefix, well before the scene-tail cut); `field8_id` is the same
+/// partial's `info.preset_id`. When the field-8 partial carries no id (older presets,
+/// or a parse miss), the id check is skipped and the row is accepted on slot+name alone
+/// — logged, never a silent empty-string compare. Pure (no device I/O), so it's testable
+/// without hardware.
 pub(crate) fn scenes_from_backup_row(
     list_index: u32,
     field8_name: &str,
+    field8_id: Option<&str>,
     rows: &[BackupPresetRow],
 ) -> Result<PresetScenes, String> {
     let device_slot = i64::from(list_index) + 1;
@@ -150,6 +158,34 @@ pub(crate) fn scenes_from_backup_row(
              refusing its empty scene list"
         ));
     }
+    let field8_id = field8_id.filter(|s| !s.is_empty());
+    match (
+        field8_id,
+        row.preset_id.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(want), Some(got)) if want != got => {
+            return Err(format!(
+                "read_preset_scenes_complete: backup row for slot {device_slot} \
+                 ({field8_name:?}) carries preset_id {got:?}, but the field-8 partial \
+                 for the same slot says {want:?} — the slot's occupant changed between \
+                 the two reads; refusing a scene list that belongs to a different preset"
+            ));
+        }
+        (Some(want), None) => {
+            return Err(format!(
+                "read_preset_scenes_complete: backup row for slot {device_slot} \
+                 ({field8_name:?}) carries no info.preset_id, but the field-8 partial \
+                 says {want:?} — refusing an unidentifiable scene list on a path that \
+                 feeds per-scene outputLevel writes"
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (None, _) => log::warn!(
+            "read_preset_scenes_complete: slot {device_slot} ({field8_name:?}) — the \
+             field-8 partial carried no info.preset_id, so the backup row was accepted \
+             on slot+name alone (identity check skipped)"
+        ),
+    }
     Ok(PresetScenes {
         scenes: row.scenes.iter().map(|s| s.name.clone()).collect(),
         fs: row.scenes.iter().map(|s| s.fs).collect(),
@@ -165,11 +201,13 @@ pub(crate) fn scenes_from_backup_row(
 /// `read_library_via_backup` uses) — a fresh connection, since the backup is its own
 /// multi-second transfer and re-amp rules keep it off any held session.
 ///
-/// Name-guarded (danger.md's address-space rule — this enumeration feeds per-scene
-/// `outputLevel` writes + saves): a second connection sits between the two reads, so the
-/// backup row is accepted ONLY when its slot AND name match the field-8 partial's own
-/// `info.displayName`. A scene list silently read from the WRONG preset would level the
-/// wrong sounds.
+/// Identity-guarded (danger.md's address-space rule — this enumeration feeds per-scene
+/// `outputLevel` writes + saves): a second connection sits between the two reads, so a
+/// replacement preset landing on the same slot could otherwise pass a slot+name check
+/// alone (a duplicate or renamed-back `displayName` on a different preset). The backup
+/// row is accepted only when its slot, name, AND `info.preset_id` all match the field-8
+/// partial's own — falling back to slot+name when the field-8 partial carries no id. A
+/// scene list silently read from the WRONG preset would level the wrong sounds.
 pub(crate) fn read_preset_scenes_complete(list_index: u32) -> Result<PresetScenes, String> {
     let (json, scenes) = read_slot_scenes_raw(list_index)?;
     let doc = session::tolerant_parse_json(&String::from_utf8_lossy(&json));
@@ -182,6 +220,10 @@ pub(crate) fn read_preset_scenes_complete(list_index: u32) -> Result<PresetScene
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    let field8_id = doc
+        .as_ref()
+        .and_then(|d| crate::library::preset_id_of(d))
+        .map(str::to_string);
     let max_ref = doc.as_ref().and_then(footswitch::max_referenced_scene);
     log::warn!(
         "read_preset_scenes_complete: slot {} {field8_name:?} scene list truncated by the \
@@ -197,7 +239,12 @@ pub(crate) fn read_preset_scenes_complete(list_index: u32) -> Result<PresetScene
     let (blob, _stats) = s.device_backup(60, |_| {})?;
     drop(s);
     let backup = read_backup_archive(&blob)?;
-    scenes_from_backup_row(list_index, &field8_name, &backup.presets)
+    scenes_from_backup_row(
+        list_index,
+        &field8_name,
+        field8_id.as_deref(),
+        &backup.presets,
+    )
 }
 
 /// Pure-lazy scene read for one preset. It never loads the preset: the command reads
@@ -509,6 +556,26 @@ fn persist_device_settings(path: Option<&std::path::Path>, result: &mut BackupRe
     let Some(bytes) = result.settings_bytes.take() else {
         return;
     };
+    // Announce the one device global that can silently defeat a deferred-write leveling
+    // run (`level_scenes::scene_discard_guard` refuses outright on DISCARD). Read from
+    // the FRESH device bytes, before the write, so it is reported even when the snapshot
+    // can't be persisted at all. `scripts/e2e.sh`'s `scene_change_preflight` greps this
+    // exact line out of the server log rather than locating the snapshot itself — that
+    // path is `app_config_dir()`-derived and so varies by OS and bundle identifier. The
+    // three verdict words are that consumer's contract: reword them and the pre-flight
+    // silently degrades to "unreadable, proceed" (the in-run guard still fires, but ~13
+    // min later).
+    log::info!(
+        "device settings: sceneChangeBehavior={}",
+        match std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(crate::backup_read::scene_change_behavior)
+        {
+            Some(crate::backup_read::SceneChangeBehavior::Discard) => "DISCARD",
+            Some(crate::backup_read::SceneChangeBehavior::Retain) => "MAINTAIN",
+            None => "unknown",
+        }
+    );
     let Some(path) = path else { return };
     let write = || -> Result<(), String> {
         if let Some(parent) = path.parent() {
@@ -646,13 +713,22 @@ mod truncation_fallback_tests {
         assert!(!preset_scenes_look_truncated(doc.as_ref(), &scenes));
     }
 
-    fn backup_row(slot: i64, name: &str, scenes: Vec<SceneInfo>) -> BackupPresetRow {
+    const ROW_ID: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+
+    fn backup_row_id(
+        slot: i64,
+        name: &str,
+        preset_id: Option<&str>,
+        scenes: Vec<SceneInfo>,
+    ) -> BackupPresetRow {
         BackupPresetRow {
             slot,
             name: name.to_string(),
+            preset_id: preset_id.map(str::to_string),
             scene_count: scenes.len() as i64,
             scenes,
             amp_candidates: Vec::new(),
+            base_active_amp_count: 0,
             blocks: Vec::new(),
             graph: session::ActiveGraph::default(),
             footswitches: vec![footswitch::FootswitchInfo {
@@ -669,6 +745,10 @@ mod truncation_fallback_tests {
         }
     }
 
+    fn backup_row(slot: i64, name: &str, scenes: Vec<SceneInfo>) -> BackupPresetRow {
+        backup_row_id(slot, name, Some(ROW_ID), scenes)
+    }
+
     #[test]
     fn name_mismatch_is_refused_naming_both_names() {
         // Non-overlapping names (neither is a substring of the other) so the two
@@ -681,7 +761,7 @@ mod truncation_fallback_tests {
                 fs: Some(1),
             }],
         )];
-        let err = match scenes_from_backup_row(24, "HBE ANATOMY", &rows) {
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows) {
             Ok(_) => panic!("mismatched name must be refused"),
             Err(e) => e,
         };
@@ -692,7 +772,7 @@ mod truncation_fallback_tests {
     #[test]
     fn no_matching_slot_is_refused() {
         let rows = vec![backup_row(3, "Other Preset", vec![])];
-        let err = match scenes_from_backup_row(24, "HBE ANATOMY", &rows) {
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows) {
             Ok(_) => panic!("no row for the slot must be refused"),
             Err(e) => e,
         };
@@ -707,7 +787,7 @@ mod truncation_fallback_tests {
         // exists to eliminate.
         let mut row = backup_row(25, "HBE ANATOMY", vec![]);
         row.scene_count = -1;
-        let err = match scenes_from_backup_row(24, "HBE ANATOMY", &[row]) {
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &[row]) {
             Ok(_) => panic!("an unparseable backup row must be refused"),
             Err(e) => e,
         };
@@ -738,10 +818,137 @@ mod truncation_fallback_tests {
                 },
             ],
         )];
-        let scenes = scenes_from_backup_row(24, "HBE ANATOMY", &rows).expect("matching row");
+        let scenes =
+            scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows).expect("matching row");
         assert_eq!(scenes.scenes, vec!["Dirt", "Crunch", "Solo", "Clean"]);
         assert_eq!(scenes.fs, vec![Some(1), None, Some(3), Some(4)]);
         assert_eq!(scenes.footswitches.len(), 1);
         assert_eq!(scenes.footswitches[0].label, "Boost");
+    }
+
+    const OTHER_ID: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+
+    #[test]
+    fn preset_id_mismatch_is_refused_naming_both_ids() {
+        // Same slot, same name — only the id guard can refuse this one.
+        let rows = vec![backup_row_id(
+            25,
+            "HBE ANATOMY",
+            Some(ROW_ID),
+            vec![SceneInfo {
+                name: "Dirt".to_string(),
+                fs: Some(1),
+            }],
+        )];
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(OTHER_ID), &rows) {
+            Ok(_) => panic!("mismatched preset_id must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains(ROW_ID), "{err}");
+        assert!(err.contains(OTHER_ID), "{err}");
+        assert!(err.contains("25"), "{err}");
+        assert!(err.contains("HBE ANATOMY"), "{err}");
+    }
+
+    #[test]
+    fn missing_row_preset_id_is_refused_when_the_field8_partial_has_one() {
+        let rows = vec![backup_row_id(
+            25,
+            "HBE ANATOMY",
+            None,
+            vec![SceneInfo {
+                name: "Dirt".to_string(),
+                fs: Some(1),
+            }],
+        )];
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows) {
+            Ok(_) => panic!("a row with no preset_id must be refused when field-8 has one"),
+            Err(e) => e,
+        };
+        assert!(err.contains("preset_id"), "{err}");
+        assert!(err.contains(ROW_ID), "{err}");
+        assert!(err.contains("25"), "{err}");
+    }
+
+    #[test]
+    fn absent_field8_preset_id_falls_back_to_slot_and_name() {
+        let scenes_in = vec![SceneInfo {
+            name: "Dirt".to_string(),
+            fs: Some(1),
+        }];
+        let rows_with_id = vec![backup_row_id(
+            25,
+            "HBE ANATOMY",
+            Some(ROW_ID),
+            scenes_in.clone(),
+        )];
+        let scenes = scenes_from_backup_row(24, "HBE ANATOMY", None, &rows_with_id)
+            .expect("no field-8 id: falls back to slot+name, row id present");
+        assert_eq!(scenes.scenes, vec!["Dirt"]);
+
+        let rows_without_id = vec![backup_row_id(25, "HBE ANATOMY", None, scenes_in)];
+        let scenes = scenes_from_backup_row(24, "HBE ANATOMY", None, &rows_without_id)
+            .expect("no field-8 id: falls back to slot+name, row id absent too");
+        assert_eq!(scenes.scenes, vec!["Dirt"]);
+    }
+
+    #[test]
+    fn matching_preset_ids_are_accepted() {
+        let rows = vec![backup_row_id(
+            25,
+            "HBE ANATOMY",
+            Some(ROW_ID),
+            vec![SceneInfo {
+                name: "Dirt".to_string(),
+                fs: Some(1),
+            }],
+        )];
+        let scenes = scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows)
+            .expect("matching preset_id");
+        assert_eq!(scenes.scenes, vec!["Dirt"]);
+        assert_eq!(scenes.fs, vec![Some(1)]);
+        assert_eq!(scenes.footswitches.len(), 1);
+    }
+
+    #[test]
+    fn empty_string_preset_ids_are_treated_as_absent_never_matched() {
+        let scenes_in = vec![SceneInfo {
+            name: "Dirt".to_string(),
+            fs: Some(1),
+        }];
+        // Row carries an empty-string preset_id: treated as absent, so it can never
+        // satisfy a present field-8 id — must refuse, not vacuously accept.
+        let rows_empty_row_id = vec![backup_row_id(
+            25,
+            "HBE ANATOMY",
+            Some(""),
+            scenes_in.clone(),
+        )];
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &rows_empty_row_id)
+        {
+            Ok(_) => panic!("an empty-string row id must never satisfy a present field-8 id"),
+            Err(e) => e,
+        };
+        assert!(err.contains(ROW_ID), "{err}");
+
+        // field-8 carries an empty-string id: treated as absent, so the identity
+        // check is skipped (fallback path) — must accept on slot+name alone.
+        let rows_with_id = vec![backup_row_id(25, "HBE ANATOMY", Some(ROW_ID), scenes_in)];
+        let scenes = scenes_from_backup_row(24, "HBE ANATOMY", Some(""), &rows_with_id)
+            .expect("empty-string field-8 id falls back to slot+name");
+        assert_eq!(scenes.scenes, vec!["Dirt"]);
+    }
+
+    #[test]
+    fn unparseable_row_error_wins_over_the_id_guard() {
+        // scene_count == -1 AND a mismatched id: the scene_count guard must fire
+        // first and keep its precise "unparseable" message, not the id-mismatch one.
+        let mut row = backup_row_id(25, "HBE ANATOMY", Some(OTHER_ID), vec![]);
+        row.scene_count = -1;
+        let err = match scenes_from_backup_row(24, "HBE ANATOMY", Some(ROW_ID), &[row]) {
+            Ok(_) => panic!("an unparseable backup row must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unparseable"), "{err}");
     }
 }

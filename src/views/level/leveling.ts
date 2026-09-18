@@ -1,9 +1,10 @@
 // src/views/level/leveling.ts — types + helpers for the unified leveling flow.
 //
 // The unit of leveling is a SCENE. A preset's BASE scene carries cross-preset
-// loudness ("levels this preset against the others" → preset `presetLevel`); an FS
-// scene is leveled within its preset ("levels this scene against the preset's base"
-// → amp `outputLevel` in scene mode). The mechanism is never exposed: no block /
+// loudness ("matches this preset’s loudness to your other presets" → preset
+// `presetLevel`); an FS scene is leveled within its preset ("matches this scene's
+// loudness to the preset’s base sound" → amp `outputLevel` in scene mode). The
+// mechanism is never exposed: no block /
 // parameter selector, the target is implicit and fixed.
 //
 // SELECTION lives in the list (the scene tree): the source of truth is a flat set of
@@ -15,7 +16,7 @@
 // commit) → run (steps the chosen scenes) → summary.
 
 import type {
-  ClampKind,
+  BaseBoostSummary,
   FootswitchInfo,
   LevelJob,
   LevelParamCandidate,
@@ -23,10 +24,10 @@ import type {
   Profile,
   SceneInfo,
   SilenceHint,
-  TradeSummary,
 } from "../../lib/types";
 import type { PresetRow } from "../PresetList";
 import type { PickOption } from "../overlays/Pick";
+import type { PresetGroup } from "./PresetGroupRow";
 // `SceneHandlePick` is declared ONCE, as the `levelScenesApplyBatched` wire type in
 // invoke.ts (its `SceneLevelJobWire.handle` field) — re-exported below so
 // `SetupOption`/`RunItem` and the scene-handle-picker wiring can import it from
@@ -34,7 +35,6 @@ import type { PickOption } from "../overlays/Pick";
 import type { SceneHandlePick } from "../../lib/invoke";
 import { blockArtTile, shortFallback } from "../../models/blockArt";
 import { stripNameFor } from "../../models/catalog";
-import { slotLabel } from "../../lib/format";
 
 export type { SceneHandlePick };
 
@@ -385,6 +385,46 @@ export interface SetupChoice {
   targetName: string;
 }
 
+/** A row's position in its preset's DEPENDENCY order — each rank writes a control the
+ *  ranks below it render through, so running them in any other order shifts rows that
+ *  are already on target:
+ *
+ *  - `0` Base: `presetLevel`, a global multiplier over every other row.
+ *  - `1` Footswitch in BASE context (`sceneContext == null`): its handle is often a block
+ *    the preset leaves ON in base, and a scene renders its whole base chain, so this
+ *    base-space write moves every scene. It must land before the scenes it moves.
+ *  - `2` Scene: a per-scene amp `outputLevel` overlay, scene-local — it moves nothing that
+ *    any other row renders through.
+ *  - `3` Footswitch in SCENE context (`sceneContext != null`): measured with its context
+ *    scene recalled, so it cannot be solved until that scene is on target. `ftswStates`
+ *    naming that scene means the switch is ON in the scene's recorded state, so the scene
+ *    pass has already put this exact sound on target and the row measures in-tolerance and
+ *    skips its write.
+ *
+ *  Rank order: 0 base, 1 base-context footswitch, 2 scene, 3 scene-context footswitch — the
+ *  split is per-row, not "all footswitches early" or "all footswitches late". HW evidence
+ *  (the online 410 arc) is in `notes/gotchas.md`'s "A scene renders the base chain's ON
+ *  blocks" entry.
+ *
+ *  `chosenFrom` emits this order; `useLevelingFlow` sorts by it so the run holds
+ *  regardless of how its items were assembled. */
+export function runRank(it: {
+  isBase: boolean;
+  footswitch?: unknown;
+}): 0 | 1 | 2 | 3 {
+  if (it.isBase) return 0;
+  const fs = it.footswitch;
+  if (fs == null) return 2;
+  // Only a NUMERIC context ranks late: absent, `null` and an unresolved `undefined` all
+  // mean base context, the conservative side (a truthiness test would mis-read scene 0).
+  // `unknown` + probe rather than a typed field: the two callers pass genuinely different
+  // shapes (a full `FootswitchTarget`, and a bare object with no `sceneContext` at all —
+  // which the gate below exists to pin), and no single object type accepts both.
+  const ctx =
+    typeof fs === "object" && "sceneContext" in fs ? fs.sceneContext : null;
+  return typeof ctx === "number" ? 3 : 1;
+}
+
 /** Resolve the scene keys SELECTED in the list into the setup rows to configure.
  *  Walks every non-empty preset (sorted, Base-first) and emits a SetupOption for
  *  each of its keys present in `sel`. Everything returned WILL be leveled — the
@@ -417,24 +457,16 @@ export function chosenFrom(
           hasScenes: hasChildren,
         });
       }
-      scenes.forEach((sc, i) => {
-        if (sel.has(sceneKeyOf(r.slot, i))) {
-          items.push({
-            key: sceneKeyOf(r.slot, i),
-            slot: r.slot,
-            presetName: r.name,
-            isBase: false,
-            sceneSlot: i, // the row index IS the 0-based wire sceneSlot
-            sceneName: sc.name,
-            tag: sc.fs != null ? `FS${String(sc.fs)}` : "—",
-            hasScenes: true,
-          });
-        }
-      });
+      // Emitted in `runRank` order — Base, BASE-CONTEXT footswitches, scenes, then
+      // SCENE-CONTEXT footswitches. Rather than restate that order as separate passes, the
+      // preset's rows are built once and sorted through `runRank` itself, which owns the rule
+      // and carries the HW evidence for both halves of the split. The sort is stable, so each
+      // switch keeps its ORIGINAL index in `fswKey` and scenes keep their wire order.
+      const children: SetupOption[] = [];
       footswitches.forEach((f, i) => {
         const target = footswitchTarget(f);
         if (target && sel.has(fswKey(r.slot, i))) {
-          items.push({
+          children.push({
             key: fswKey(r.slot, i),
             slot: r.slot,
             presetName: r.name,
@@ -450,6 +482,22 @@ export function chosenFrom(
           });
         }
       });
+      scenes.forEach((sc, i) => {
+        if (sel.has(sceneKeyOf(r.slot, i))) {
+          children.push({
+            key: sceneKeyOf(r.slot, i),
+            slot: r.slot,
+            presetName: r.name,
+            isBase: false,
+            sceneSlot: i, // the row index IS the 0-based wire sceneSlot
+            sceneName: sc.name,
+            tag: sc.fs != null ? `FS${String(sc.fs)}` : "—",
+            hasScenes: true,
+          });
+        }
+      });
+      children.sort((a, b) => runRank(a) - runRank(b));
+      items.push(...children);
     });
   return items;
 }
@@ -517,18 +565,8 @@ export interface RunItem {
   /** Base rows only: this row's handle pick, carried from Set up into the dispatch
    *  (mirrors `SetupOption.baseHandle`). */
   baseHandle?: BaseHandlePick | null;
-  /** The clamp's CAUSE from the shared taxonomy, when clamped — render
-   *  `CLAMP_MESSAGES[clampKind]` verbatim. Null/undefined on a non-clamped row. */
-  clampKind?: ClampKind | null;
-  /** THE HEADROOM TRADE this row's batch made (or, on a preview, WOULD make) — see
-   *  `TradeSummary`. Stamped on every row of a batch that traded. Null/undefined
-   *  otherwise. */
-  trade?: TradeSummary | null;
   /** Dynamics spread of the measure capture (LU); drives the "dynamic" by-ear cause. */
   spreadLu?: number | null;
-  /** The preset's saved `presetLevel` before this run wrote it — enables the Summary
-   *  "Restore original" (Base rows only; scene/footswitch writes aren't revertable). */
-  previousLevel?: number | null;
   /** PREDICTED true peak (dBTP) at the leveled setting — an estimate, never a
    *  re-measurement. Only Base rows carry a value (undefined/null elsewhere); drives
    *  the Summary "may clip" chip when > −1 dBTP. */
@@ -556,6 +594,11 @@ export interface RunItem {
    *  no ceiling): the run loop leaves the row's existing outcome untouched so it stays
    *  visible/counted in the Summary without wasting a re-capture on a signal-less sound. */
   skipRelevel?: boolean;
+  /** Base rows only: this row's base-pair BOOST disclosure, carried verbatim from the
+   *  result's `base_boost` — see `BaseBoostSummary`'s own doc. `null`/undefined on every
+   *  row whose base pair never entered the `Boost` regime (the common case) and on every
+   *  non-base row. */
+  baseBoost?: BaseBoostSummary | null;
 }
 
 /** A finished row's MEASURED raw ceiling for the reachable-common-target derivation, or null
@@ -577,18 +620,29 @@ export const ceilingOf = (it: RunItem): number | null => {
   return c != null && Number.isFinite(c) ? c : null;
 };
 
+/** Group run items by preset slot, ascending — the shape both Run and Summary render
+ *  (one `PresetGroupRow` per preset, its items nested inside). */
+export function groupItemsBySlot(items: RunItem[]): PresetGroup<RunItem>[] {
+  const by = new Map<number, PresetGroup<RunItem>>();
+  items.forEach((it) => {
+    let g = by.get(it.slot);
+    if (!g) {
+      g = { slot: it.slot, name: it.presetName, items: [] };
+      by.set(it.slot, g);
+    }
+    g.items.push(it);
+  });
+  return [...by.values()].sort((a, b) => a.slot - b.slot);
+}
+
 /** The offbranch ("silent capture") row status, refined by the preset's JSON-visible
- *  cause when the backup scan found one. Rendered verbatim in RunBody + SummaryBody. */
+ *  cause when the backup scan found one. Rendered verbatim in RunPage; used only to
+ *  branch copy in SummaryPage. */
 export function offbranchStatus(hint: SilenceHint | undefined): string {
   if (hint === "amp_zero") return "amp output at zero";
   if (hint === "exp_mute") return "exp pedal may mute";
   return "not on USB 1/2";
 }
-
-/** The sound's preset line — the mono sub-line under its name. Rendered verbatim in
- *  RunBody + SummaryBody, so it lives here rather than being retyped on both. */
-export const presetLine = (it: RunItem): string =>
-  `${slotLabel(it.slot)} · ${it.presetName}`;
 
 /** The LUFS a row is ACTUALLY aiming at. The reachable-common-target fallback stamps an
  *  explicit override that wins over the named target — the run loop's dispatch and the

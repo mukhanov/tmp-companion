@@ -159,6 +159,105 @@ pub(crate) fn stimulus_instrument(topology_id: Option<&str>) -> &'static str {
         .unwrap_or("guitar")
 }
 
+/// The Phase-2 boost candidate: the base amp's `outputLevel` knob job, classified by the SAME
+/// amp classifier a scene batch run uses (`build_scene_jobs_with_handles`), scoped to base
+/// (`session::BASE_SCENE_SLOT`). `None` on ANY refusal — an unusual routing (parallel/split/
+/// mic), no amp-`outputLevel` candidate, a classifier error, or an amp `force` already
+/// force-bypasses (boosting an amp that's forced OFF for this isolated capture is nonsensical)
+/// — degrades to today's plain path, never a hard error: boost is an OPPORTUNISTIC extra, not
+/// a leveling prerequisite.
+///
+/// Stamps `force_bypass = force` onto the returned job itself (`build_scene_jobs_with_handles`
+/// always emits `force_bypass: Vec::new()` — isolation is the CALLER's to stamp, see
+/// `level_scenes_apply_batched`). Owning the stamp HERE, in one named helper, is the fix:
+/// without it `jointk_one_scene` → `apply_levels` → `set_knobs`'s base recall (`load_scene`)
+/// would revert the forced-bypass footswitches to their SAVED state mid-solve, so every capture
+/// in the boost's measure/verify/secant loop would read base-with-pedals-on instead of the
+/// isolated base the plan was computed against — silently wrong by whatever those pedals add,
+/// with `verify_lufs` still reading on-target.
+fn base_boost_candidate(
+    preset: &serde_json::Value,
+    target_lufs: f64,
+    force: &[(String, String, bool)],
+) -> Option<leveller::SceneJob> {
+    let candidates = filter_amp_candidates(session::extract_level_blocks(preset));
+    build_scene_jobs_with_handles(
+        &[session::BASE_SCENE_SLOT],
+        &candidates,
+        &[(session::BASE_SCENE_SLOT, Some(preset.clone()))],
+        target_lufs,
+        Some(preset),
+        &[],
+    )
+    .ok()
+    .and_then(|jobs| jobs.into_iter().next())
+    .filter(|job| job.skip.is_none() && job.knobs.len() == 1)
+    .filter(|job| match &job.knobs[0].knob {
+        leveller::LevelKnob::Block {
+            group_id, node_id, ..
+        } => !force.iter().any(|(g, n, _)| g == group_id && n == node_id),
+        leveller::LevelKnob::PresetLevel => true,
+    })
+    .map(|mut job| {
+        job.force_bypass = force.to_vec();
+        job
+    })
+}
+
+#[cfg(test)]
+mod base_boost_candidate_tests {
+    use super::*;
+
+    fn series_amp_preset() -> serde_json::Value {
+        serde_json::json!({
+            "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+                {
+                    "nodeId": "amp",
+                    "FenderId": "ACD_TwinReverb65NoFx",
+                    "dspUnitParameters": { "bypass": false, "outputLevel": 0.42 }
+                }
+            ] } }
+        })
+    }
+
+    // A classifiable single amp with no isolation in the way: the candidate carries the amp's
+    // knob and the isolation list is stamped onto it whole, even when empty.
+    #[test]
+    fn a_single_amp_candidate_is_returned_with_force_bypass_stamped() {
+        let preset = series_amp_preset();
+        let job = base_boost_candidate(&preset, -23.0, &[]).expect("one amp candidate");
+        assert_eq!(job.knobs.len(), 1);
+        assert!(job.force_bypass.is_empty());
+        let leveller::LevelKnob::Block {
+            group_id, node_id, ..
+        } = &job.knobs[0].knob
+        else {
+            panic!("expected a Block knob");
+        };
+        assert_eq!((group_id.as_str(), node_id.as_str()), ("G1", "amp"));
+
+        let force = [("G1".to_string(), "other".to_string(), true)];
+        let job = base_boost_candidate(&preset, -23.0, &force).expect("still classifiable");
+        assert_eq!(job.force_bypass, force, "the isolation list rides whole");
+    }
+
+    // An amp the isolation list itself force-bypasses can't be boosted (it's forced OFF for
+    // this isolated capture) — the candidate must refuse rather than boost a silenced amp.
+    #[test]
+    fn an_amp_already_force_bypassed_yields_no_candidate() {
+        let preset = series_amp_preset();
+        let force = [("G1".to_string(), "amp".to_string(), true)];
+        assert!(base_boost_candidate(&preset, -23.0, &force).is_none());
+    }
+
+    // No outputLevel candidate at all (e.g. an empty graph) degrades to `None`, never an error.
+    #[test]
+    fn no_amp_candidates_yields_no_error_just_none() {
+        let preset = serde_json::json!({ "audioGraph": { "guitarNodes": {} } });
+        assert!(base_boost_candidate(&preset, -23.0, &[]).is_none());
+    }
+}
+
 /// Level one preset to its target (the real, one-shot open-loop path). The
 /// leveller opens its own fresh connections (load → measure → set), so the work
 /// runs with the app's seize released (see `with_released_seize`).
@@ -291,78 +390,54 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                 // BASE MEANS BASE — every footswitch-owned on-off block is forced OFF, so the
                 // measurement describes the preset with nothing switched on. A preset saved
                 // with a pedal engaged does NOT measure that pedal here; that sound is its own
-                // footswitch row's job (user directive, 2026-08-20).
+                // footswitch row's job (user directive, 2026-08-20; the HW evidence behind it
+                // is in `notes/leveling.md`).
                 //
-                // This REVERTS a 2026-08-19 change that measured base as saved. That change was
-                // argued from an external ffmpeg read of −18.3 LUFS against a −23.0 target on
-                // "Plumes+BD2+OCD" — a real number, but a CONFOUNDED one: on the same day, on
-                // that same preset, the block's own footswitch row was clamping in every
-                // multi-row batch (see the isolation note in `footswitch.rs`), which by itself
-                // leaves the recalled sound exactly that hot. With the clamp fixed, base and
-                // its pedal row are separately reachable, and re-measuring is unambiguous
-                // (HW, 2026-08-20, ffmpeg `ebur128`, the player's own DI): base-as-saved and
-                // the FS6 row are the SAME sound — both −22.99 LUFS — while base with the four
-                // pedals off sits 4.7 LU away at −27.69. Measuring base as saved spends one of
-                // the run's rows on a duplicate and never levels the no-pedals sound at all.
-                //
-                // `ftsw` is LOAD-BEARING now, so the read must deliver it WHOLE: it sits at the
-                // tail, exactly where a large preset's field-8 read gets cut, and a short `ftsw`
-                // yields a short force list — pedals left on, and the wrong `presetLevel` SAVED.
-                // `read_slot_preset_complete` re-reads off a device backup when a required
-                // section is truncated, so an unreadable `ftsw` REFUSES instead of guessing.
-                // The same read still supplies the revert anchor and the save's `restore_scene`.
-                let preset = match read_slot_preset_complete(slot, &["ftsw"]) {
-                    Ok((preset, _, _)) => preset,
-                    // Returns BEFORE the run-end `reamp_off_guaranteed` backstop, which is safe
-                    // only because nothing has engaged re-amp yet on this path: every step above
-                    // is a pure read. Same rule as the block arm's early refusal.
-                    Err(e) => {
-                        return Err(format!(
-                            "could not read preset {}'s footswitch assignments ({e}) — they \
-                             define which blocks are switched off for the Base measurement, and \
-                             leveling without them would save a level solved for the wrong sound",
-                            slot + 1
-                        ))
-                    }
-                };
+                // `ftsw` sits at the field-8 truncation cliff, so a short read yields a short
+                // force list — pedals left on, and the wrong `presetLevel` SAVED. The shared
+                // read REFUSES on a truncated `ftsw` rather than leveling a guess. Refusing
+                // here returns BEFORE the run-end `reamp_off_guaranteed` backstop, safe only
+                // because every step above is a pure read: nothing has engaged re-amp yet.
+                let (preset, has_fs_scenes, force, restore_scene) =
+                    crate::commands::doctor::read_base_isolation(slot)?;
                 // The original `lastLoadedScene` must be re-stamped by the save: the
                 // base-context measurement leaves base active, and saving there would
                 // rewrite the preset's on-load scene to base (HW, Hiwatt slot 31).
                 previous_level = audiograph::preset_level(&preset).map(|v| v as f32);
-                opts.restore_scene = crate::last_loaded_scene(&preset);
+                opts.restore_scene = restore_scene;
                 crate::warn_missing_restore_scene("level_preset", slot, &preset, opts.restore_scene);
-                // THE base isolation list — shared with the Doctor's own base sound
-                // (`doctor_force_bypass`'s `None` arm) so the two definitions of "base" cannot
-                // drift apart: every on-off block any footswitch owns, forced bypassed.
-                let force = crate::commands::doctor::doctor_force_bypass(
-                    &preset["ftsw"],
-                    &preset,
-                    None,
-                );
                 log::info!(
                     "level_preset slot={slot}: base isolation forces {} footswitch-owned \
                      block(s) off",
                     force.len()
                 );
-                // That read opened its own session — gap before level_preset reconnects, else
-                // the quick reopen risks the HID open-lockout (0xe00002c5).
-                crate::settle(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
-                leveller::level_preset(
+                // ⟦BOOST⟧ Derive the base amp candidate for the plan-then-apply routing.
+                let base_amp = base_boost_candidate(&preset, target_lufs, &force);
+                log::info!(
+                    "level_preset slot={slot}: base boost candidate {:?}",
+                    base_amp.as_ref().map(|j| j.knobs[0].knob.label())
+                );
+                leveller::level_preset_impl(
                     slot,
                     &stim,
                     target_lufs,
                     opts,
                     &force,
                     previous_level,
+                    leveller::BoostContext {
+                        base_amp,
+                        saved: Some(&preset),
+                        has_fs_scenes,
+                    },
                     cancelled,
                 )
             }
         };
-        // The revert anchor rides the result (Summary "Restore original"). In-memory
-        // only: a restart-surviving restore is a follow-up that ships WITH its reader UI.
-        // Only staple when this run actually SAVED (and the leveller left it unset) —
-        // the leveller returns `previous_level: None` itself both for its own idempotency
-        // skip AND the no-signal clamp, and neither has anything worth "restoring".
+        // `previous_level` rides the result for the re-run idempotency skip (see
+        // `level_unchanged`) — not a user-facing revert; design 1a has no in-app restore
+        // of any kind. Only staple when this run actually SAVED (and the leveller left it
+        // unset) — the leveller returns `previous_level: None` itself both for its own
+        // idempotency skip AND the no-signal clamp, and neither has anything to staple.
         let result = result.map(|mut r| {
             if r.saved && r.previous_level.is_none() {
                 r.previous_level = previous_level;
@@ -400,27 +475,6 @@ pub(crate) fn cancel_preset_leveling() {
     crate::request_op_abort();
 }
 
-/// Restore a preset's `presetLevel` to its pre-leveling snapshot value (the
-/// Summary "Restore original" action). A device WRITE (set + save), serialized
-/// and seize-released like every leveling write. `presetLevel` only — scene and
-/// footswitch `outputLevel` writes are not revertable from here (UI copy says so).
-/// `expected_name` is the display name the run recorded for the slot; the write
-/// is refused if the preset list drifted and the slot now holds a different preset.
-#[tauri::command]
-pub(crate) async fn restore_preset_level(
-    state: State<'_, AppState>,
-    slot: u32,
-    level: f32,
-    expected_name: String,
-) -> Result<(), String> {
-    with_released_seize(state.session.clone(), move || {
-        log::info!(
-            "restore_preset_level slot={slot} level={level:.4} expected=\"{expected_name}\""
-        );
-        leveller::restore_preset_level(slot, level, &expected_name)
-    })
-    .await
-}
 /// What one Tier-2 calibration measured, plus its quality caveats.
 /// Mirrored in `src/lib/types.ts` (`CalibrateResult`).
 #[derive(Debug, Clone, Serialize)]
@@ -535,8 +589,7 @@ pub(crate) async fn calibrate_profile(
         //   take persists the capture as the leveling stimulus (injected verbatim at
         //   gain 1), so a fader-scaled one corrupts every later re-amp invisibly.
         //   `usb3_fader_fault` carries the full reasoning and the replug recovery.
-        let strip = settings_path
-            .and_then(|p| std::fs::read_to_string(p).ok())
+        let strip = crate::backup_read::read_settings_snapshot(settings_path.as_deref())
             .and_then(|json| crate::backup_read::usb3_strip(&json));
         let (mono, _peak) = crate::probe_api::stimulus::capture_dry_di(secs, strip.as_ref())?;
         if let Some(f) = strip
