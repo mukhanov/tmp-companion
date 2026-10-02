@@ -123,7 +123,7 @@ pub fn device_present() -> Result<bool, String> {
 
 /// The VID/PID fragment in a Windows HID interface path; no device handle needed.
 #[cfg(any(windows, test))]
-fn path_matches_tmp(path: &str) -> bool {
+pub(crate) fn path_matches_tmp(path: &str) -> bool {
     path.to_ascii_lowercase()
         .contains(&format!("vid_{VID:04x}&pid_{PID:04x}"))
 }

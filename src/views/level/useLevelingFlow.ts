@@ -34,6 +34,7 @@ import {
   toFootswitchJobWire,
 } from "../../lib/invoke";
 import { onLevelingLufs } from "../../lib/liveEvents";
+import { errMsg } from "../../lib/format";
 import { MODELS } from "../../models/catalog";
 import { resolveDeviceId } from "../../models/blockArt";
 import {
@@ -471,7 +472,10 @@ export function useLevelingFlow({
         setSoleActive(rows[0].item);
         publish(idx, false, false);
       };
-      const sweepUnresolved = <K>(entries: Map<K, BatchEntry>) => {
+      const sweepUnresolved = <K>(
+        entries: Map<K, BatchEntry>,
+        failureReason: string | null,
+      ) => {
         if (isCancelled()) {
           // A cancelled batch keeps un-run rows queued (still selected for a
           // follow-up run), but the optimistic `markGroupActive` row never got a
@@ -491,6 +495,7 @@ export function useLevelingFlow({
         }
         for (const entry of entries.values()) {
           if (entry.item.status !== "result") {
+            entry.item.skipReason = failureReason;
             entry.item.outcome = "skipped";
             finishItem(entry.item, entry.idx);
           }
@@ -543,8 +548,9 @@ export function useLevelingFlow({
               // A scene item with no wire slot — nothing to level.
               it.outcome = "skipped";
             }
-          } catch {
-            // One sound's failure shouldn't abort the run — flag it skipped.
+          } catch (error) {
+            // One sound's failure shouldn't abort the run — retain its reason.
+            it.skipReason = errMsg(error);
             it.outcome = "skipped";
           }
           finishItem(it, i);
@@ -579,6 +585,7 @@ export function useLevelingFlow({
           );
           const resolveFs = batchResolve(bySwitch, causeOf);
           markGroupActive(bySwitch, i);
+          let failureReason: string | null = null;
           try {
             await levelFootswitchesApply(
               {
@@ -599,10 +606,10 @@ export function useLevelingFlow({
                 resolveFs(item.switch, item.status, item.result, item.message);
               },
             );
-          } catch {
-            /* whole-group failure — the sweep flags unresolved rows skipped */
+          } catch (error) {
+            failureReason = errMsg(error);
           }
-          sweepUnresolved(bySwitch);
+          sweepUnresolved(bySwitch, failureReason);
           i = end;
           continue;
         }
@@ -679,6 +686,7 @@ export function useLevelingFlow({
         // Consequence, unchanged: the offline e2e HTTP bridge no-ops the Channel, so scene
         // rows there resolve to "skipped" (their physics is gated at the command level
         // instead — see level-defaults.spec.ts).
+        let failureReason: string | null = null;
         try {
           await levelScenesApplyBatched(
             {
@@ -710,10 +718,10 @@ export function useLevelingFlow({
               );
             },
           );
-        } catch {
-          /* whole-group failure — the sweep flags unresolved rows skipped */
+        } catch (error) {
+          failureReason = errMsg(error);
         }
-        sweepUnresolved(byScene);
+        sweepUnresolved(byScene, failureReason);
         i = end;
       }
 

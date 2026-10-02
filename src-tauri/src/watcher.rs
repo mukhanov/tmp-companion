@@ -17,9 +17,9 @@
 //! detach-cleanup ordering, coarser latency (up to ~1 s vs. IOKit's
 //! near-instant callback).
 //!
-//! Windows uses the same one-second polling loop, enumerating HID interfaces
-//! through SetupAPI without opening or seizing the device. A failed scan preserves
-//! the previous presence state instead of reporting a false detach.
+//! Windows also registers non-seizing Configuration Manager HID notifications.
+//! Queued removal/arrival events survive a quick replug between the one-second
+//! SetupAPI presence polls. Failed scans preserve the previous presence state.
 //!
 //! On removal (all supported platforms) it also clears the shared session slot: the
 //! seized handle is dead once the device is gone, and dropping it keeps a
@@ -227,6 +227,9 @@ mod imp {
     }
 }
 
+#[cfg(windows)]
+mod windows_notifications;
+
 #[cfg(any(target_os = "linux", windows))]
 mod imp {
     use super::*;
@@ -251,7 +254,28 @@ mod imp {
                     POLL_INTERVAL.as_secs()
                 );
                 let mut last = false;
+                #[cfg(windows)]
+                let mut notifications = None;
                 loop {
+                    #[cfg(windows)]
+                    {
+                        // Register before the initial scan, then retain every
+                        // removal witness even if the next scan is already true.
+                        // Retry registration errors while polling remains active.
+                        if notifications.is_none() {
+                            match super::windows_notifications::Notifications::register() {
+                                Ok(registered) => notifications = Some(registered),
+                                Err(error) => {
+                                    log::warn!("hotplug: notification registration failed: {error}")
+                                }
+                            }
+                        }
+                        if let Some(registered) = &notifications {
+                            for evt in observe_notifications(&mut last, registered.observations()) {
+                                emit_event(&app, &session, evt);
+                            }
+                        }
+                    }
                     #[cfg(target_os = "linux")]
                     let scan = Ok(crate::hid::device_present());
                     #[cfg(windows)]
@@ -265,24 +289,26 @@ mod imp {
                         }
                     };
                     if let Some(evt) = event {
-                        if evt == EVT_DETACHED {
-                            // Same cleanup, same order, as macOS's removed_cb:
-                            // drop the (now-dead) session first so a later
-                            // reconnect never collides with our own stale
-                            // handle or lock, then reset monitor/doctor state.
-                            *crate::lock_ok(&session) = None;
-                            crate::monitor::reset_startup_state();
-                            crate::commands::doctor::clear_doctor_before_cache();
-                            log::info!("hotplug: TMP detached — session released");
-                        } else {
-                            log::info!("hotplug: TMP attached");
-                        }
-                        let _ = app.emit(evt, ());
+                        emit_event(&app, &session, evt);
                     }
                     std::thread::sleep(POLL_INTERVAL);
                 }
             })
             .expect("spawn tmp-hotplug-watcher");
+    }
+
+    fn emit_event(app: &tauri::AppHandle, session: &Arc<Mutex<Option<Session>>>, evt: &str) {
+        if evt == EVT_DETACHED {
+            // Same cleanup order as macOS: release the stale handle, reset the
+            // monitor and Doctor caches, then notify the frontend.
+            *crate::lock_ok(session) = None;
+            crate::monitor::reset_startup_state();
+            crate::commands::doctor::clear_doctor_before_cache();
+            log::info!("hotplug: TMP detached — session released");
+        } else {
+            log::info!("hotplug: TMP attached");
+        }
+        let _ = app.emit(evt, ());
     }
 }
 
@@ -303,9 +329,46 @@ fn observe_presence(
     Ok(event)
 }
 
+/// Drain notification observations in order before reconciling the current scan.
+/// A removal followed by arrival must still release the old session.
+#[cfg(any(windows, test))]
+fn observe_notifications(
+    last: &mut bool,
+    observations: impl Iterator<Item = bool>,
+) -> Vec<&'static str> {
+    observations
+        .filter_map(|present| observe_presence(last, Ok(present)).ok().flatten())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_replug_between_present_polls_still_emits_detach_then_attach() {
+        let mut last = true;
+        assert_eq!(
+            observe_notifications(&mut last, [false, true].into_iter()),
+            vec![EVT_DETACHED, EVT_ATTACHED]
+        );
+        assert_eq!(observe_presence(&mut last, Ok(true)).unwrap(), None);
+    }
+
+    #[test]
+    fn notification_cleanup_is_not_lost_when_the_following_scan_fails() {
+        let mut last = true;
+        assert_eq!(
+            observe_notifications(&mut last, [false].into_iter()),
+            vec![EVT_DETACHED]
+        );
+        assert!(observe_presence(&mut last, Err("scan unavailable".into())).is_err());
+        assert!(!last);
+        assert_eq!(
+            observe_presence(&mut last, Ok(true)).unwrap(),
+            Some(EVT_ATTACHED)
+        );
+    }
 
     #[test]
     fn present_at_startup_emits_attach_once() {
