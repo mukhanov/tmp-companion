@@ -573,6 +573,9 @@ mod imp {
     }
 }
 
+#[cfg(any(windows, test))]
+mod endpoint_unity;
+
 /// Windows only: hold the TMP's OWN audio endpoints at unity volume for the
 /// LIFETIME of a re-amp session, restoring the user's values on drop. Shared-
 /// mode WASAPI applies the endpoint's Windows master volume (the system slider
@@ -589,8 +592,8 @@ mod imp {
 /// monitoring loop ("Listen to this device", a DAW echo) quiet in the player's
 /// rig — pinning 100% permanently doubled the user's live guitar the moment it
 /// landed. The hold touches ONLY endpoints whose friendly name matches the
-/// unit — never the user's speakers — and is best-effort: a COM failure logs
-/// and the measurement proceeds (it may then read low; the floor guards flag it).
+/// unit — never the user's speakers. Setup is transactional: a COM failure
+/// restores every touched endpoint and rejects the measurement.
 #[cfg(windows)]
 mod endpoint_volume {
     use windows::core::GUID;
@@ -600,82 +603,71 @@ mod endpoint_volume {
         eCapture, eRender, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+        STGM_READ,
     };
 
-    /// One endpoint's pre-hold state, by identity (flow + friendly name — the
-    /// hold re-resolves on restore, so no COM object is stored and the hold can
-    /// travel with the stream structs across the capture).
-    struct Prev {
+    use super::endpoint_unity::{Endpoint, State};
+
+    /// Identity only: do not move thread-affine COM interfaces with the streams.
+    pub(super) struct TmpEndpoint {
         capture: bool,
         name: String,
-        scalar: f32,
-        muted: bool,
     }
+    pub(super) type UnityHold = super::endpoint_unity::UnityHold<TmpEndpoint>;
 
-    /// RAII: TMP endpoints at 100%/unmuted until dropped, then restored.
-    pub(super) struct UnityHold {
-        prev: Vec<Prev>,
-    }
-
-    impl Drop for UnityHold {
-        fn drop(&mut self) {
-            for p in &self.prev {
-                if let Err(e) = with_tmp_endpoint(p.capture, &p.name, |vol| unsafe {
-                    vol.SetMasterVolumeLevelScalar(p.scalar, &GUID::zeroed())?;
-                    vol.SetMute(p.muted, &GUID::zeroed())
-                }) {
-                    log::warn!(
-                        "[audio] {}: failed to restore the Windows endpoint volume to {:.0}% ({e})",
-                        p.name,
-                        p.scalar * 100.0
-                    );
-                }
-            }
+    impl Endpoint for TmpEndpoint {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn state(&self) -> Result<State, String> {
+            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+                Ok(State {
+                    scalar: vol.GetMasterVolumeLevelScalar()?,
+                    muted: vol.GetMute()?.as_bool(),
+                })
+            })
+        }
+        fn set_scalar(&self, scalar: f32) -> Result<(), String> {
+            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+                vol.SetMasterVolumeLevelScalar(scalar, &GUID::zeroed())
+            })
+        }
+        fn set_muted(&self, muted: bool) -> Result<(), String> {
+            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+                vol.SetMute(muted, &GUID::zeroed())
+            })
         }
     }
 
-    /// Raise every TMP endpoint to unity, remembering what to restore.
-    pub(super) fn hold_tmp_unity() -> UnityHold {
-        let mut prev = Vec::new();
-        if let Err(e) = for_each_tmp_endpoint(|capture, name, vol| unsafe {
-            let scalar = vol.GetMasterVolumeLevelScalar()?;
-            let muted = vol.GetMute()?.as_bool();
-            if (scalar - 1.0).abs() > 0.001 || muted {
-                vol.SetMasterVolumeLevelScalar(1.0, &GUID::zeroed())?;
-                vol.SetMute(false, &GUID::zeroed())?;
-                log::warn!(
-                    "[audio] {name}: Windows endpoint volume was {:.0}%{} — holding it at 100% for this re-amp session (the system slider scales the inject/capture); it is restored afterwards",
-                    scalar * 100.0,
-                    if muted { " and MUTED" } else { "" }
-                );
-                prev.push(Prev {
-                    capture,
-                    name: name.to_string(),
-                    scalar,
-                    muted,
-                });
-            }
+    pub(super) fn hold_tmp_unity() -> Result<UnityHold, String> {
+        let mut endpoints = Vec::new();
+        for_each_tmp_endpoint(|capture, name, _| {
+            endpoints.push(TmpEndpoint {
+                capture,
+                name: name.to_string(),
+            });
             Ok(())
-        }) {
-            log::warn!("[audio] endpoint volume hold failed ({e}) — a nudged Windows volume slider on the Tone Master Pro endpoint will attenuate the re-amp inject");
-        }
-        UnityHold { prev }
+        })
+        .map_err(|e| format!("enumerate TMP endpoint volume: {e}"))?;
+        UnityHold::new(endpoints)
+            .map_err(|e| format!("cannot hold TMP endpoint volume at unity: {e}"))
     }
 
-    /// Run `f` for one named TMP endpoint (restore path).
-    fn with_tmp_endpoint(
+    fn with_tmp_endpoint<T>(
         capture: bool,
         target: &str,
-        f: impl Fn(&IAudioEndpointVolume) -> windows::core::Result<()>,
-    ) -> windows::core::Result<()> {
+        mut f: impl FnMut(&IAudioEndpointVolume) -> windows::core::Result<T>,
+    ) -> Result<T, String> {
+        let mut result = None;
         for_each_tmp_endpoint(|c, name, vol| {
             if c == capture && name == target {
-                f(vol)
-            } else {
-                Ok(())
+                result = Some(f(vol)?);
             }
+            Ok(())
         })
+        .map_err(|e| format!("{target}: {e}"))?;
+        result.ok_or_else(|| format!("TMP endpoint disappeared: {target}"))
     }
 
     /// Enumerate the active render+capture endpoints whose friendly name names
@@ -686,7 +678,17 @@ mod endpoint_volume {
         unsafe {
             // Per-thread; RPC_E_CHANGED_MODE just means the thread is already
             // initialized in another mode — either way COM is usable.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            struct ComInit(bool);
+            impl Drop for ComInit {
+                fn drop(&mut self) {
+                    if self.0 {
+                        unsafe { CoUninitialize() };
+                    }
+                }
+            }
+            // Balance both S_OK and S_FALSE; a changed apartment mode does not
+            // acquire a reference and must not be uninitialized here.
+            let _com = ComInit(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             for flow in [eRender, eCapture] {
@@ -879,7 +881,7 @@ fn resolve_reamp_streams(sample_rate: u32) -> Result<ReampStreams, String> {
     // A nudged Windows volume slider on the unit's endpoints silently scales the
     // inject/capture — hold unity for the session (restored when the streams drop).
     #[cfg(windows)]
-    let volume_hold = endpoint_volume::hold_tmp_unity();
+    let volume_hold = endpoint_volume::hold_tmp_unity()?;
     let host = cpal::default_host();
     let out_dev = find_device(host.output_devices().map_err(|e| e.to_string())?, |d| {
         channels_rates_formats(d.supported_output_configs().ok()).0
@@ -1531,11 +1533,11 @@ fn ring_append_raw(buf: &mut std::collections::VecDeque<f32>, data: &Data, cap: 
 /// stimulus forever and lets the caller measure recent capture windows after live
 /// parameter changes without rebuilding CoreAudio streams.
 pub struct LiveReamp {
-    /// See [`endpoint_volume`]: unity for the live session, restored on drop.
-    #[cfg(windows)]
-    _volume_hold: endpoint_volume::UnityHold,
     _out_stream: cpal::Stream,
     _in_stream: cpal::Stream,
+    /// Fields drop in declaration order: stop both streams before restoring volume.
+    #[cfg(windows)]
+    _volume_hold: endpoint_volume::UnityHold,
     captured: Arc<Mutex<std::collections::VecDeque<f32>>>,
     channels: usize,
     sample_rate: u32,
@@ -1667,7 +1669,7 @@ pub fn capture_input(secs: f32, sample_rate: u32) -> Result<Capture, String> {
     // The capture endpoint's Windows level scales what we record (see
     // `endpoint_volume`); calibration must read the instrument at unity.
     #[cfg(windows)]
-    let _volume_hold = endpoint_volume::hold_tmp_unity();
+    let _volume_hold = endpoint_volume::hold_tmp_unity()?;
     let host = cpal::default_host();
     let in_dev = find_device(host.input_devices().map_err(|e| e.to_string())?, |d| {
         channels_rates_formats(d.supported_input_configs().ok()).0

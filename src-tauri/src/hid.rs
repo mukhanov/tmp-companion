@@ -21,6 +21,9 @@ use std::thread::JoinHandle;
 
 use crate::proto;
 
+#[cfg(any(windows, test))]
+mod write_completion;
+
 /// Fender vendor ID / Tone Master Pro product ID.
 pub const VID: i32 = 0x1ED8;
 pub const PID: i32 = 0x44;
@@ -1195,6 +1198,36 @@ mod imp {
         dev
     }
 
+    struct PendingWrite<'a> {
+        handle: HANDLE,
+        event: HANDLE,
+        overlapped: &'a OVERLAPPED,
+    }
+    impl write_completion::PendingWrite for PendingWrite<'_> {
+        fn wait(&mut self, timeout_ms: u32) -> Result<bool, String> {
+            match unsafe { WaitForSingleObject(self.event, timeout_ms) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err(format!("HID write wait: {}", last_err())),
+            }
+        }
+        fn cancel(&mut self) -> Result<(), String> {
+            if unsafe { CancelIoEx(self.handle, self.overlapped) } != 0 {
+                Ok(())
+            } else {
+                Err(last_err().to_string())
+            }
+        }
+        fn finish(&mut self) -> Result<u32, String> {
+            let mut written = 0;
+            if unsafe { GetOverlappedResult(self.handle, self.overlapped, &mut written, 1) } != 0 {
+                Ok(written)
+            } else {
+                Err(format!("HID write: {}", last_err()))
+            }
+        }
+    }
+
     impl Dev {
         /// Synchronous write of one output report: report id `0x00` + the 63-byte
         /// frame, zero-padded to the descriptor length.
@@ -1221,11 +1254,13 @@ mod imp {
             let result = if ok != 0 {
                 Ok(written)
             } else if unsafe { GetLastError() } == ERROR_IO_PENDING {
-                if unsafe { GetOverlappedResult(self.handle, &ov, &mut written, 1) } != 0 {
-                    Ok(written)
-                } else {
-                    Err(format!("HID write: {}", last_err()))
-                }
+                // pkt and ov stay in this stack frame until terminal completion,
+                // including after the five-second cancellation policy fires.
+                write_completion::complete(&mut PendingWrite {
+                    handle: self.handle,
+                    event: ev,
+                    overlapped: &ov,
+                })
             } else {
                 Err(format!("HID write: {}", last_err()))
             };

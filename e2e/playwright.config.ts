@@ -1,11 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // webServer commands run with this config's dir (`e2e/`) as CWD. Vite must run from the
 // repo root, and on Windows a relative `../…` command reaches cmd.exe, which cannot run
 // it ("'..' is not recognized") — so the root is resolved and the server binary is given
 // as an absolute path with its platform suffix.
-const ROOT = path.resolve(import.meta.dirname, "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const E2E_SERVER = path.join(
   ROOT,
   "src-tauri",
@@ -80,7 +81,7 @@ export default defineConfig({
     // build — run `scripts/e2e.sh` (or `cargo build --features e2e --bin e2e_server`) to
     // pick up backend changes.
     ...Array.from({ length: WORKERS }, (_, i) => ({
-      command: E2E_SERVER,
+      command: `"${E2E_SERVER}"`,
       env: { TMP_E2E_PORT: String(PORT + i) },
       url: `http://127.0.0.1:${String(PORT + i)}/health`,
       reuseExistingServer: !process.env.CI,

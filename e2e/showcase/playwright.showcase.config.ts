@@ -1,5 +1,6 @@
 import { defineConfig, devices } from "@playwright/test";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Ports default to 7600/1421; scripts/e2e.sh exports a per-worktree pair (TMP_E2E_PORT /
 // TMP_E2E_VITE_PORT) — read it here too so a showcase run coexists with a sibling gate run.
@@ -40,7 +41,7 @@ export default defineConfig({
     {
       command: "bun run dev",
       // Vite runs from the repo root (webServer CWD defaults to this config's dir).
-      cwd: path.resolve(import.meta.dirname, "../.."),
+      cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.."),
       url: `http://localhost:${VITE}`,
       reuseExistingServer: true,
       timeout: 120_000,

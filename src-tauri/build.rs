@@ -21,7 +21,9 @@ fn main() {
     // only embeds into the app binaries — without it the `--features e2e` harness
     // (MockRuntime → comctl32 v6 imports) dies at load with
     // STATUS_ENTRYPOINT_NOT_FOUND. The MSVC linker embeds it directly.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests.manifest");
         println!("cargo:rerun-if-changed={}", manifest.display());
         // `rustc-link-arg-tests` only covers integration-test targets, not the lib's

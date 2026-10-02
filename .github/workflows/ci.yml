@@ -71,6 +71,8 @@ jobs:
         run: bun run test
 
       - name: Rust tests
+        # Explicit bash uses fail-fast native-command handling on Windows too.
+        shell: bash
         working-directory: src-tauri
         # Two lanes, for the same reason clippy runs two: a guard whose branch only
         # compiles under `e2e` is never executed by the default-feature run. The
@@ -82,6 +84,7 @@ jobs:
           cargo test --lib --features e2e
 
       - name: Rust clippy
+        shell: bash
         working-directory: src-tauri
         # Two lanes: default features, then the e2e feature. The e2e lane is
         # required because sim_device (+ e2e_server) only compile under
