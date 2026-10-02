@@ -602,6 +602,7 @@ mod endpoint_volume {
     use windows::Win32::Media::Audio::{
         eCapture, eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
     };
+    use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
         COINIT_MULTITHREADED, STGM_READ,
@@ -698,14 +699,14 @@ mod endpoint_volume {
                 for i in 0..devices.GetCount()? {
                     let device = devices.Item(i)?;
                     let store = device.OpenPropertyStore(STGM_READ)?;
-                    let value = store.GetValue(&PKEY_Device_FriendlyName)?;
-                    // VT_LPWSTR (31) carries the friendly name; anything else is
-                    // not an endpoint we can identify — skip it.
+                    let mut value = store.GetValue(&PKEY_Device_FriendlyName)?;
+                    // Copy the name before releasing GetValue's owning PROPVARIANT,
+                    // including values with a type we cannot use for discovery.
                     let inner = &value.Anonymous.Anonymous;
-                    if inner.vt.0 != 31 {
-                        continue;
-                    }
-                    let name = inner.Anonymous.pwszVal.to_string().unwrap_or_default();
+                    let name = (inner.vt.0 == 31)
+                        .then(|| inner.Anonymous.pwszVal.to_string().unwrap_or_default());
+                    PropVariantClear(&mut value)?;
+                    let Some(name) = name else { continue };
                     if !name.to_lowercase().contains("tone master") {
                         continue;
                     }
@@ -849,6 +850,22 @@ fn host_config_hint() -> &'static str {
     } else {
         ""
     }
+}
+
+/// Preserve the input-only failure and tell Windows users which capture format
+/// to change, without requiring them to reconfigure an unused output endpoint.
+fn input_config_error(sample_rate: u32, min_channels: usize, windows: bool) -> String {
+    let mut error = format!(
+        "no F32/I32 input config at {sample_rate} Hz with ≥{min_channels} channels — the dry \
+         instrument tap is USB-Out 3; is a non-TMP device named \"Tone Master\" \
+         selected?"
+    );
+    if windows {
+        error.push_str(&format!(
+            " — in Windows Sound settings set the Tone Master Pro Line input to a {sample_rate} Hz default format with at least {min_channels} channels (Properties → Advanced), then retry"
+        ));
+    }
+    error
 }
 
 /// Format a cpal stream-build failure, adding the one piece of context the
@@ -1688,14 +1705,7 @@ pub fn capture_input(secs: f32, sample_rate: u32) -> Result<Capture, String> {
         sample_rate,
         (DRY_INSTRUMENT_IN_CH + 1) as u16,
     )
-    .ok_or_else(|| {
-        format!(
-            "no F32/I32 input config at {sample_rate} Hz with ≥{} channels — the dry \
-             instrument tap is USB-Out 3; is a non-TMP device named \"Tone Master\" \
-             selected?",
-            DRY_INSTRUMENT_IN_CH + 1
-        )
-    })?;
+    .ok_or_else(|| input_config_error(sample_rate, DRY_INSTRUMENT_IN_CH + 1, cfg!(windows)))?;
     let in_ch = in_cfg.channels() as usize;
 
     let captured = Arc::new(Mutex::new(Vec::<f32>::with_capacity(
@@ -2585,5 +2595,28 @@ mod pipewire_hint_tests {
                 "missed: {err}",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod input_config_hint_tests {
+    use super::input_config_error;
+
+    #[test]
+    fn windows_calibration_failure_names_only_the_capture_format() {
+        let error = input_config_error(48_000, 3, true);
+        assert!(error.contains("48000 Hz with ≥3 channels"));
+        assert!(error.contains("USB-Out 3"));
+        assert!(error.contains("Windows Sound settings"));
+        assert!(error.contains("Line input"));
+        assert!(error.contains("Properties → Advanced"));
+        assert!(!error.contains("Speakers"));
+    }
+
+    #[test]
+    fn other_hosts_keep_the_input_failure_without_windows_advice() {
+        let error = input_config_error(48_000, 3, false);
+        assert!(error.contains("USB-Out 3"));
+        assert!(!error.contains("Windows"));
     }
 }

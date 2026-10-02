@@ -109,12 +109,23 @@ impl Hid {
 }
 
 /// Whether the TMP is currently attached, WITHOUT opening or seizing it — the
-/// Linux hotplug poller's only building block (`watcher.rs`'s `imp`), since
-/// hidraw has no IOHIDManager-style matching-callback equivalent. Reuses the
-/// same sysfs walk `open_device()` uses rather than a second matcher.
+/// Linux hotplug poller's building block: reuse the same sysfs walk as open.
+/// Windows uses the equivalent SetupAPI enumeration below, without CreateFile.
 #[cfg(target_os = "linux")]
 pub fn device_present() -> bool {
     imp::find_hidraw().is_ok()
+}
+
+#[cfg(windows)]
+pub fn device_present() -> Result<bool, String> {
+    imp::device_present()
+}
+
+/// The VID/PID fragment in a Windows HID interface path; no device handle needed.
+#[cfg(any(windows, test))]
+fn path_matches_tmp(path: &str) -> bool {
+    path.to_ascii_lowercase()
+        .contains(&format!("vid_{VID:04x}&pid_{PID:04x}"))
 }
 
 impl Drop for Hid {
@@ -979,8 +990,9 @@ mod imp {
         HidD_SetNumInputBuffers, HidP_GetCaps, HIDD_ATTRIBUTES, HIDP_CAPS,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_SHARING_VIOLATION,
-        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_IO_PENDING, ERROR_NO_MORE_ITEMS,
+        ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -1005,8 +1017,15 @@ mod imp {
         IoError::from_raw_os_error(unsafe { GetLastError() } as i32)
     }
 
-    /// Every present HID device-interface path, as UTF-16 with its NUL terminator
-    /// (ready for `CreateFileW`) plus a lossy string for matching/logging.
+    struct DeviceInfoSet(isize);
+    impl Drop for DeviceInfoSet {
+        fn drop(&mut self) {
+            unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+        }
+    }
+
+    /// Every present HID interface path, as NUL-terminated UTF-16 for CreateFile
+    /// and as a string for matching. Enumeration performs no device I/O.
     fn hid_interface_paths() -> Result<Vec<(Vec<u16>, String)>, String> {
         let mut guid = unsafe { std::mem::zeroed() };
         unsafe { HidD_GetHidGuid(&mut guid) };
@@ -1022,23 +1041,28 @@ mod imp {
         if set == INVALID_HANDLE_VALUE as isize {
             return Err(format!("SetupDiGetClassDevsW: {}", last_err()));
         }
+        let set = DeviceInfoSet(set);
         let mut out = Vec::new();
         let mut index = 0u32;
         loop {
             let mut iface: SP_DEVICE_INTERFACE_DATA = unsafe { std::mem::zeroed() };
             iface.cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
             let ok = unsafe {
-                SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &guid, index, &mut iface)
+                SetupDiEnumDeviceInterfaces(set.0, std::ptr::null(), &guid, index, &mut iface)
             };
             if ok == 0 {
-                break; // ERROR_NO_MORE_ITEMS, or a genuine error — either ends the walk
+                let err = last_err();
+                if err.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as i32) {
+                    break;
+                }
+                return Err(format!("SetupDiEnumDeviceInterfaces: {err}"));
             }
             index += 1;
             // First call sizes the detail buffer, second fills it.
             let mut needed = 0u32;
             unsafe {
                 SetupDiGetDeviceInterfaceDetailW(
-                    set,
+                    set.0,
                     &iface,
                     std::ptr::null_mut(),
                     0,
@@ -1047,7 +1071,10 @@ mod imp {
                 )
             };
             if needed == 0 {
-                continue;
+                return Err(format!(
+                    "SetupDiGetDeviceInterfaceDetailW (size): {}",
+                    last_err()
+                ));
             }
             let mut buf = vec![0u8; needed as usize];
             let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
@@ -1062,7 +1089,7 @@ mod imp {
             }
             let ok = unsafe {
                 SetupDiGetDeviceInterfaceDetailW(
-                    set,
+                    set.0,
                     &iface,
                     detail,
                     needed,
@@ -1071,7 +1098,7 @@ mod imp {
                 )
             };
             if ok == 0 {
-                continue;
+                return Err(format!("SetupDiGetDeviceInterfaceDetailW: {}", last_err()));
             }
             let path_ptr = unsafe { std::ptr::addr_of!((*detail).DevicePath) as *const u16 };
             let max = (needed as usize).saturating_sub(4) / 2;
@@ -1089,14 +1116,13 @@ mod imp {
             let text = String::from_utf16_lossy(&wide[..wide.len() - 1]);
             out.push((wide, text));
         }
-        unsafe { SetupDiDestroyDeviceInfoList(set) };
         Ok(out)
     }
 
-    /// The path fragment PnP puts in every device-interface path for our unit.
-    fn path_matches_tmp(path: &str) -> bool {
-        path.to_ascii_lowercase()
-            .contains(&format!("vid_{VID:04x}&pid_{PID:04x}"))
+    /// Presence only: never open/seize an interface, even during a live session.
+    pub(super) fn device_present() -> Result<bool, String> {
+        let paths = hid_interface_paths()?;
+        Ok(paths.iter().any(|(_, path)| path_matches_tmp(path)))
     }
 
     struct Dev {
@@ -1470,21 +1496,6 @@ mod imp {
             Err(_) => Err("HID thread exited before reporting status".into()),
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn path_match_is_case_insensitive_and_pid_zero_padded() {
-            assert!(path_matches_tmp(
-                r"\\?\hid#vid_1ed8&pid_0044&mi_02#9&2640e151&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
-            ));
-            assert!(path_matches_tmp(r"\\?\HID#VID_1ED8&PID_0044&MI_02#x"));
-            // The audio-side interface of the same unit is a different PID.
-            assert!(!path_matches_tmp(r"\\?\hid#vid_1ed8&pid_0047&mi_04#x"));
-        }
-    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1501,6 +1512,16 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_match_is_case_insensitive_and_pid_zero_padded() {
+        assert!(path_matches_tmp(
+            r"\\?\hid#vid_1ed8&pid_0044&mi_02#9&2640e151&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        assert!(path_matches_tmp(r"\\?\HID#VID_1ED8&PID_0044&MI_02#x"));
+        // The audio-side interface of the same unit is a different PID.
+        assert!(!path_matches_tmp(r"\\?\hid#vid_1ed8&pid_0047&mi_04#x"));
+    }
 
     /// Build a synthetic 64-byte input report: `0x00` report id, the magic, a
     /// dummy byte, a body length, then padding — the shape `fold_frame_open`
