@@ -596,23 +596,32 @@ mod endpoint_unity;
 /// restores every touched endpoint and rejects the measurement.
 #[cfg(windows)]
 mod endpoint_volume {
-    use windows::core::GUID;
+    use windows::core::{GUID, PCWSTR};
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::Media::Audio::{
-        eCapture, eRender, EDataFlow, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        eCapture, eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-        STGM_READ,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+        COINIT_MULTITHREADED, STGM_READ,
     };
 
     use super::endpoint_unity::{Endpoint, State};
 
     /// Identity only: do not move thread-affine COM interfaces with the streams.
     pub(super) struct TmpEndpoint {
-        capture: bool,
+        id: String,
         name: String,
+    }
+
+    struct ComInit(bool);
+    impl Drop for ComInit {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
     pub(super) type UnityHold = super::endpoint_unity::UnityHold<TmpEndpoint>;
 
@@ -621,7 +630,7 @@ mod endpoint_volume {
             &self.name
         }
         fn state(&self) -> Result<State, String> {
-            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+            with_tmp_endpoint(&self.id, &self.name, |vol| unsafe {
                 Ok(State {
                     scalar: vol.GetMasterVolumeLevelScalar()?,
                     muted: vol.GetMute()?.as_bool(),
@@ -629,12 +638,12 @@ mod endpoint_volume {
             })
         }
         fn set_scalar(&self, scalar: f32) -> Result<(), String> {
-            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+            with_tmp_endpoint(&self.id, &self.name, |vol| unsafe {
                 vol.SetMasterVolumeLevelScalar(scalar, &GUID::zeroed())
             })
         }
         fn set_muted(&self, muted: bool) -> Result<(), String> {
-            with_tmp_endpoint(self.capture, &self.name, |vol| unsafe {
+            with_tmp_endpoint(&self.id, &self.name, |vol| unsafe {
                 vol.SetMute(muted, &GUID::zeroed())
             })
         }
@@ -642,9 +651,9 @@ mod endpoint_volume {
 
     pub(super) fn hold_tmp_unity() -> Result<UnityHold, String> {
         let mut endpoints = Vec::new();
-        for_each_tmp_endpoint(|capture, name, _| {
+        for_each_tmp_endpoint(|id, name| {
             endpoints.push(TmpEndpoint {
-                capture,
+                id: id.to_string(),
                 name: name.to_string(),
             });
             Ok(())
@@ -655,37 +664,30 @@ mod endpoint_volume {
     }
 
     fn with_tmp_endpoint<T>(
-        capture: bool,
-        target: &str,
-        mut f: impl FnMut(&IAudioEndpointVolume) -> windows::core::Result<T>,
+        id: &str,
+        name: &str,
+        f: impl FnOnce(&IAudioEndpointVolume) -> windows::core::Result<T>,
     ) -> Result<T, String> {
-        let mut result = None;
-        for_each_tmp_endpoint(|c, name, vol| {
-            if c == capture && name == target {
-                result = Some(f(vol)?);
-            }
-            Ok(())
-        })
-        .map_err(|e| format!("{target}: {e}"))?;
-        result.ok_or_else(|| format!("TMP endpoint disappeared: {target}"))
+        // Friendly names can repeat after a replug or with multiple TMP units.
+        // Reopen exactly the endpoint whose original state was recorded.
+        let id: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+        (|| unsafe {
+            let _com = ComInit(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let device = enumerator.GetDevice(PCWSTR(id.as_ptr()))?;
+            let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
+            f(&vol)
+        })()
+        .map_err(|e| format!("{name}: {e}"))
     }
 
-    /// Enumerate the active render+capture endpoints whose friendly name names
-    /// the unit and hand each one's `IAudioEndpointVolume` to `f`.
+    /// Discover active TMP endpoints by friendly name, retaining their opaque
+    /// endpoint IDs for subsequent reads, writes and restoration.
     fn for_each_tmp_endpoint(
-        mut f: impl FnMut(bool, &str, &IAudioEndpointVolume) -> windows::core::Result<()>,
+        mut f: impl FnMut(&str, &str) -> windows::core::Result<()>,
     ) -> windows::core::Result<()> {
         unsafe {
-            // Per-thread; RPC_E_CHANGED_MODE just means the thread is already
-            // initialized in another mode — either way COM is usable.
-            struct ComInit(bool);
-            impl Drop for ComInit {
-                fn drop(&mut self) {
-                    if self.0 {
-                        unsafe { CoUninitialize() };
-                    }
-                }
-            }
             // Balance both S_OK and S_FALSE; a changed apartment mode does not
             // acquire a reference and must not be uninitialized here.
             let _com = ComInit(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
@@ -707,8 +709,12 @@ mod endpoint_volume {
                     if !name.to_lowercase().contains("tone master") {
                         continue;
                     }
-                    let vol: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-                    f(flow == EDataFlow(1), &name, &vol)?;
+                    let raw_id = device.GetId()?;
+                    let id = raw_id.to_string();
+                    // GetId allocates with the COM task allocator. Free it even
+                    // if converting the UTF-16 ID fails.
+                    CoTaskMemFree(Some(raw_id.0.cast()));
+                    f(&id?, &name)?;
                 }
             }
             Ok(())

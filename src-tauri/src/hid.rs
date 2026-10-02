@@ -1337,7 +1337,10 @@ mod imp {
                 if left.is_zero() {
                     return;
                 }
-                let wait = unsafe { WaitForSingleObject(self.event, left.as_millis() as u32) };
+                // Reserve INFINITE (u32::MAX); large finite budgets must not
+                // wrap into a short wait or accidentally become unbounded.
+                let wait_ms = left.as_millis().min(u32::MAX as u128 - 1) as u32;
+                let wait = unsafe { WaitForSingleObject(self.event, wait_ms) };
                 if wait == WAIT_TIMEOUT {
                     return; // budget expired; the read stays pending for the next pump
                 }

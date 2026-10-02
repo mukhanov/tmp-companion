@@ -120,6 +120,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_names_restore_each_endpoints_distinct_state() {
+        let first = fake(false, false);
+        let second = fake(false, false);
+        *second.state.borrow_mut() = State {
+            scalar: 0.55,
+            muted: false,
+        };
+        let originals = [*first.state.borrow(), *second.state.borrow()];
+        assert_eq!(first.name(), second.name());
+        let hold = UnityHold::new([first.clone(), second.clone()]).unwrap();
+        for endpoint in [&first, &second] {
+            assert_eq!(
+                *endpoint.state.borrow(),
+                State {
+                    scalar: 1.0,
+                    muted: false
+                }
+            );
+        }
+        drop(hold);
+        assert_eq!(*first.state.borrow(), originals[0]);
+        assert_eq!(*second.state.borrow(), originals[1]);
+    }
+
+    #[test]
     fn successful_hold_restores_only_after_session_resources_stop() {
         let endpoint = fake(false, false);
         let original = *endpoint.state.borrow();
