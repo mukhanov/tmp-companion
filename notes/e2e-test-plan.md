@@ -27,10 +27,18 @@ Sources: a full read of `src/views/**`, `src/App.tsx`, `src/ui/{DeviceStatus,Err
   and **Pro Control closed** (it holds the exclusive HID seize). The script pre-flights the
   handshake, runs each spec in its own invocation, and recovers the unit on every handled exit
   (`trap cleanup EXIT INT TERM` — so Ctrl-C and `kill` included): reamp-off + recall 001, plus a
-  guarded clear of the scenario slots (`SCRATCH_SLOTS`, 400–409) only with `TMP_E2E_CLEAR_SCENARIO=1`.
+  guarded clear of the scenario slots (`SCRATCH_SLOTS`, 400–410) only with `TMP_E2E_CLEAR_SCENARIO=1`.
   A SIGKILL or host crash skips the traps — recover manually with `cargo run --bin probe -- --reamp-off`.
+- **`bash scripts/e2e.sh online auto`** — ONLINE, exactly the specs this diff requires
+  (`scripts/gates.sh --required-online`, from `scripts/gate-map.tsv` and `scripts/gate-policy.tsv`);
+  a diff that requires none exits 0 without touching the unit.
+- **`bash scripts/pre-pr.sh`** — the offline gates and `online auto` side by side, on disjoint port bands.
 
 Add a spec name — `copy` / `songs` / `doctor.online` / `level.online` — to run a single spec (e.g. `bash scripts/e2e.sh online level.online`).
+Any passing online run merges the specs it ran into the tree's online stamp (one `#run` line per run, with
+`os=`, `fw=` and `unit=`), so a failed spec re-runs alone. Soak never stamps, a level.online run stamps only
+when the ffmpeg validation passed, and no run stamps unless the unit presents its stock USB interfaces.
+Per-spec wall times land in `$TMPDIR/tmp-companion-e2e/online-timings.tsv`.
 
 The rest of this doc is the **coverage map** — the per-tab scenario inventory + the still-un-automated
 backlog (§9), independent of how the suite is launched. Markers below: **⌨️** = the scenario needs
@@ -352,3 +360,19 @@ Non-destructive first, destructive last (single backup-restore rollback at the e
 
 > Text-entry (⌨️) and drag (🖱️) scenarios run fine under the Playwright harness (`scripts/e2e.sh`);
 > only a manual native-window `cliclick` pass can't type them.
+
+## Decision log (2026-10-11)
+
+Decisions taken for making the offline e2e simulator match the device. Later entries amend earlier ones; none is rewritten in place.
+
+- **Delivery.** Per-diff online spec selection and the side-by-side lanes land first, with fixes so tests run as root, an injectable test browser and a manual-only release trigger. Each later PR budgets two reviews and two online runs.
+- **`/sim` routes.** The `/sim/*` handlers stay in `e2e_server.rs`.
+- **Event bridge.** The UI event and Channel bridge replaces the stub. If Channels cannot be captured, it carries events only, and the gap is recorded in COVERAGE.md.
+- **Attended tooling checks.** Two unstamped attended device sessions verify the checks that need the unit at intermediate trees.
+- **Showcase firmware.** `showcase.json` reports firmware 1.8.58.
+- **Runner.** No self-hosted runner is registered on this public repository. `device-gate` becomes a required status once the job that posts it lands. A hosted job that reads only the base branch posts it when no device check is needed; otherwise the maintainer posts it after the required lanes pass locally. `smoke` means `smoke:darwin`.
+- **Releases.** Releases are batched and started manually. Once `device-gate` is required, a batch with device-facing changes publishes only after the maintainer posts a `device-release` status from a full local device run on that commit.
+- **Reference unit.** Device evidence that stamps, records or calibrates comes only from a unit presenting its stock USB interfaces. The lane checks this and does not stamp otherwise. No second unit is planned.
+- **Licence review.** Firmware analysis beyond a local first check needs the maintainer's licence review first. As of 2026-10-11 the review is not done and the local check has not run; nothing beyond it is approved.
+- **Derived data.** The CPU table (`model-cpu.json`) and the Empty template's observable fields are public. The message table and conformance cases stay local until a follow-up decision, and would then be published only under allow-list redaction. No descriptor files, factory preset bodies, default parameters, IRs or user content are committed.
+- **Real backups.** No real device backup is committed. A private check compares the simulator's archive with a real one locally.
