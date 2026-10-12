@@ -20,7 +20,7 @@
 #      (`probe --level-preset-scenes`) and optionally block-acting footswitches
 #      (`probe --level-footswitch … --commit`);
 #   5. (no wait after a save: on fw 1.8.58 a save is durable the moment it returns —
-#      tmp-audit Q34);
+#      fw 1.8.58);
 #   6. re-measures each leveled foundation, EMITTING one expectation row + WAV per sound:
 #      base/scenes via `probe --measure-scene … --target … --dump-wav`, footswitches via
 #      `probe --measure-footswitch … --target … --dump-wav` (P5 closed that hole; FS rows
@@ -199,7 +199,7 @@ FAILED=0
 # reamp-off FIRST (the danger.md guarantee — never let a slower step delay it), then the
 # name-guarded clear (best-effort: skip if we never got a confirmed name), then release
 # the device lock LAST (other waiters should not start until recovery is done). ──
-# shellcheck disable=SC2329  # invoked via `trap cleanup EXIT INT TERM`, which shellcheck doesn't count as a use
+# shellcheck disable=SC2329,SC2317  # invoked via `trap cleanup EXIT INT TERM`, which shellcheck doesn't count as a use
 cleanup() {
   local code=$?
   trap - EXIT INT TERM

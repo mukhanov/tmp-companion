@@ -65,13 +65,14 @@ pub mod e2e_transport {
 
 /// Open the device transport: the e2e fake when a factory is installed (`--features e2e`,
 /// offline UI tests), else the real seized [`Hid`]. Single chokepoint for both the command
-/// lane and the monitor lane.
+/// lane and the monitor lane, and so the one place the trace recorder (`crate::trace`)
+/// hooks in, below `TrackedHid`; each branch names its own backend.
 fn open_transport() -> Result<Box<dyn HidTransport>, String> {
     #[cfg(feature = "e2e")]
     if let Some(t) = e2e_transport::take() {
-        return Ok(t);
+        return crate::trace::open(crate::trace::Backend::Sim, || Ok(t));
     }
-    Ok(Box::new(Hid::open()?))
+    crate::trace::open(crate::trace::Backend::Device, || Ok(Box::new(Hid::open()?)))
 }
 
 /// One entry in the device's "My Presets" list. `slot` is the **0-based list
@@ -992,9 +993,11 @@ impl Session {
     /// request) since it doesn't need it.
     ///
     /// The request rides the batch-2 group, BEFORE `current_preset_data_request`
-    /// — sending it after that batch-3 request makes the device drop the fw
-    /// reply (HW-confirmed), so it can't reuse the generic
-    /// `extra_burst` slot (which fires last).
+    /// — sent after that batch-3 request, its reply queues behind the ~1.2 s
+    /// handshake drain and a short window misses it, so it can't reuse the generic
+    /// `extra_burst` slot (which fires last). INFERRED from the same queueing
+    /// measured on a delayed `currentPresetInfoRequest`; `currentFwRequest` itself
+    /// was not measured.
     pub fn connect_with_firmware() -> Result<Session, String> {
         let mut s = Self::connect_inner(false, None, true, false)?;
         s.fw_version = s
@@ -1102,8 +1105,10 @@ impl Session {
         self.send_and_collect(&proto::settings_field66(2), hs(base[1]))?;
         self.send_and_collect(&proto::userir_field2(2), hs(base[1]))?;
         // Firmware read rides the batch-2 group (no batchStatus), BEFORE the
-        // batch-3 current_preset_data_request — sending it after that makes the
-        // device drop the `currentFwResponse` reply (HW-confirmed).
+        // batch-3 current_preset_data_request — sent after that, the
+        // `currentFwResponse` reply queues behind the ~1.2 s handshake drain and
+        // this short pump misses it (INFERRED: only a delayed
+        // `currentPresetInfoRequest` was measured, not `currentFwRequest`).
         // The reply is a tiny single 0x35 frame, so a short pump suffices.
         if request_firmware {
             self.send_and_collect(&proto::current_fw_request(), 200)?;
@@ -2085,7 +2090,7 @@ impl Session {
 
     /// The working copy's dirty flag, from the latest `currentPresetInfoChanged` (field
     /// 22) `isDirty`. fw 1.8.58 fills it from the same flag that decides whether a
-    /// same-slot `loadPreset` really reloads (tmp-audit Q4; `getPresetInfo` copies `+0x686`).
+    /// same-slot `loadPreset` really reloads (fw 1.8.58; `getPresetInfo` copies `+0x686`).
     pub(crate) fn active_preset_dirty(&self) -> Option<bool> {
         self.push_bodies()
             .iter()
@@ -2159,7 +2164,7 @@ impl Session {
 
     /// Prove the loaded working copy is the import before a save writes it over another
     /// slot: a body the firmware rejects at LOAD becomes an EMPTY preset that keeps the
-    /// stored name (fw 1.8.58, tmp-audit Q35 — its `presetError` 6 is dropped by
+    /// stored name (fw 1.8.58, — its `presetError` 6 is dropped by
     /// `load_preset`'s eager transact), which [`Self::confirm_active`] passes. Re-prompts the working copy (the HW-proven [`Self::live_audio_graph`] seam)
     /// and hands `check` its block roster and the accepted document.
     pub(crate) fn confirm_loaded_body(
@@ -2750,7 +2755,7 @@ impl Session {
     ///
     /// The row is read back: the device refuses a `preset_scene_slot` the preset doesn't
     /// have (not [`BASE_SCENE_SLOT`] and ≥ its scene count) with SongError 5 and writes
-    /// nothing (fw 1.8.58, tmp-audit Q40), so a row that didn't land is an `Err`.
+    /// nothing (fw 1.8.58), so a row that didn't land is an `Err`.
     #[allow(clippy::too_many_arguments)]
     pub fn assign_song_preset(
         &mut self,
@@ -3267,7 +3272,7 @@ fn json_payloads_from_reports(reports: &[Vec<u8>]) -> Vec<(u32, Vec<u8>)> {
 /// (e.g. "1.7.75"). The device sends this in reply to a `currentFwRequest`
 /// issued in-burst with no batchStatus (see [`Session::connect_with_firmware`]);
 /// a standalone request after the burst is rejected with ConnectionError.
-fn extract_fw_version(body: &[u8]) -> Option<String> {
+pub(crate) fn extract_fw_version(body: &[u8]) -> Option<String> {
     dig(body, TMS_SETTINGS, SETTINGS_CURRENT_FW).and_then(|fields| {
         field1(&fields)
             .and_then(Val::as_bytes)

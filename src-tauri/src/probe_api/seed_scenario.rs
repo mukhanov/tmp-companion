@@ -288,6 +288,14 @@ impl PristineMiss {
     }
 }
 
+/// A pristine verdict as the trace records it: `ok`, or why the body is not pristine.
+fn pristine_label(verdict: &Result<(), PristineMiss>) -> &'static str {
+    match verdict {
+        Ok(()) => "ok",
+        Err(miss) => miss.reason(),
+    }
+}
+
 /// Float round-trip slack for the pristine compares, far below any real edit.
 const PRISTINE_TOL: f64 = 1e-3;
 
@@ -440,7 +448,7 @@ fn leveled_values(doc: &serde_json::Value) -> std::collections::HashMap<String, 
 //
 // The stored row is checked over field 8 (`presetDataRequest`), which holds an import the
 // moment it returns. A body the firmware rejects only shows at its first real LOAD (fw
-// 1.8.58, tmp-audit Q35), which `replace_inplace_with` already proves for every import
+// 1.8.58), which `replace_inplace_with` already proves for every import
 // before it returns.
 
 /// Where the empty-body substitution is written up — quoted in the hard error so the
@@ -532,7 +540,9 @@ fn verify_landed_imports(spec: &[ScenarioPreset], seeded: &[u32]) -> Result<(), 
                 p.name
             ));
         }
-        if let Err(miss) = pristine_check(&body, &p.preset_json) {
+        let verdict = pristine_check(&body, &p.preset_json);
+        crate::trace::record_field8(list_index, &body, Some(pristine_label(&verdict)));
+        if let Err(miss) = verdict {
             let why = miss.reason();
             return Err(format!(
                 "slot {list_index} ({:?}) was imported this run but reads back wrong — \
@@ -712,6 +722,11 @@ pub(crate) fn seed_scenario_core(check_pristine: bool) -> Result<SeedOutcome, St
         // body that IDENTIFIES as this preset may drive the decision — a wrong-slot
         // body falls back to the marker-skip (the pre-pristine-check behavior)
         // instead of churning a redundant ~30 s re-import every seed.
+        // Trace the resident fixture's body (inert unless recording). Only a body that
+        // names this preset gets a verdict.
+        let verdict = (check_pristine && body_names(&body, &p.name))
+            .then(|| pristine_label(&pristine_check(&body, &p.preset_json)));
+        crate::trace::record_field8(p.list_index, &body, verdict);
         if !check_pristine {
             // Marker-verified and pristine-checking is off — the pre-check skip.
         } else if !body_names(&body, &p.name) {
@@ -1142,7 +1157,7 @@ mod tests {
         ));
     }
 
-    /// BUG→GATE (tmp-audit Q35, fw 1.8.58): a rejected import's stored row is the fixture
+    /// BUG→GATE (fw 1.8.58): a rejected import's stored row is the fixture
     /// VERBATIM, so every field-8 check passes it; only its first real load shows the
     /// substitute (template `preset_id`, zero blocks, name kept). For every committed
     /// fixture, the load proof must pass the fixture's own working copy and refuse that

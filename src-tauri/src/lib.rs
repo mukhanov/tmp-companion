@@ -75,6 +75,10 @@ pub(crate) mod test_support;
 // `pub` so the `gen_samples` bin (a separate crate) can reach the shared
 // catalog as `tmp_companion_lib::topologies`.
 pub mod topologies;
+// Lossless device traces for online e2e runs; inert unless `TMP_TRACE_DIR` is set.
+// Most of it is reached only from the e2e server and the seed, so default builds see it unused.
+#[allow(dead_code)]
+mod trace;
 // P5 external validation: the JSON-lines expectation log the measurement seams append
 // to when `TMP_E2E_VALIDATE_LOG` is set. Inert (and unallocating) otherwise.
 #[allow(dead_code)]
@@ -1608,7 +1612,7 @@ mod fixture_gates {
         }
     }
 
-    /// NON-REGRESSION GATE (HW bisect 2026-08-09; fw 1.8.58 tmp-audit Q35): a preset whose
+    /// NON-REGRESSION GATE (HW bisect 2026-08-09; fw 1.8.58): a preset whose
     /// `ftsw` array carries a `func: "param"` entry with NO `valueType` field is rejected
     /// at its first load — the device substitutes an empty preset under the imported name
     /// (`presetError` 6). Every param-func footswitch entry in every committed fixture must

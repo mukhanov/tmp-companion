@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 #
 # scripts/lib/e2e-lane.sh — pure helpers for the ONLINE e2e lane, sourced by scripts/e2e.sh
-# and scripts/pre-pr.sh, and tested offline by scripts/e2e-lane.spec.sh. Nothing here
+# and scripts/pre-release.sh, and tested offline by scripts/e2e-lane.spec.sh. Nothing here
 # touches the device: each function reads text (or a listing it is pointed at) and prints a
 # verdict, so every rule that decides whether a run may stamp is provable without a unit.
 #
@@ -74,6 +74,9 @@ lane_unit_state() {
 #   $5 ran_level   1 when level.online was in the spec set
 #   $6 validated   1 when the ffmpeg judge PASSED (exit 0)
 #   $7 unit        stock | non-stock | unknown
+#   $8 on_device   1 when the e2e server's own trace holds a successful open on the real
+#                  device (`evidence_server_touched_device`): an online run answered by a
+#                  stale offline server never touched the unit and must not stamp
 lane_stamp_verdict() {
   if [ "$1" != 0 ]; then
     printf 'no-stamp: a spec or the external validation failed\n'
@@ -81,6 +84,8 @@ lane_stamp_verdict() {
     printf 'no-stamp: %s runs never stamp\n' "$4"
   elif [ "$7" != stock ]; then
     printf 'no-stamp: unit=%s — the unit must present its stock USB interfaces\n' "$7"
+  elif [ "${8:-}" != 1 ]; then
+    printf "no-stamp: the e2e server's trace holds no session on the real device (a stale or offline server answered this run)\n"
   elif [ "$5" = 1 ] && [ "$6" != 1 ]; then
     printf 'no-stamp: level.online ran but external validation did not confirm anything\n'
   elif [ -z "$2" ] || [ "$2" != "$3" ]; then

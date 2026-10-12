@@ -416,8 +416,8 @@ pub const CANCELLED: &str = "cancelled";
 /// measuring. `save=false` is a preview/read-only contract for callers: the TMP
 /// edit buffer may be mutated during capture, but it must not remain dirty.
 ///
-/// fw 1.8.58 skips a same-slot `loadPreset` while the working copy's dirty flag is clear
-/// (tmp-audit Q4), keeping the working copy. Every edit the callers make sets the flag
+/// fw 1.8.58 skips a same-slot `loadPreset` while the working copy's dirty flag is clear,
+/// keeping the working copy. Every edit the callers make sets the flag
 /// (HW 2026-10-10, `probe --restore-check`), but a clear flag can still hide a stale
 /// working copy, and reading `isDirty` costs ~1.1 s. So the restore always loads a
 /// neighbour slot first, which forces the reload (+0.34 s on HW: 1.67 s vs 1.33 s).
@@ -823,6 +823,8 @@ fn capture_full_at_params(
     tail_ms: u64,
     skip_load: bool,
 ) -> Result<audio::Capture, String> {
+    // Names this capture in the trace (inert unless recording); an outer caller's name wins.
+    let _trace_ctx = crate::trace::capture_ctx("capture", Some(slot), scene, None);
     // The settles here are `sleep_abortable`: a Stop pressed anywhere in the ~1.9 s of
     // settling that brackets a capture bails immediately instead of being noticed only at
     // the next step seam. Safe to leave from any of these points — nothing is engaged or
@@ -1226,6 +1228,11 @@ pub fn measure_sound_asis_strict(
     stimulus: &[f32],
     validate: Option<&crate::validate_log::ValidationRow>,
 ) -> Result<lufs::Loudness, String> {
+    // The trace names these captures by the validation row's identity when there is one.
+    let _trace_ctx = match validate {
+        Some(r) => crate::trace::capture_ctx(&r.label, Some(r.slot), r.scene_slot, r.switch),
+        None => crate::trace::capture_ctx("strict", Some(slot), scene, None),
+    };
     // Resolved ONCE, up front: an unarmed run must not clone a ~2.7 MB capture per
     // floor-guard attempt just to throw it away.
     let keep = validate.is_some() && crate::validate_log::log_path().is_some();
@@ -8486,8 +8493,8 @@ mod tests {
             .collect()
     }
 
-    /// BUG→GATE: fw 1.8.58 skips a same-slot `loadPreset` while the dirty flag is clear
-    /// (tmp-audit Q4), so the restore — the one "discard unsaved edits" path — must never
+    /// BUG→GATE: fw 1.8.58 skips a same-slot `loadPreset` while the dirty flag is clear,
+    /// so the restore — the one "discard unsaved edits" path — must never
     /// rely on it: it loads a neighbour first, and the target LAST.
     #[test]
     fn restore_loads_a_neighbour_before_the_target() {
