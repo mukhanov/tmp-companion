@@ -455,29 +455,57 @@ describe("device-backed song/setlist CRUD (Songs page)", () => {
     await listSetlistSongs(4);
     expectCall("list_setlist_songs", { setlistSlot: 4 });
   });
-  it("remove_song uses slot/expectName (guarded delete)", async () => {
-    await removeSong(2, "Toto");
-    expectCall("remove_song", { slot: 2, expectName: "Toto" });
+  const SEEN = [{ name: "Tete" }, { name: "Tutu" }];
+  const SEEN_NAMES = ["Tete", "Tutu"];
+  it("remove_song uses slot/expectName/expectList (guarded delete)", async () => {
+    await removeSong(2, "Toto", [{ name: "Tata" }, { name: "Toto" }]);
+    expectCall("remove_song", {
+      slot: 2,
+      expectName: "Toto",
+      expectList: ["Tata", "Toto"],
+    });
   });
   it("add_setlist uses name", async () => {
     await addSetlist("Tutu");
     expectCall("add_setlist", { name: "Tutu" });
   });
-  it("rename_setlist uses slot/name", async () => {
-    await renameSetlist(4, "Tutu Tutu");
-    expectCall("rename_setlist", { slot: 4, name: "Tutu Tutu" });
+  it("rename_setlist uses slot/expectName/expectList/name (guarded rename)", async () => {
+    await renameSetlist(4, "Tutu", SEEN, "Tutu Tutu");
+    expectCall("rename_setlist", {
+      slot: 4,
+      expectName: "Tutu",
+      expectList: SEEN_NAMES,
+      name: "Tutu Tutu",
+    });
   });
-  it("remove_setlist uses slot/expectName (guarded delete)", async () => {
-    await removeSetlist(4, "Tutu");
-    expectCall("remove_setlist", { slot: 4, expectName: "Tutu" });
+  it("remove_setlist uses slot/expectName/expectList (guarded delete)", async () => {
+    await removeSetlist(4, "Tutu", SEEN);
+    expectCall("remove_setlist", {
+      slot: 4,
+      expectName: "Tutu",
+      expectList: SEEN_NAMES,
+    });
   });
-  it("remove_setlist_song uses setlistSlot/setlistSongSlot (1-based POSITION)", async () => {
-    await removeSetlistSong(4, 2);
-    expectCall("remove_setlist_song", { setlistSlot: 4, setlistSongSlot: 2 });
+  it("remove_setlist_song uses setlistSlot/setlistSongSlot (1-based POSITION), guarded", async () => {
+    await removeSetlistSong(4, "Tutu", SEEN, 2, 9);
+    expectCall("remove_setlist_song", {
+      setlistSlot: 4,
+      expectName: "Tutu",
+      expectList: SEEN_NAMES,
+      setlistSongSlot: 2,
+      expectSongSlot: 9,
+    });
   });
-  it("move_setlist_song uses setlistSlot/oldPos/newPos (1-based POSITIONS)", async () => {
-    await moveSetlistSong(4, 3, 1);
-    expectCall("move_setlist_song", { setlistSlot: 4, oldPos: 3, newPos: 1 });
+  it("move_setlist_song uses setlistSlot/oldPos/newPos (1-based POSITIONS), guarded", async () => {
+    await moveSetlistSong(4, "Tutu", SEEN, 3, 1, 9);
+    expectCall("move_setlist_song", {
+      setlistSlot: 4,
+      expectName: "Tutu",
+      expectList: SEEN_NAMES,
+      oldPos: 3,
+      newPos: 1,
+      expectSongSlot: 9,
+    });
   });
 });
 
