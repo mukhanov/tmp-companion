@@ -16,7 +16,11 @@ import {
 import { listPresets } from "../../lib/invoke";
 import { useDeviceLoad } from "../../lib/useDeviceLoad";
 import { presetCpu } from "../../models/cpu";
-import { subscribeLibraryScan, getLibraryScan } from "../level/libraryScan";
+import {
+  subscribeLibraryScan,
+  getLibraryScan,
+  retryLibraryScan,
+} from "../../device/libraryScan";
 import { isEmptyName } from "../level/usePresetData";
 import type { ActiveGraph, PresetEntry } from "../../lib/types";
 
@@ -51,7 +55,6 @@ export interface CopyLibrary {
   /** Backup graph load settled (graphs available). */
   ready: boolean;
   scanning: boolean;
-  percent: number;
   error: string | null;
   refresh: () => Promise<void>;
 }
@@ -60,22 +63,29 @@ export function useCopyLibrary(
   connected: boolean,
   activeSlot: number | null,
 ): CopyLibrary {
-  const { phase, mountedRef, runLoad } = useDeviceLoad();
+  const { phase, runLoad } = useDeviceLoad();
   const [rows, setRows] = useState<PresetEntry[]>([]);
 
   const lib = useSyncExternalStore(subscribeLibraryScan, getLibraryScan);
 
   const refresh = useCallback(async () => {
-    await runLoad(async () => {
+    await runLoad(async (isCurrent) => {
       const list = await listPresets();
-      if (!mountedRef.current) return;
+      if (!isCurrent()) return;
       setRows(list);
     });
-  }, [runLoad, mountedRef]);
+  }, [runLoad]);
 
   useEffect(() => {
     if (connected) void refresh();
   }, [connected, refresh]);
+
+  // The error pane's Retry: re-read the list, and re-run the shared scan only if
+  // IT failed (a healthy scan is never re-triggered from a tab).
+  const retry = useCallback(async () => {
+    if (getLibraryScan().error != null) retryLibraryScan();
+    await refresh();
+  }, [refresh]);
 
   // The backup scan is App-owned (one per connection, shared by every device tab); this
   // hook only SUBSCRIBES to it (`lib`) — no trigger here, so a tab switch never re-scans.
@@ -112,8 +122,8 @@ export function useCopyLibrary(
     loaded: phase.kind === "ready",
     ready: lib.ready,
     scanning: lib.scanning,
-    percent: lib.percent,
-    error: phase.kind === "error" ? phase.message : null,
-    refresh,
+    // A failed library scan blocks Copy too: without it every graph is empty.
+    error: lib.error ?? (phase.kind === "error" ? phase.message : null),
+    refresh: retry,
   };
 }

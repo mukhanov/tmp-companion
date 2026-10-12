@@ -175,6 +175,42 @@ describe("useUpdater — download failure + retry", () => {
   });
 });
 
+// A finished download must release the single-flight guard, or an update found
+// after dismissing "ready" could never download.
+describe("useUpdater — a finished download releases the guard", () => {
+  it("success → dismiss → a later update downloads again", async () => {
+    const u = mkUpdate("1.1.0", null);
+    h.checkForUpdate.mockResolvedValue(u.found);
+
+    const { result } = renderHook(() => useUpdater());
+    await waitFor(() => {
+      expect(result.current.phase).toBe("available");
+    });
+    act(() => {
+      result.current.startDownload();
+    });
+    act(() => {
+      u.finish();
+    });
+    await waitFor(() => {
+      expect(result.current.phase).toBe("ready");
+    });
+
+    act(() => {
+      result.current.dismiss();
+    });
+    await act(async () => {
+      await result.current.check();
+    });
+    expect(result.current.phase).toBe("available");
+    act(() => {
+      result.current.startDownload();
+    });
+    expect(result.current.phase).toBe("downloading");
+    expect(u.download).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("useUpdater — dev-build guard", () => {
   it("never checks when the app version is the dev placeholder", async () => {
     h.appInfo.mockResolvedValue(info("0.0.0-development"));
@@ -303,6 +339,44 @@ describe("useUpdater — manual check()", () => {
     });
     expect(outcome).toBe("found");
     expect(h.checkForUpdate).not.toHaveBeenCalled();
+    expect(result.current.phase).toBe("downloading");
+    expect(u.download).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #311: with auto-install on, a manual Check while the startup check is still
+// pending used to reach start() twice — two concurrent downloads.
+describe("useUpdater — overlapping checks with auto-install (#311)", () => {
+  it("two checks resolving together start ONE download", async () => {
+    const u = mkUpdate("1.1.0", null);
+    h.getStore.mockResolvedValue(storeWith(true));
+    const pending: ((f: FoundUpdate | null) => void)[] = [];
+    h.checkForUpdate.mockImplementation(
+      () =>
+        new Promise<FoundUpdate | null>((res) => {
+          pending.push(res);
+        }),
+    );
+
+    const { result } = renderHook(() => useUpdater());
+    // The startup check is in flight (auto-install read, check pending).
+    await waitFor(() => {
+      expect(pending).toHaveLength(1);
+    });
+    expect(result.current.autoInstall).toBe(true);
+    expect(result.current.phase).toBe("idle");
+
+    // A manual Check while it's pending — both are now in flight.
+    let manual: Promise<"found" | "none" | "error"> | undefined;
+    act(() => {
+      manual = result.current.check();
+    });
+    expect(pending).toHaveLength(2);
+
+    await act(async () => {
+      for (const res of pending) res(u.found);
+      await manual;
+    });
     expect(result.current.phase).toBe("downloading");
     expect(u.download).toHaveBeenCalledTimes(1);
   });
