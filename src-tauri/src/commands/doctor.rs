@@ -933,6 +933,10 @@ pub struct DoctorApplyJob {
 pub struct DoctorApplyResult {
     pub before_clip: String,
     pub after_clip: String,
+    /// The run-end re-amp warning (`leveller::REAMP_STILL_ON_WARNING`) when the backstop
+    /// could not read re-amp back OFF. Omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reamp_warning: Option<String>,
 }
 
 /// Identity of a cached BEFORE clip: sound + stimulus + diagnosed context.
@@ -1124,12 +1128,42 @@ pub(crate) fn ops_session(
     // the seize) as the closure's scope unwinds — BEFORE `.map_err` below
     // calls `restored_err`, which opens its own connection to restore.
     let setup = || -> Result<Session, String> {
+        // The job's scene comes from the frontend's diagnosis, not a fresh read: prove it
+        // against the stored document before recalling it (`doctor_scene_refusal`).
+        if let Some(n) = scene.filter(|&n| n != session::BASE_SCENE_SLOT) {
+            let (doc, _, _, cut) =
+                crate::slot_read::read_slot_preset_sections(list_index, &["scenes"])?;
+            if let Some(why) = doctor_scene_refusal(&doc, n, cut.truncated.is_empty()) {
+                return Err(why);
+            }
+        }
         let mut s = Session::connect()?;
         s.confirm_active(list_index, Some(expect_name))?;
         apply_ops_under_scene(&mut s, scene, ops)?;
         Ok(s)
     };
     setup().map_err(|detail| restored_err(list_index, verb, detail))
+}
+
+/// Why a Doctor job may not recall `scene` on the preset `doc` describes, or `None`.
+/// `scenes_whole` says the read delivered the `scenes` section uncut; a cut one only
+/// proves a scene-less preset (an empty list), never a short one.
+pub(crate) fn doctor_scene_refusal(
+    doc: &serde_json::Value,
+    scene: u32,
+    scenes_whole: bool,
+) -> Option<String> {
+    let scene_less = doc
+        .get("scenes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let refuse = scene_less || (scenes_whole && !session::scene_index_ok(doc, scene));
+    refuse.then(|| {
+        format!(
+            "scene {} isn't on this preset any more; diagnose it again",
+            scene + 1
+        )
+    })
 }
 
 /// `begin_live_edit` → `load_scene` → `apply_doctor_ops` on an already-confirmed
@@ -1384,14 +1418,14 @@ pub(crate) async fn doctor_apply<R: tauri::Runtime>(
             Ok(DoctorApplyResult {
                 before_clip,
                 after_clip,
+                reamp_warning: None,
             })
         };
         let result = run();
         // Run-end backstop, success or failure (see `reamp_off_guaranteed`). ONLY
         // the reamp toggle — never a load_preset here, which would discard the
         // just-applied unsaved edit buffer on the success path.
-        leveller::reamp_off_guaranteed("doctor_apply");
-        result
+        leveller::reamp_off_guaranteed("doctor_apply").stamp(result, |r, w| r.reamp_warning = w)
     })
     .await
 }

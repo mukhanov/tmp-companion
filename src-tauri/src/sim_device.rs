@@ -11,11 +11,18 @@
 //!   `nodeInserted`(33); a save must follow ONLY a confirmed edit,
 //! - a REJECTED edit replies `presetError`(53) and must NEVER be followed by a save
 //!   (an unconfirmed save corrupted a real preset — `confirm_structural_edit`),
-//! - the COLD first structural edit after a fresh load can be silently DROPPED, which
-//!   the held-session path retry-hardens (`apply_copy_op`'s `retry_drop`).
+//! - a structural edit can be armed to be silently DROPPED ([`Injection::DropFirstStructural`]).
+//!   That "cold first edit" is a fw 1.8.45 belief with no cited HW evidence: fw 1.8.58 has
+//!   no silent-drop path for a correctly framed edit (INFERRED). A missing confirm there is a
+//!   confirm queued behind the FIFO, a lapse (which draws ConnectionError), a backup freeze,
+//!   or an insert abort, so the held-session path recovers by read-back, never by blind
+//!   re-send (`apply_copy_op`'s `recover_unconfirmed`),
+//! - a `replaceNode` naming a node its group lacks ABORTS the device server (static RE that
+//!   it throws; whether it is caught is OPEN). The fake records [`SimEvent::ServerAbort`] and
+//!   fails every later send; no product path should ever reach it.
 //!
 //! Configure [`SimDevice::with_drop_first`] / [`SimDevice::with_reject_at`] to drive
-//! those two adversarial cases. Replies are produced SYNCHRONOUSLY from the send call
+//! the drop and rejection cases. Replies are produced SYNCHRONOUSLY from the send call
 //! (the reports land in `Session::raw`); the subsequent heartbeat `pump`s return empty,
 //! exactly as the confirm loop expects.
 //!
@@ -112,7 +119,7 @@ const F_SONG_PRESET_LIST_RESPONSE: u32 = 13;
 const F_ASSIGN_SONG_PRESET: u32 = 14;
 const F_SET_SONG_NOTES: u32 = 22;
 const F_SET_SONG_BPM_ACTIVE: u32 = 23;
-// PresetMessage inner field numbers (mirror `proto`'s encoders + `session.rs`).
+// PresetMessage inner field numbers (mirror `proto`'s encoders + `session/mod.rs`).
 const F_LOAD_PRESET: u32 = 10;
 const F_REPLACE_NODE: u32 = 39;
 const F_REPLACE_WITH_BLOCK: u32 = 100;
@@ -146,6 +153,14 @@ const TMS_SETTINGS: u32 = 3;
 const F_REAMP_SETTING: u32 = 30;
 /// `SettingsMessage.tapTempoBpm` (12) → `{ value(1)=float, originatorId(2) }`.
 const F_TAP_TEMPO_BPM: u32 = 12;
+/// `SettingsMessage.usbSettingsRequest` (55) → `usbSettingsResponse` (56).
+const F_USB_SETTINGS_REQUEST: u32 = 55;
+const F_USB_SETTINGS_RESPONSE: u32 = 56;
+/// FenderMessageTMS field carrying a `MixerMessage`.
+const TMS_MIXER: u32 = 5;
+/// `MixerMessage.reAmpModeRequest` (4) → `reAmpModeResponse` (9){ isActive(1) }.
+const F_MIXER_REAMP_REQUEST: u32 = 4;
+const F_MIXER_REAMP_RESPONSE: u32 = 9;
 // Device confirmation / echo field numbers.
 const F_PRESET_LOADED: u32 = 11;
 const F_NODE_INSERTED: u32 = 33;
@@ -186,6 +201,11 @@ pub enum SimEvent {
     /// and aborts its server on this (static RE), so the fake applies nothing and answers
     /// nothing; a test asserts it never fires.
     AnchorMiss { group: String, before: String },
+    /// The fake's device server ABORTED: `cause` names the request that killed it. Every
+    /// later send on this fake returns `Err` (a narrow model: the real unit's systemd
+    /// restarts the server, and a third crash in 60 s leaves it down). `/sim/state` counts
+    /// these as `server_aborts`, and the offline e2e teardown asserts zero.
+    ServerAbort { cause: String },
     /// `removeNode`(35).
     Remove { group: String, node_id: String },
     /// `currentPresetDataRequest`(2) — the working-copy re-prompt (`Session::live_ftsw` /
@@ -265,6 +285,145 @@ pub enum SimEvent {
     /// A song setter refused with `SongError{code}` and no write (recorded, not encoded:
     /// the companion detects a refusal by reading the row back).
     SongError(u64),
+    /// A request the fake has no handler for, answered with nothing. `tms` is the
+    /// FenderMessageTMS field, `inner` the first field inside it (0 when it has none),
+    /// `batch` the top-level `batchStatus`. Kept in its own log ([`SimDevice::unhandled`]),
+    /// NEVER in `events`, so the events-equality oracles don't move; [`UNHANDLED_CENSUS`]
+    /// pins the kinds an offline run is known to send.
+    Unhandled {
+        tms: u32,
+        inner: u32,
+        batch: Option<u64>,
+    },
+}
+
+/// Every request kind (`(tms, inner)`) the offline suite sends that the fake answers with
+/// nothing — the census. A kind outside it is REPORTED (`/sim/state`'s `unhandled_new`),
+/// not failed. Each entry names why it is unanswered and who models it.
+pub(crate) const UNHANDLED_CENSUS: &[(u32, u32)] = &[
+    // Handshake burst (`Session::connect`) requests the fake does not model.
+    (4, 1),  // connectionRequest
+    (2, 6),  // favoriteListRequest
+    (2, 41), // productProfileRequest
+    (3, 66), // settings field 66
+    (13, 2), // user-IR field 2
+    (3, 1),  // currentFwRequest: the offline server pins the firmware string itself
+    // Keepalive.
+    (4, 4), // heartbeat
+    // Preset reads the fake leaves unanswered on this route (a lapse re-arm, and the
+    // handshake's filtered list requests).
+    (2, 1), // currentPresetInfoRequest
+    (2, 4), // presetListRequest by filter
+];
+
+/// Whether `(tms, inner)` is a census kind.
+pub(crate) fn in_census(tms: u32, inner: u32) -> bool {
+    UNHANDLED_CENSUS.contains(&(tms, inner))
+}
+
+/// One fault the fake can be armed with: the adversarial shapes the held-session paths are
+/// tested against. [`Injection::tag`] says whether fw 1.8.58 can produce it.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "e2e", derive(serde::Serialize))]
+#[cfg_attr(feature = "e2e", serde(tag = "kind", rename_all = "kebab-case"))]
+pub(crate) enum Injection {
+    /// The FIRST structural edit lands, but its confirm is lost.
+    LoseFirstConfirm,
+    /// The `nth` (1-based) structural edit, when it is a replace, gets `presetError` 14.
+    RejectReplace { nth: u32 },
+    /// The FIRST structural edit is dropped: no confirm, no error, nothing lands.
+    DropFirstStructural,
+    /// `nodeInserted`/`nodeReplaced` carry no node JSON.
+    BareConfirms,
+    /// A save queues a push of the PRE-edit document for the next pump.
+    StalePushAfterSave,
+    /// The NEXT Settings re-amp OFF leaves the latch ON (once). It is still recorded, as the
+    /// device still echoes it.
+    DropNextReampOff,
+    /// Every Settings re-amp OFF leaves the latch ON.
+    ReampOffNeverLands,
+    /// The NEXT real `loadPreset` rejects the stored body: the working copy becomes the
+    /// empty template under the preset's name and the load answers `presetError` 6.
+    RejectNextLoad,
+    /// While scene `scene` is active, field-3 pushes are cut at the first byte of
+    /// `cut_before`, with a proper final frame and the session still live.
+    #[cfg(feature = "e2e")]
+    #[serde(rename_all = "camelCase")]
+    TruncatedScenePush { scene: u32, cut_before: String },
+}
+
+impl Injection {
+    /// Whether fw 1.8.58 can produce this fault:
+    /// - `reachable`: a confirm queued past the reply window or discarded by a session
+    ///   lapse (lapse device-confirmed); an over-budget replace gets `presetError` 14
+    ///   (static RE), and only a replace does — an over-budget insert aborts the server and a
+    ///   remove always confirms.
+    /// - `unreachable`: no fw 1.8.58 path drops a correctly framed structural edit
+    ///   (INFERRED); a write to a lapsed session draws `ConnectionError(0)` (device-confirmed),
+    ///   so a lapse drop is not silent. Confirms carry the node JSON (static RE).
+    /// - `unverified`: seen once on fw 1.8.45 (2026-09-02); on fw 1.8.58 a same-slot save
+    ///   sends 25 and then the CHANGE push (static RE).
+    /// - `not-device-shaped`: the server never truncates a push; a lapse cuts frames with no
+    ///   final, and every later message draws `ConnectionError` (device-confirmed).
+    ///
+    /// `reject-next-load` is `reachable`: fw 1.8.58 substitutes the empty template for a
+    /// body it rejects at its first real load and answers that load `presetError` 6
+    /// (device-confirmed; e.g. a param footswitch with no `valueType`).
+    ///
+    /// The re-amp OFF faults: `drop-next-reamp-off` is `reachable`, because a stale Settings
+    /// flag turns a Settings write into a no-op that still echoes success (device-confirmed).
+    /// `reamp-off-never-lands` is `unverified`: no device run has shown an OFF that a Settings
+    /// ON → OFF re-sync also fails to clear, but a failed connect or a server restart mid-run
+    /// leaves the unit in that state as far as the companion can tell, so the run-end ladder
+    /// must still end in a visible warning.
+    pub(crate) fn tag(&self) -> &'static str {
+        match self {
+            Injection::LoseFirstConfirm
+            | Injection::RejectReplace { .. }
+            | Injection::DropNextReampOff
+            | Injection::RejectNextLoad => "reachable",
+            Injection::DropFirstStructural | Injection::BareConfirms => "unreachable",
+            Injection::StalePushAfterSave | Injection::ReampOffNeverLands => "unverified",
+            #[cfg(feature = "e2e")]
+            Injection::TruncatedScenePush { .. } => "not-device-shaped",
+        }
+    }
+
+    /// Parse a `POST /sim/inject` body (`{kind, …}`).
+    #[cfg(feature = "e2e")]
+    pub(crate) fn from_request(v: &serde_json::Value) -> Result<Injection, String> {
+        let kind = v
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let u32_arg = |key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| format!("{kind}: missing {key}"))
+        };
+        Ok(match kind {
+            "lose-first-confirm" => Injection::LoseFirstConfirm,
+            "reject-replace" => Injection::RejectReplace {
+                nth: u32_arg("nth")?,
+            },
+            "drop-first-structural" => Injection::DropFirstStructural,
+            "bare-confirms" => Injection::BareConfirms,
+            "stale-push-after-save" => Injection::StalePushAfterSave,
+            "drop-next-reamp-off" => Injection::DropNextReampOff,
+            "reamp-off-never-lands" => Injection::ReampOffNeverLands,
+            "reject-next-load" => Injection::RejectNextLoad,
+            "truncated-scene-push" => Injection::TruncatedScenePush {
+                scene: u32_arg("scene")?,
+                cut_before: v
+                    .get("cutBefore")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{kind}: missing cutBefore"))?
+                    .to_string(),
+            },
+            other => return Err(format!("unknown injection kind '{other}'")),
+        })
+    }
 }
 
 /// Rows per song: the six assignable song footswitches.
@@ -326,8 +485,9 @@ pub(crate) struct SimSongRow {
 /// `replaceNodeWithBlock` / `insertNode` / `removeNode`), applied in order when the fake
 /// renders a field-2 re-prompt (`load_echo_json` with `working = true`): the device's
 /// working copy shows a confirmed edit (HW 6/6 re-prompts, fw 1.8.45, 2026-09-03), and Copy
-/// reads it there BEFORE saving. Cleared by the next `loadPreset`; a save does NOT bake it
-/// into the scenario doc (as before — the stored doc stays the fixture).
+/// reads it there BEFORE saving. Cleared by the next `loadPreset`. A save bakes the
+/// working copy's edits into the target slot's stored roster ([`SimState::saved_edits`]), so a
+/// later load of that slot shows the node ids the device minted, as the unit does.
 #[derive(Clone, Debug)]
 enum WorkingEdit {
     Replace {
@@ -350,6 +510,10 @@ enum WorkingEdit {
 
 struct SimState {
     events: Vec<SimEvent>,
+    /// [`SimEvent::Unhandled`] records, in order — the census log, apart from `events`.
+    unhandled: Vec<SimEvent>,
+    /// The injections armed on this fake, in arming order (`/sim/state`).
+    injections: Vec<Injection>,
     /// Requests sent with `batchStatus` 1/2, waiting for a batch 3 to answer them
     /// (fw 1.8.58). Shared device state, so it outlives a transport clone — a
     /// reconnect — just as the real queue outlives a lapse.
@@ -358,7 +522,7 @@ struct SimState {
     /// drop-first / reject-at adversarial injections.
     structural_seen: u32,
     /// When set, the FIRST structural edit is silently DROPPED (no confirm, no error) —
-    /// reproduces the cold-first-edit drop the held-session path retries past.
+    /// the fw 1.8.45 cold-first-edit belief, whose read-back shows "not landed".
     drop_first: bool,
     /// When set, the FIRST structural edit LANDS but its confirm is lost — the case a
     /// blind re-send would turn into a second block.
@@ -374,6 +538,11 @@ struct SimState {
     stale_push_after_save: bool,
     /// Confirmed structural edits since the last load — see [`WorkingEdit`].
     working_edits: Vec<WorkingEdit>,
+    /// Per slot, the structural edits its saves have persisted, applied on top of the slot's
+    /// own document before [`SimState::working_edits`]. Without it a re-opened Copy edit
+    /// would name a node id the stored document never got, which the fake answers with a
+    /// [`SimEvent::ServerAbort`].
+    saved_edits: HashMap<u32, Vec<WorkingEdit>>,
     /// String `changeParameter` writes (`(group, node, param) → value`) since the last load,
     /// served back by `nodeJsonRequest`(119) so a string-param verify read (the IR `file`
     /// link in `Session::replace_node_with_ir`) sees what it wrote.
@@ -441,7 +610,7 @@ struct SimState {
     saved_scene: HashMap<u32, Option<u32>>,
     /// Gate seam: while scene `.0` is active, field-3 pushes are cut at the first byte of `.1`.
     /// Field-8 stays whole — it is what `scene_jobs::backfill_scene_docs_from_saved` repairs from.
-    #[cfg(all(test, feature = "e2e"))]
+    #[cfg(feature = "e2e")]
     truncated_scene_push: Option<(u32, String)>,
     /// The last `setPresetLevel` — the linear global multiplier the model shifts by
     /// `20·log10`. PLAIN (non-e2e) BUILD: a real `loadPreset` restores the slot's SAVED
@@ -489,6 +658,17 @@ struct SimState {
     /// Whether re-amp is engaged (the `SettingsMessage` toggle). Latched at capture; a
     /// capture with re-amp OFF returns silence (the real device routes no USB return).
     reamp_on: bool,
+    /// [`Injection::DropNextReampOff`]: the next Settings OFF leaves `reamp_on` set, once.
+    drop_next_reamp_off: bool,
+    /// [`Injection::ReampOffNeverLands`]: no Settings OFF clears `reamp_on`.
+    reamp_off_never_lands: bool,
+    /// Set by the first [`SimEvent::ServerAbort`]: every later send returns `Err`.
+    server_aborted: bool,
+    /// The working copy is the unit's EMPTY template (see [`template_json`]): set by a
+    /// `loadScene(N≠8)` on a scene-less preset, cleared by the next real load.
+    template_substituted: bool,
+    /// [`Injection::RejectNextLoad`]: the next real load substitutes the template, once.
+    reject_next_load: bool,
     /// Capture-fault injection (`POST /sim/fault`): when armed for a slot, that slot's
     /// NEXT capture returns silence once (the leveller's no-signal path), then disarms.
     /// e2e-only — its only reader is the offline capture model.
@@ -563,6 +743,8 @@ impl Default for SimState {
     fn default() -> Self {
         SimState {
             events: Vec::new(),
+            unhandled: Vec::new(),
+            injections: Vec::new(),
             batch_queue: Vec::new(),
             structural_seen: 0,
             drop_first: false,
@@ -571,6 +753,7 @@ impl Default for SimState {
             reject_at: None,
             stale_push_after_save: false,
             working_edits: Vec::new(),
+            saved_edits: HashMap::new(),
             string_params: std::collections::BTreeMap::new(),
             pending_pushes: Vec::new(),
             songs: vec![SimSong::new("Opening Set"), SimSong::new("Encore")],
@@ -594,7 +777,7 @@ impl Default for SimState {
             dirty: false,
             current_scene: None,
             saved_scene: HashMap::new(),
-            #[cfg(all(test, feature = "e2e"))]
+            #[cfg(feature = "e2e")]
             truncated_scene_push: None,
             preset_level: 1.0,
             param_writes: HashMap::new(),
@@ -602,6 +785,11 @@ impl Default for SimState {
             scene_edit_enabled: std::collections::HashSet::new(),
             ftsw_working: None,
             reamp_on: false,
+            drop_next_reamp_off: false,
+            reamp_off_never_lands: false,
+            server_aborted: false,
+            template_substituted: false,
+            reject_next_load: false,
             #[cfg(feature = "e2e")]
             fail_capture_slot: None,
             #[cfg(feature = "e2e")]
@@ -1113,6 +1301,8 @@ fn with_ftsw(json: &str, ftsw: Option<&serde_json::Value>) -> String {
 #[derive(Clone, Default)]
 pub struct SimDevice {
     state: Arc<Mutex<SimState>>,
+    /// This fake's own empty-template mark, so parallel tests never share the real one.
+    template_mark: Arc<crate::hid::TemplateMark>,
 }
 
 impl SimDevice {
@@ -1123,28 +1313,30 @@ impl SimDevice {
     /// Silently DROP the first structural edit (forces the held-session retry path).
     #[cfg(test)]
     pub fn with_drop_first(self) -> SimDevice {
-        self.state.lock().expect("sim lock").drop_first = true;
+        self.arm(Injection::DropFirstStructural);
         self
     }
 
     /// Land the first structural edit but lose its confirm (forces the read-then-retry).
     #[cfg(test)]
     pub fn with_lost_first_confirm(self) -> SimDevice {
-        self.state.lock().expect("sim lock").lose_first_confirm = true;
+        self.arm(Injection::LoseFirstConfirm);
         self
     }
 
     /// Confirm structural edits without the new node's id.
     #[cfg(test)]
     pub fn with_bare_confirms(self) -> SimDevice {
-        self.state.lock().expect("sim lock").bare_confirms = true;
+        self.arm(Injection::BareConfirms);
         self
     }
 
-    /// REJECT the `n`th structural edit (1-based) with `presetError` (never save after).
+    /// REJECT the `n`th structural edit (1-based) with `presetError` 14 when it is a
+    /// replace (never save after). An insert or a remove at `n` is answered normally: fw
+    /// 1.8.58 sends 14 only for a replace (static RE).
     #[cfg(test)]
     pub fn with_reject_at(self, n: u32) -> SimDevice {
-        self.state.lock().expect("sim lock").reject_at = Some(n);
+        self.arm(Injection::RejectReplace { nth: n });
         self
     }
 
@@ -1153,7 +1345,7 @@ impl SimDevice {
     /// never be poisoned by.
     #[cfg(test)]
     pub fn with_stale_push_after_save(self) -> SimDevice {
-        self.state.lock().expect("sim lock").stale_push_after_save = true;
+        self.arm(Injection::StalePushAfterSave);
         self
     }
 
@@ -1189,9 +1381,34 @@ impl SimDevice {
     /// before `template` — that scene's routing template with them.
     #[cfg(all(test, feature = "e2e"))]
     pub fn with_truncated_scene_push(self, scene: u32, cut_before: &str) -> SimDevice {
-        self.state.lock().expect("sim lock").truncated_scene_push =
-            Some((scene, cut_before.to_string()));
+        self.arm(Injection::TruncatedScenePush {
+            scene,
+            cut_before: cut_before.to_string(),
+        });
         self
+    }
+
+    /// Arm one [`Injection`] on this fake (the `with_*` builders and `POST /sim/inject`)
+    /// and return its reachability tag. A fresh fake (`/sim/reset`) has none armed.
+    pub(crate) fn arm(&self, injection: Injection) -> &'static str {
+        let tag = injection.tag();
+        let mut st = self.state.lock().expect("sim lock");
+        match &injection {
+            Injection::LoseFirstConfirm => st.lose_first_confirm = true,
+            Injection::RejectReplace { nth } => st.reject_at = Some(*nth),
+            Injection::DropFirstStructural => st.drop_first = true,
+            Injection::BareConfirms => st.bare_confirms = true,
+            Injection::StalePushAfterSave => st.stale_push_after_save = true,
+            Injection::DropNextReampOff => st.drop_next_reamp_off = true,
+            Injection::ReampOffNeverLands => st.reamp_off_never_lands = true,
+            Injection::RejectNextLoad => st.reject_next_load = true,
+            #[cfg(feature = "e2e")]
+            Injection::TruncatedScenePush { scene, cut_before } => {
+                st.truncated_scene_push = Some((*scene, cut_before.clone()));
+            }
+        }
+        st.injections.push(injection);
+        tag
     }
 
     /// The CURRENT `preset_level` — test-only introspection for the saved-doc specs
@@ -1218,6 +1435,12 @@ impl SimDevice {
     #[cfg(any(test, feature = "e2e"))]
     pub fn events(&self) -> Vec<SimEvent> {
         self.state.lock().expect("sim lock").events.clone()
+    }
+
+    /// The [`SimEvent::Unhandled`] log, in order (the census; never part of [`Self::events`]).
+    #[cfg(test)]
+    pub fn unhandled(&self) -> Vec<SimEvent> {
+        self.state.lock().expect("sim lock").unhandled.clone()
     }
 
     /// The current song names (read-back-after-write CRUD mutates them).
@@ -1343,20 +1566,58 @@ impl SimDevice {
         let Some(pm) = proto::first_bytes(&top, TMS_PRESET) else {
             // Song (11) / Setlist (12) CRUD; else heartbeat / connection / settings (ignored).
             if let Some(sm) = proto::first_bytes(&top, TMS_SONG) {
-                return self.handle_song_msg(sm);
+                return self.handle_song_msg(sm, proto::batch_status(body));
             }
             if let Some(slm) = proto::first_bytes(&top, TMS_SETLIST) {
-                return self.handle_setlist_msg(slm);
+                return self.handle_setlist_msg(slm, proto::batch_status(body));
+            }
+            // MixerMessage(5) → reAmpModeRequest(4): the re-amp read the oracle relies on
+            // (fw 1.8.58, device-confirmed) → reAmpModeResponse(9){ isActive(1) }, the flag
+            // omitted when off (proto3). One latch feeds both re-amp stores here.
+            if let Some(mm) = proto::first_bytes(&top, TMS_MIXER) {
+                if proto::first_bytes(&proto::parse(mm), F_MIXER_REAMP_REQUEST).is_some() {
+                    let on = self.state.lock().expect("sim lock").reamp_on;
+                    let mut resp = Vec::new();
+                    if on {
+                        proto::field_varint(&mut resp, 1, 1);
+                    }
+                    return frame_multi(&proto::len_delimited(
+                        TMS_MIXER,
+                        &proto::len_delimited(F_MIXER_REAMP_RESPONSE, &resp),
+                    ));
+                }
             }
             // SettingsMessage(3) → reampModeActive(30) → { value(1) } — the re-amp toggle
             // (ON=`1a05f201020801`, OFF=`1a03f20100`). Latched for the capture model; the
             // real device acks nothing, so no reply.
             if let Some(sm) = proto::first_bytes(&top, TMS_SETTINGS) {
                 let settings = proto::parse(sm);
+                // usbSettingsRequest(55) → usbSettingsResponse(56){ reampModeActive(1){
+                // value(1) } }, the flag omitted when off (fw 1.8.58, device-confirmed).
+                if proto::first_bytes(&settings, F_USB_SETTINGS_REQUEST).is_some() {
+                    let on = self.state.lock().expect("sim lock").reamp_on;
+                    let mut flag = Vec::new();
+                    if on {
+                        proto::field_varint(&mut flag, 1, 1);
+                    }
+                    return frame_multi(&proto::len_delimited(
+                        TMS_SETTINGS,
+                        &proto::len_delimited(
+                            F_USB_SETTINGS_RESPONSE,
+                            &proto::len_delimited(1, &flag),
+                        ),
+                    ));
+                }
                 if let Some(re) = proto::first_bytes(&settings, F_REAMP_SETTING) {
                     let on = proto::first_varint(&proto::parse(re), 1).unwrap_or(0) != 0;
                     let mut st = self.state.lock().expect("sim lock");
-                    st.reamp_on = on;
+                    // The re-amp OFF faults leave the latch ON; the OFF is still recorded.
+                    let dropped = !on
+                        && (st.reamp_off_never_lands
+                            || std::mem::replace(&mut st.drop_next_reamp_off, false));
+                    if !dropped {
+                        st.reamp_on = on;
+                    }
                     st.events.push(SimEvent::ReAmp(on));
                 }
                 if let Some(tap) = proto::first_bytes(&settings, F_TAP_TEMPO_BPM) {
@@ -1371,7 +1632,16 @@ impl SimDevice {
                         }
                     }
                 }
+                let handled = [F_REAMP_SETTING, F_TAP_TEMPO_BPM]
+                    .iter()
+                    .any(|&f| proto::first_bytes(&settings, f).is_some());
+                if handled {
+                    return Vec::new();
+                }
             }
+            // Connection traffic, other Settings fields, Mixer fields and every other
+            // message type: unanswered.
+            record_unhandled(&mut self.state.lock().expect("sim lock"), body);
             return Vec::new();
         };
         let f = proto::parse(pm);
@@ -1405,6 +1675,7 @@ impl SimDevice {
             st.loaded_identity = Some(identity);
             st.dirty = false;
             // A real load re-instantiates the stored preset: the working copy starts clean.
+            st.template_substituted = false;
             st.working_edits.clear();
             st.string_params.clear();
             // A tab-5 load makes its song active when the row it names is bound to this
@@ -1464,6 +1735,20 @@ impl SimDevice {
             // Echo `currentPresetDataChanged`(3) right after the load — the real device's
             // post-load push the `blockcaps` guard reads as the pre-edit roster
             // (`Session::current_preset_value`). May exceed one HID frame, so chunk it.
+            if std::mem::take(&mut st.reject_next_load) {
+                // A body the unit rejects at load: the empty template under the stored name,
+                // answered with presetError 6 (device-confirmed).
+                st.template_substituted = true;
+                let json = load_echo_json(&mut st, slot0, true);
+                let mut code = Vec::new();
+                proto::field_varint(&mut code, 1, crate::session::PRESET_ERROR_TEMPLATE);
+                let mut reports = vec![
+                    frame(&preset_loaded(dev_slot)),
+                    frame(&preset_message(F_PRESET_ERROR, &code)),
+                ];
+                reports.extend(frame_multi(&current_preset_data_changed(&json)));
+                return reports;
+            }
             let json = load_echo_json(&mut st, slot0, false);
             let mut reports = vec![frame(&preset_loaded(dev_slot))];
             reports.extend(frame_multi(&current_preset_data_changed(&json)));
@@ -1501,6 +1786,16 @@ impl SimDevice {
                 node_id: node_id.clone(),
                 fender_id: fender_id.clone(),
             });
+            // static RE that `replaceNode` naming an unknown id throws; whether the server
+            // catches it is OPEN, so the fake models the uncaught case. A narrow rule, on by
+            // default; a general sim abort model may replace it.
+            if !working_group_ids(&mut st, &group, None).contains(&node_id) {
+                server_abort(
+                    &mut st,
+                    format!("replaceNode names {group}/{node_id}, which the group lacks"),
+                );
+                return Vec::new();
+            }
             return confirm_replace(&mut st, group, node_id, fender_id);
         }
         if let Some(rb) = proto::first_bytes(&f, F_REPLACE_WITH_BLOCK) {
@@ -1588,6 +1883,15 @@ impl SimDevice {
                 let push = frame_multi(&current_preset_data_changed(&json));
                 st.pending_pushes.extend(push);
             }
+            // The working copy's structural edits become slot0's stored roster.
+            let current = st.current_slot;
+            let mut stored = st.saved_edits.get(&current).cloned().unwrap_or_default();
+            if slot0 == current {
+                stored.append(&mut st.working_edits);
+            } else {
+                stored.extend(st.working_edits.iter().cloned());
+            }
+            st.saved_edits.insert(slot0, stored);
             // This becomes slot0's saved doc (presetLevel + baked params; module header).
             #[cfg(feature = "e2e")]
             st.record_save(slot0);
@@ -1605,6 +1909,41 @@ impl SimDevice {
             // `BASE_SCENE_SLOT` (8) sentinel that recalls base (not a real `scenes[]`
             // entry — HW-confirmed; `session::BASE_SCENE_SLOT`).
             let wire_slot = proto::first_varint(&proto::parse(ls), 1).unwrap_or(0) as u32;
+            if wire_slot != crate::session::BASE_SCENE_SLOT {
+                let slot0 = st.current_slot;
+                let count =
+                    serde_json::from_str::<serde_json::Value>(&render_json(&mut st, slot0, true))
+                        .ok()
+                        .and_then(|v| {
+                            v.get("scenes")
+                                .and_then(serde_json::Value::as_array)
+                                .map(Vec::len)
+                        })
+                        .unwrap_or(0);
+                if count == 0 {
+                    // Scene-less preset (fw 1.8.58 static RE): the unit swaps the working copy
+                    // for its EMPTY template under the same name, answers presetError 6, sets
+                    // the dirty flag and keeps the requested scene index.
+                    st.events.push(SimEvent::LoadScene(wire_slot));
+                    st.template_substituted = true;
+                    st.dirty = true;
+                    st.current_scene = Some(wire_slot);
+                    let mut code = Vec::new();
+                    proto::field_varint(&mut code, 1, crate::session::PRESET_ERROR_TEMPLATE);
+                    let mut reports = vec![frame(&preset_message(F_PRESET_ERROR, &code))];
+                    let json = load_echo_json(&mut st, slot0, true);
+                    reports.extend(frame_multi(&current_preset_data_changed(&json)));
+                    return reports;
+                }
+                if wire_slot as usize >= count {
+                    // An index past the preset's scenes aborts the device server (static RE).
+                    server_abort(
+                        &mut st,
+                        format!("loadScene({wire_slot}) past {count} scenes"),
+                    );
+                    return Vec::new();
+                }
+            }
             st.current_scene = if wire_slot == crate::session::BASE_SCENE_SLOT {
                 None
             } else {
@@ -1818,6 +2157,7 @@ impl SimDevice {
                 &proto::len_delimited(1, json.as_bytes()),
             ));
         }
+        record_unhandled(&mut st, body);
         Vec::new()
     }
 
@@ -1825,7 +2165,7 @@ impl SimDevice {
     /// frame); add/remove/rename mutate them so the app's read-back-after-write sees the
     /// change. Membership is modeled too: the add/move/remove setters edit
     /// [`SimSetlist::members`] and the membership request reads it back.
-    fn handle_setlist_msg(&self, inner_bytes: &[u8]) -> Vec<Vec<u8>> {
+    fn handle_setlist_msg(&self, inner_bytes: &[u8], batch: Option<u64>) -> Vec<Vec<u8>> {
         let f = proto::parse(inner_bytes);
         let mut st = self.state.lock().expect("sim lock");
         let song_count = st.songs.len();
@@ -1910,13 +2250,15 @@ impl SimDevice {
             if let Some(i) = slot_index(&inner, 1, lists.len()) {
                 lists[i].name = str_field(&inner, 2);
             }
+            return Vec::new();
         }
+        record_unhandled_inner(&mut st, TMS_SETLIST, &f, batch);
         Vec::new()
     }
 
     /// Handle a `SongMessage`(11): the list and per-song row reads, song CRUD, notes, the
     /// `bpmActive` flag and `assignSongPreset` (see [`SimSong`] for the BPM model).
-    fn handle_song_msg(&self, inner_bytes: &[u8]) -> Vec<Vec<u8>> {
+    fn handle_song_msg(&self, inner_bytes: &[u8], batch: Option<u64>) -> Vec<Vec<u8>> {
         let f = proto::parse(inner_bytes);
         let mut st = self.state.lock().expect("sim lock");
         let song_at = |fields: &[(u32, proto::Val)]| {
@@ -2027,7 +2369,9 @@ impl SimDevice {
                 list_index: dev_slot - 1,
                 scene,
             });
+            return Vec::new();
         }
+        record_unhandled_inner(&mut st, TMS_SONG, &f, batch);
         Vec::new()
     }
 }
@@ -2107,6 +2451,72 @@ pub fn live_events() -> Vec<SimEvent> {
 // RESPONSE of any param outside `leveledParams`, and parallel-lane summation (joint-k) —
 // still online-only classes. The wet-mix curve is NOT HW-measured (see `wet_mix_gain_db`):
 // an offline wet solve proves the OUTCOME PLUMBING, never the real preset's numbers.
+
+/// Clear the installed fake's re-amp latch WITHOUT a wire send, so neither the re-amp
+/// counters nor `/sim/events` move (the offline `e2e_reamp_off` teardown). Returns whether
+/// the latch was ON; `None` when no fake is installed (online).
+#[cfg(feature = "e2e")]
+pub fn clear_live_reamp() -> Option<bool> {
+    let live = LIVE.lock().expect("sim live lock");
+    let mut st = live.as_ref()?.state.lock().expect("sim lock");
+    Some(std::mem::replace(&mut st.reamp_on, false))
+}
+
+/// Arm `injection` on the installed fake (`POST /sim/inject`) and return its tag; `None`
+/// when no fake is installed (online).
+#[cfg(feature = "e2e")]
+pub fn live_inject(injection: Injection) -> Option<&'static str> {
+    LIVE.lock()
+        .expect("sim live lock")
+        .as_ref()
+        .map(|dev| dev.arm(injection))
+}
+
+/// The installed fake's state for `GET /sim/state`: the re-amp latch, the current slot
+/// and scene, the unanswered-request histogram (`"<tms>.<inner>": n`), the kinds outside
+/// [`UNHANDLED_CENSUS`], and the armed injections with their tags. `None` online.
+#[cfg(feature = "e2e")]
+pub fn live_state() -> Option<serde_json::Value> {
+    let live = LIVE.lock().expect("sim live lock");
+    let st = live.as_ref()?.state.lock().expect("sim lock");
+    let mut unhandled = serde_json::Map::new();
+    let mut unhandled_new = Vec::new();
+    for e in &st.unhandled {
+        if let SimEvent::Unhandled { tms, inner, .. } = e {
+            let key = format!("{tms}.{inner}");
+            if !in_census(*tms, *inner) && !unhandled_new.contains(&key) {
+                unhandled_new.push(key.clone());
+            }
+            let n = unhandled.get(&key).and_then(serde_json::Value::as_u64);
+            unhandled.insert(key, serde_json::json!(n.unwrap_or(0) + 1));
+        }
+    }
+    let injections: Vec<serde_json::Value> = st
+        .injections
+        .iter()
+        .map(|i| {
+            let mut v = serde_json::to_value(i).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("tag".into(), serde_json::json!(i.tag()));
+            }
+            v
+        })
+        .collect();
+    Some(serde_json::json!({
+        "online": false,
+        "reamp_on": st.reamp_on,
+        "slot": st.current_slot,
+        "scene": st.current_scene,
+        "unhandled": unhandled,
+        "unhandled_new": unhandled_new,
+        "injections": injections,
+        "server_aborts": st
+            .events
+            .iter()
+            .filter(|e| matches!(e, SimEvent::ServerAbort { .. }))
+            .count(),
+    }))
+}
 
 /// Arm the currently-installed fake so `slot`'s NEXT capture returns silence once (the
 /// `POST /sim/fault` bridge endpoint). No-op when no fake is installed (online).
@@ -2654,7 +3064,7 @@ fn node_output_level(node: &serde_json::Value) -> Option<f32> {
 
 /// Keyed on the ACTIVE scene, not the recall that selected it: the `currentPresetDataRequest`
 /// re-push mid-prepass must be cut too, or it heals the scene the seam exists to break.
-#[cfg(all(test, feature = "e2e"))]
+#[cfg(feature = "e2e")]
 fn truncate_scene_push(st: &SimState, json: Vec<u8>) -> Vec<u8> {
     let Some((scene, marker)) = st.truncated_scene_push.as_ref() else {
         return json;
@@ -2671,7 +3081,7 @@ fn truncate_scene_push(st: &SimState, json: Vec<u8>) -> Vec<u8> {
     }
 }
 
-#[cfg(not(all(test, feature = "e2e")))]
+#[cfg(not(feature = "e2e"))]
 fn truncate_scene_push(_st: &SimState, json: Vec<u8>) -> Vec<u8> {
     json
 }
@@ -2729,11 +3139,13 @@ fn with_bypass_writes(json: String, writes: &HashMap<String, bool>) -> String {
 
 /// [`load_echo_json`] before any injected truncation.
 fn render_json(st: &mut SimState, slot0: u32, working: bool) -> String {
-    let edits = if working {
-        st.working_edits.clone()
-    } else {
-        Vec::new()
-    };
+    if working && st.template_substituted {
+        return template_json(&render_json_stored_name(st, slot0));
+    }
+    let mut edits = st.saved_edits.get(&slot0).cloned().unwrap_or_default();
+    if working {
+        edits.extend(st.working_edits.iter().cloned());
+    }
     #[cfg(feature = "e2e")]
     if let Some(j) = scenario_json_for(slot0) {
         // A working-copy render is the LIVE document: unsaved edits included, and after a save
@@ -2757,6 +3169,30 @@ fn render_json(st: &mut SimState, slot0: u32, working: bool) -> String {
     }
     let _ = slot0;
     with_working_edits(with_ftsw(&st.preset_json, st.ftsw_working.as_ref()), &edits)
+}
+
+/// The unit's EMPTY template as the working copy shows it after a substitution: the
+/// public fields only (template `preset_id`, the preset's own name, no blocks, no scenes,
+/// presetLevel 0.53; device-confirmed), never a copy of the factory record.
+fn template_json(name: &str) -> String {
+    serde_json::json!({
+        "info": {"displayName": name, "preset_id": crate::library::TEMPLATE_PRESET_ID},
+        "presetLevel": 0.53,
+        "audioGraph": {"guitarNodes": {}},
+        "scenes": [],
+    })
+    .to_string()
+}
+
+/// The display name the stored document for `slot0` carries ("" when it has none).
+fn render_json_stored_name(st: &mut SimState, slot0: u32) -> String {
+    serde_json::from_str::<serde_json::Value>(&render_json(st, slot0, false))
+        .ok()
+        .and_then(|v| {
+            v.pointer("/info/displayName")
+                .and_then(|n| n.as_str().map(String::from))
+        })
+        .unwrap_or_default()
 }
 
 /// The node ids `group` holds in the current working copy, minus `except`.
@@ -2929,7 +3365,11 @@ fn saved_slot_json_body(
         // NO working copy here: field-8 is the SAVED document, so an unsaved `ftsw` edit must
         // be invisible to it (that asymmetry against the field-3 render above is the point —
         // `verify_fs_persisted_writes` reads this to decide whether the assign PERSISTED).
-        saved_slot_json(slot0).map(|j| with_ftsw(&with_patched_doc(j, &doc), doc.ftsw.as_ref()))
+        let edits = st.saved_edits.get(&slot0).cloned().unwrap_or_default();
+        saved_slot_json(slot0).map(|j| {
+            let graph = with_working_edits(j.to_string(), &edits);
+            with_ftsw(&with_patched_doc(&graph, &doc), doc.ftsw.as_ref())
+        })
     }
     #[cfg(not(feature = "e2e"))]
     {
@@ -3029,6 +3469,62 @@ fn confirm_structural(
     reply
 }
 
+/// Record a request the fake answers with nothing ([`SimEvent::Unhandled`]): `body` is the
+/// whole FenderMessageTMS. Its message type is the first top-level field other than
+/// `batchStatus`(10).
+fn record_unhandled(st: &mut SimState, body: &[u8]) {
+    let top = proto::parse(body);
+    let Some((tms, msg)) = top.iter().find(|(f, _)| *f != 10) else {
+        return;
+    };
+    let inner = msg.as_bytes().map(proto::parse).unwrap_or_default();
+    record_unhandled_inner(st, *tms, &inner, proto::batch_status(body));
+}
+
+/// [`record_unhandled`] for an already-parsed message body `inner` of type `tms`. Prints
+/// `[sim] UNHANDLED <tms>.<inner>` the first time a fake sees a kind, so a run's log shows
+/// every kind once (a fresh fake per `/sim/reset` prints them again).
+fn record_unhandled_inner(
+    st: &mut SimState,
+    tms: u32,
+    inner: &[(u32, proto::Val)],
+    batch: Option<u64>,
+) {
+    let inner = inner.first().map_or(0, |(f, _)| *f);
+    let seen = st.unhandled.iter().any(
+        |e| matches!(e, SimEvent::Unhandled { tms: t, inner: i, .. } if *t == tms && *i == inner),
+    );
+    if !seen {
+        eprintln!("[sim] UNHANDLED {tms}.{inner}");
+    }
+    st.unhandled.push(SimEvent::Unhandled { tms, inner, batch });
+}
+
+/// The default preset with eight (empty) scenes, for tests that recall scenes 0..=7: on
+/// the scene-less default a `loadScene(N≠8)` substitutes the empty template.
+#[cfg(test)]
+pub(crate) const SCENED_PRESET_JSON: &str = r#"{"audioGraph":{"template":"gtrSeries","guitarNodes":{"G1":[
+    {"FenderId":"ACD_Twin57","nodeId":"n1","dspUnitParameters":{"bypass":false,"outputLevel":0.5}},
+    {"FenderId":"ACD_ChorusCE2","nodeId":"n2","dspUnitParameters":{"bypass":false}}
+]}},"scenes":[{"sceneName":"S1"},{"sceneName":"S2"},{"sceneName":"S3"},{"sceneName":"S4"},
+{"sceneName":"S5"},{"sceneName":"S6"},{"sceneName":"S7"},{"sceneName":"S8"}]}"#;
+
+/// Record a device-server abort: no reply to the request that caused it, and every later
+/// send on this fake fails ([`SimEvent::ServerAbort`]).
+fn server_abort(st: &mut SimState, cause: String) {
+    eprintln!("[sim] SERVER ABORT: {cause}");
+    st.server_aborted = true;
+    st.events.push(SimEvent::ServerAbort { cause });
+}
+
+/// `Err` once the fake's server has aborted ([`server_abort`]).
+fn alive(st: &SimState) -> Result<(), String> {
+    if st.server_aborted {
+        return Err("sim: the device server aborted; no reply".to_string());
+    }
+    Ok(())
+}
+
 /// Produce the framed confirm/reject reply for a structural edit, honoring the
 /// drop-first / lost-confirm / reject-at injections. The flag says whether the edit lands.
 fn structural_reply(st: &mut SimState, confirm_field: u32, payload: &[u8]) -> (Vec<Vec<u8>>, bool) {
@@ -3040,8 +3536,9 @@ fn structural_reply(st: &mut SimState, confirm_field: u32, payload: &[u8]) -> (V
     if st.lose_first_confirm && n == 1 {
         return (Vec::new(), true); // applied, but the confirm never arrives
     }
-    if st.reject_at == Some(n) {
-        // Code 14: what fw 1.8.58 sends for a replace over the CPU budget.
+    if st.reject_at == Some(n) && confirm_field == F_NODE_REPLACED {
+        // Code 14: what fw 1.8.58 sends for a replace over the CPU budget — and only for a
+        // replace (an over-budget insert aborts the server; a remove always confirms).
         let mut code = Vec::new();
         proto::field_varint(&mut code, 1, 14);
         return (vec![frame(&preset_message(F_PRESET_ERROR, &code))], false);
@@ -3051,18 +3548,20 @@ fn structural_reply(st: &mut SimState, confirm_field: u32, payload: &[u8]) -> (V
 }
 
 impl HidTransport for SimDevice {
-    fn send(&self, _body: &[u8]) -> Result<(), String> {
-        self.state
-            .lock()
-            .expect("sim lock")
-            .events
-            .push(SimEvent::Heartbeat);
+    fn send(&self, body: &[u8]) -> Result<(), String> {
+        let mut st = self.state.lock().expect("sim lock");
+        alive(&st)?;
+        st.events.push(SimEvent::Heartbeat);
+        // Unanswered, so it joins the census too: an allow-list of silent kinds needs it.
+        record_unhandled(&mut st, body);
         Ok(()) // fire-and-forget (heartbeat) — no reply
     }
     fn transact(&self, body: &[u8], _pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        alive(&self.state.lock().expect("sim lock"))?;
         Ok(self.receive(body))
     }
     fn transact_chunked(&self, body: &[u8], _pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        alive(&self.state.lock().expect("sim lock"))?;
         Ok(self.receive(body))
     }
     fn pump(&self, _pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
@@ -3073,7 +3572,11 @@ impl HidTransport for SimDevice {
         ))
     }
     fn transact_eager(&self, body: &[u8], _max_ms: u64) -> Result<Vec<Vec<u8>>, String> {
+        alive(&self.state.lock().expect("sim lock"))?;
         Ok(self.receive(body))
+    }
+    fn template_mark(&self) -> Arc<crate::hid::TemplateMark> {
+        self.template_mark.clone()
     }
 }
 
@@ -3135,7 +3638,7 @@ fn preset_loaded(dev_slot: u64) -> Vec<u8> {
 }
 
 /// `currentPresetDataChanged`(3) — `presetJson`(1) = LZ4("stored"/uncompressed-block)
-/// of the preset JSON. Mirrors the wire shape `session.rs`'s own fixtures build
+/// of the preset JSON. Mirrors the wire shape `session/tests.rs`'s own fixtures build
 /// (`decode_current_preset_data_yields_active_graph_with_known_template`) and what
 /// `Session::current_preset_value` (`best_json_payload`'s `(3, 1)` carrier) reads back.
 const F_CURRENT_PRESET_DATA_CHANGED: u32 = 3;
@@ -3726,9 +4229,10 @@ mod physics_tests {
     fn scene_recall_reverts_an_unsaved_preset_level_to_the_saved_value() {
         let sim = SimDevice::new();
         let mut s = crate::session::Session::from_transport(Box::new(sim.clone()));
-        s.load_preset(401).unwrap();
+        // 402 has 8 scenes: a real-scene recall on a scene-less preset swaps in the template.
+        s.load_preset(402).unwrap();
         s.set_preset_level(0.81).unwrap();
-        s.save_current_preset(401).unwrap(); // saves 0.81, marks 401 `ever_saved`
+        s.save_current_preset(402).unwrap(); // saves 0.81, marks 401 `ever_saved`
 
         // A real scene recall.
         s.set_preset_level(0.55).unwrap(); // unsaved working-copy write, e.g. a solved level
@@ -3797,7 +4301,7 @@ mod scene_context_tests {
     // NEXT load — including a save while base (BASE_SCENE_SLOT) is active.
     #[test]
     fn saving_records_the_active_scene_for_the_next_load() {
-        let sim = SimDevice::new();
+        let sim = SimDevice::new().with_preset_json(SCENED_PRESET_JSON);
         let mut s = Session::from_transport(Box::new(sim.clone()));
         s.load_preset(1).unwrap();
         s.load_scene(4).unwrap();
@@ -4520,5 +5024,343 @@ mod setlist_membership_tests {
         assert_eq!(read(&mut s, 2), [2, 5]);
         s.remove_setlist(1).unwrap();
         assert_eq!(read(&mut s, 1), [2, 5]);
+    }
+}
+
+/// The re-amp read pair, the unanswered-request census and the injection tags.
+#[cfg(test)]
+mod oracle_and_census_tests {
+    use super::*;
+    use crate::session::{ReampState, Session};
+
+    fn session(sim: &SimDevice) -> Session {
+        Session::from_transport(Box::new(sim.clone()))
+    }
+
+    #[test]
+    fn both_reamp_stores_read_back_the_latch() {
+        let sim = SimDevice::new();
+        let mut s = session(&sim);
+        s.set_reamp_mode(true).expect("engage");
+        let on = ReampState {
+            mixer: Some(true),
+            settings: Some(true),
+        };
+        assert_eq!(s.read_reamp_state().expect("read"), on);
+        s.set_reamp_mode(false).expect("disengage");
+        let off = ReampState {
+            mixer: Some(false),
+            settings: Some(false),
+        };
+        assert_eq!(s.read_reamp_state().expect("read"), off);
+    }
+
+    #[test]
+    fn the_read_is_read_only_and_answered_off_the_census() {
+        let sim = SimDevice::new();
+        session(&sim).read_reamp_state().expect("read");
+        assert!(
+            !sim.events().iter().any(|e| matches!(e, SimEvent::ReAmp(_))),
+            "the oracle must never send a re-amp write"
+        );
+        assert!(
+            !sim.unhandled().iter().any(|e| matches!(
+                e,
+                SimEvent::Unhandled { tms: 5, .. }
+                    | SimEvent::Unhandled {
+                        tms: 3,
+                        inner: 55,
+                        ..
+                    }
+            )),
+            "both reads are answered, so neither is in the census"
+        );
+    }
+
+    /// A transport that never answers anything.
+    struct Mute;
+    impl HidTransport for Mute {
+        fn send(&self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn transact(&self, _: &[u8], _: u64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(Vec::new())
+        }
+        fn transact_chunked(&self, _: &[u8], _: u64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(Vec::new())
+        }
+        fn pump(&self, _: u64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(Vec::new())
+        }
+        fn transact_eager(&self, _: &[u8], _: u64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_store_that_never_answers_reads_none_not_off() {
+        let mut s = Session::from_transport(Box::new(Mute));
+        let state = s.read_reamp_state().expect("read");
+        assert_eq!(
+            state,
+            ReampState {
+                mixer: None,
+                settings: None
+            }
+        );
+    }
+
+    /// A [`SimDevice`] whose Mixer re-amp reply lands `delay_ms` (nominal) after the
+    /// request — behind another session's preset-dump continuation frames, as on HW.
+    struct LateMixer {
+        sim: SimDevice,
+        delay_ms: u64,
+        held: Mutex<Option<(u64, Vec<Vec<u8>>)>>,
+    }
+    impl LateMixer {
+        fn pass(&self, body: &[u8], frames: Vec<Vec<u8>>, ms: u64) -> Vec<Vec<u8>> {
+            let mut held = self.held.lock().unwrap();
+            if body == proto::mixer_request(4) {
+                *held = Some((0, frames));
+                return Vec::new();
+            }
+            let mut out = frames;
+            if let Some((waited, late)) = held.as_mut() {
+                *waited += ms;
+                if *waited >= self.delay_ms {
+                    out.append(late);
+                    *held = None;
+                }
+            }
+            out
+        }
+    }
+    impl HidTransport for LateMixer {
+        fn send(&self, body: &[u8]) -> Result<(), String> {
+            self.sim.send(body)
+        }
+        fn transact(&self, body: &[u8], ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            let f = self.sim.transact(body, ms)?;
+            Ok(self.pass(body, f, ms))
+        }
+        fn transact_chunked(&self, body: &[u8], ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            let f = self.sim.transact_chunked(body, ms)?;
+            Ok(self.pass(body, f, ms))
+        }
+        fn pump(&self, ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            let f = self.sim.pump(ms)?;
+            Ok(self.pass(&[], f, ms))
+        }
+        fn transact_eager(&self, body: &[u8], ms: u64) -> Result<Vec<Vec<u8>>, String> {
+            let f = self.sim.transact_eager(body, ms)?;
+            Ok(self.pass(body, f, ms))
+        }
+        fn template_mark(&self) -> std::sync::Arc<crate::hid::TemplateMark> {
+            crate::hid::HidTransport::template_mark(&self.sim)
+        }
+    }
+
+    /// A Mixer reply that arrives after the Settings request went out is still read. The
+    /// online idempotency run read it as missing when it came ~2.4 s late.
+    #[test]
+    fn a_mixer_reply_that_lands_after_the_settings_request_still_reads() {
+        let sim = SimDevice::new();
+        session(&sim).set_reamp_mode(false).expect("disengage");
+        let mut s = Session::from_transport(Box::new(LateMixer {
+            sim: sim.clone(),
+            delay_ms: 2_450,
+            held: Mutex::new(None),
+        }));
+        assert_eq!(
+            s.read_reamp_state().expect("read"),
+            ReampState {
+                mixer: Some(false),
+                settings: Some(false)
+            }
+        );
+    }
+
+    #[test]
+    fn an_unanswered_request_is_recorded_apart_from_events_with_its_kind_and_batch() {
+        let sim = SimDevice::new();
+        let before = sim.events();
+        // A batch-2 product-profile request queues, then the batch-3 drain answers it.
+        sim.receive(&proto::product_profile_request(2));
+        sim.receive(&proto::current_preset_data_request(3));
+        sim.receive(&proto::connection_request());
+        let recorded = sim.unhandled();
+        let top = proto::parse(&proto::product_profile_request(2));
+        let (tms, msg) = top.iter().find(|(f, _)| *f != 10).expect("tms");
+        let inner = proto::parse(msg.as_bytes().expect("body"))
+            .first()
+            .map_or(0, |(f, _)| *f);
+        assert!(recorded.contains(&SimEvent::Unhandled {
+            tms: *tms,
+            inner,
+            batch: Some(2),
+        }));
+        assert!(recorded.contains(&SimEvent::Unhandled {
+            tms: 4,
+            inner: 1,
+            batch: None,
+        }));
+        // `events` only gained what the handled drain recorded, never an Unhandled.
+        assert!(!sim
+            .events()
+            .iter()
+            .skip(before.len())
+            .any(|e| matches!(e, SimEvent::Unhandled { .. })));
+    }
+
+    #[test]
+    fn a_heartbeat_joins_the_census_log_and_keeps_its_event() {
+        let sim = SimDevice::new();
+        session(&sim).heartbeat().expect("heartbeat");
+        assert_eq!(sim.events(), vec![SimEvent::Heartbeat]);
+        assert_eq!(
+            sim.unhandled(),
+            vec![SimEvent::Unhandled {
+                tms: 4,
+                inner: 4,
+                batch: None
+            }]
+        );
+    }
+
+    #[test]
+    fn handled_song_and_setlist_setters_stay_out_of_the_census() {
+        let sim = SimDevice::new();
+        let mut s = session(&sim);
+        s.rename_setlist(1, "M").expect("rename setlist");
+        s.rename_song(1, "B").expect("rename song");
+        assert!(sim.unhandled().is_empty(), "{:?}", sim.unhandled());
+    }
+
+    fn preset_error_in(reports: &[Vec<u8>]) -> bool {
+        reports.iter().any(|r| {
+            let top = proto::parse(&r[4..]);
+            proto::first_bytes(&top, TMS_PRESET)
+                .is_some_and(|pm| proto::first_bytes(&proto::parse(pm), F_PRESET_ERROR).is_some())
+        })
+    }
+
+    #[test]
+    fn reject_replace_never_answers_an_insert_or_a_remove_with_an_error() {
+        let insert = proto::insert_node("G1", None, "ACD_Boost", None);
+        let remove = proto::remove_node("G1", "ACD_Boost", None);
+        // `n2`: a node the default document holds (a missing one aborts the server).
+        let replace = proto::replace_node("G1", "n2", "ACD_Fuzz", None);
+        let sim = SimDevice::new();
+        assert_eq!(sim.arm(Injection::RejectReplace { nth: 1 }), "reachable");
+        assert!(!preset_error_in(&sim.receive(&insert)));
+        let sim = SimDevice::new();
+        sim.arm(Injection::RejectReplace { nth: 1 });
+        assert!(!preset_error_in(&sim.receive(&remove)));
+        let sim = SimDevice::new();
+        sim.arm(Injection::RejectReplace { nth: 1 });
+        assert!(preset_error_in(&sim.receive(&replace)));
+    }
+
+    #[test]
+    fn a_replace_naming_a_missing_node_aborts_the_server() {
+        let sim = SimDevice::new();
+        let ghost = proto::replace_node("G1", "ghost", "ACD_Fuzz", None);
+        assert!(sim.receive(&ghost).is_empty(), "an abort answers nothing");
+        assert!(
+            sim.events().iter().any(
+                |e| matches!(e, SimEvent::ServerAbort { cause } if cause.contains("G1/ghost"))
+            ),
+            "{:?}",
+            sim.events()
+        );
+        // The narrow model: every later send on this fake fails.
+        let level = proto::set_preset_level(0.5);
+        assert!(sim.transact(&level, 0).is_err());
+        assert!(sim.send(&level).is_err());
+        // A replace of a node the group holds is answered normally.
+        let sim = SimDevice::new();
+        sim.receive(&proto::replace_node("G1", "n2", "ACD_Fuzz", None));
+        assert!(!sim
+            .events()
+            .iter()
+            .any(|e| matches!(e, SimEvent::ServerAbort { .. })));
+        assert!(sim.transact(&level, 0).is_ok());
+    }
+
+    #[test]
+    fn a_saved_replace_persists_its_minted_id_across_a_reload() {
+        let sim = SimDevice::new();
+        sim.receive(&proto::replace_node("G1", "n2", "ACD_Fuzz", None));
+        sim.receive(&proto::save_current_preset(1));
+        // Load another slot, then this one: a real reload of the stored document.
+        sim.receive(&proto::load_preset(2, 1));
+        sim.receive(&proto::load_preset(1, 1));
+        sim.receive(&proto::replace_node("G1", "ACD_Fuzz", "ACD_Boost", None));
+        assert!(
+            !sim.events()
+                .iter()
+                .any(|e| matches!(e, SimEvent::ServerAbort { .. })),
+            "the stored roster holds the id the save persisted: {:?}",
+            sim.events()
+        );
+    }
+
+    #[test]
+    fn the_reamp_off_faults_keep_the_latch_on() {
+        let off = proto::set_reamp_mode(false);
+        let on = proto::set_reamp_mode(true);
+        let latch = |sim: &SimDevice| sim.state.lock().expect("sim lock").reamp_on;
+        let sim = SimDevice::new();
+        sim.receive(&on);
+        sim.arm(Injection::DropNextReampOff);
+        sim.receive(&off);
+        assert!(latch(&sim), "the next OFF is dropped");
+        sim.receive(&off);
+        assert!(!latch(&sim), "only once");
+        let sim = SimDevice::new();
+        sim.receive(&on);
+        sim.arm(Injection::ReampOffNeverLands);
+        sim.receive(&off);
+        sim.receive(&on);
+        sim.receive(&off);
+        assert!(latch(&sim), "no OFF ever lands");
+        // Every OFF is still recorded as sent.
+        assert_eq!(
+            sim.events()
+                .iter()
+                .filter(|e| matches!(e, SimEvent::ReAmp(false)))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn every_injection_carries_its_reachability_tag() {
+        let tags: Vec<_> = [
+            Injection::LoseFirstConfirm,
+            Injection::RejectReplace { nth: 2 },
+            Injection::DropFirstStructural,
+            Injection::BareConfirms,
+            Injection::StalePushAfterSave,
+            Injection::DropNextReampOff,
+            Injection::ReampOffNeverLands,
+            Injection::RejectNextLoad,
+        ]
+        .iter()
+        .map(Injection::tag)
+        .collect();
+        assert_eq!(
+            tags,
+            [
+                "reachable",
+                "reachable",
+                "unreachable",
+                "unreachable",
+                "unverified",
+                "reachable",
+                "unverified",
+                "reachable"
+            ]
+        );
     }
 }

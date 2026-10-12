@@ -148,7 +148,7 @@ fn offline_copy_journey_through_real_backend() {
         },
     ];
     MONITOR_ENABLED.store(true, SeqCst);
-    monitor::e2e_install_snapshot(Some("1.8.45".into()), presets, None);
+    monitor::e2e_install_snapshot(Some("1.8.58".into()), presets, None);
 
     let app = tauri::test::mock_builder()
         .manage(AppState::default())
@@ -168,7 +168,7 @@ fn offline_copy_journey_through_real_backend() {
     let conn = invoke(&webview, "connect_device", serde_json::json!({})).expect("connect");
     assert_eq!(
         conn.get("firmware").and_then(|v| v.as_str()),
-        Some("1.8.45")
+        Some("1.8.58")
     );
 
     // 2. list presets → the snapshot's fixture entries (one per scenario preset).
@@ -194,16 +194,17 @@ fn offline_copy_journey_through_real_backend() {
 
     // 4. copy_apply a dry-run replace on the target → outcome "updated", NOTHING saved.
     // The job is the exact camelCase wire shape `CopyJob`/`CopyOp`/`CopyRepl` accept
-    // (the input-only structs the frontend's `diffToOps` produces). The fake confirms
-    // any structural edit, so the nodeId need not match a fixture node.
+    // (the input-only structs the frontend's `diffToOps` produces). The nodeId must be a
+    // node 401's G1 holds: a `replaceNode` naming a missing node aborts the fake's server,
+    // as it may the device's.
     let jobs = serde_json::json!([{
         "listIndex": 401,
         "name": "E2E Pedalboard",
         "ops": [{
             "kind": "replace",
             "group": "G1",
-            "nodeId": "ACD_PhaserP90",
-            "repl": { "kind": "model", "fenderId": "ACD_KingOfTone" }
+            "nodeId": "ACD_UniVibe",
+            "repl": { "kind": "model", "fenderId": "ACD_PhaserP90" }
         }]
     }]);
     let items = invoke(
@@ -1811,8 +1812,8 @@ fn a_truncated_swap_scene_levels_its_own_amp_not_the_base_one() {
 }
 
 /// The SCENE-leveling physics for slot 403 through the REAL `level_scenes_apply_batched`
-/// command over mock IPC — the same path the offline UI drives, minus the Channel-streaming
-/// seam (`.claude/rules/e2e.md`'s "The Channel-streaming seam"): this gate asserts the
+/// command over mock IPC — the same path the offline UI drives, minus the streamed rows
+/// (`.claude/rules/e2e.md`'s "Events and Channels reach the page"): this gate asserts the
 /// outcomes on the command's RETURN value instead. At the shipped default target (-23,
 /// PR2 re-baseline: +3 from the mono-era -26) the 4 scenes produce the level-defaults outcome
 /// set: 3 SOLVABLE (amp `outputLevel` converged to ~-23) + 1 OFF-BRANCH ("Clean", saved with
@@ -4077,6 +4078,9 @@ impl crate::hid::HidTransport for CancelAtSceneWrite {
         self.check();
         r
     }
+    fn template_mark(&self) -> std::sync::Arc<crate::hid::TemplateMark> {
+        crate::hid::HidTransport::template_mark(&self.sim)
+    }
 }
 
 /// ⟦F2⟧ CANCEL AFTER A LANDED TRADE RETURNS ITS OUTCOMES AND DISCLOSES THE TRADE — it does not
@@ -4555,6 +4559,17 @@ fn side_lane_takes_cancels_and_counters_only() {
         );
     }
     assert!(super::e2e_is_side_lane(&req("GET", "/reamp/counters", "")));
+    assert!(super::e2e_is_side_lane(&req(
+        "GET",
+        "/ui/events?after=3",
+        ""
+    )));
+    assert!(!super::e2e_is_side_lane(&req("GET", "/sim/state", "")));
+    assert!(!super::e2e_is_side_lane(&req(
+        "POST",
+        "/invoke",
+        "e2e_reamp_state"
+    )));
     assert!(!super::e2e_is_side_lane(&req(
         "POST",
         "/invoke",
@@ -4565,4 +4580,316 @@ fn side_lane_takes_cancels_and_counters_only() {
         "/sim/reset",
         "cancel_doctor_check"
     )));
+}
+
+/// A webview over a mock app registering the re-amp e2e commands, with the offline fake
+/// installed the way the server installs it. Hold [`serial`] around it.
+fn reamp_webview() -> (tauri::App<MockRuntime>, WebviewWindow<MockRuntime>) {
+    super::e2e_install_offline_fake();
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            super::e2e_reamp_state,
+            super::e2e_reamp_off
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    (app, webview)
+}
+
+fn route_json(
+    webview: &WebviewWindow<MockRuntime>,
+    method: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (&'static str, serde_json::Value) {
+    let (status, bytes) = super::e2e_route(
+        webview,
+        method,
+        path,
+        &serde_json::to_vec(&body).unwrap_or_default(),
+    );
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// The offline installer reports the firmware every sim rule encodes.
+#[test]
+fn the_offline_snapshot_reports_fw_1_8_58() {
+    let _g = serial();
+    super::e2e_install_offline_fake();
+    let snap = crate::monitor::startup_snapshot().expect("snapshot installed");
+    assert_eq!(snap.firmware.as_deref(), Some("1.8.58"));
+}
+
+/// The re-amp oracle reads the latch the way the device answers: with the latch ON, both
+/// `/sim/state` and `e2e_reamp_state` say so, and the offline `e2e_reamp_off` clears it
+/// with no wire send (the counters and `/sim/events` stay put).
+#[test]
+fn the_reamp_oracle_reads_the_sim_latch_and_the_offline_off_clears_it_silently() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _g = serial();
+    let (_app, webview) = reamp_webview();
+    let mut s = crate::session::Session::connect().expect("connect");
+    s.set_reamp_mode(true).expect("engage");
+    drop(s);
+
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    assert_eq!(state["online"], serde_json::json!(false));
+    assert_eq!(state["reamp_on"], serde_json::json!(true));
+    let read = invoke(&webview, "e2e_reamp_state", serde_json::json!({})).expect("read");
+    assert_eq!(read, serde_json::json!({ "mixer": true, "settings": true }));
+
+    let events = crate::sim_device::live_events().len();
+    let off = crate::session::REAMP_OFF_COUNT.load(Relaxed);
+    invoke(&webview, "e2e_reamp_off", serde_json::json!({})).expect("off");
+    assert_eq!(crate::session::REAMP_OFF_COUNT.load(Relaxed), off);
+    let after: Vec<_> = crate::sim_device::live_events();
+    assert!(
+        !after[events..]
+            .iter()
+            .any(|e| matches!(e, crate::sim_device::SimEvent::ReAmp(_))),
+        "the offline teardown sends nothing"
+    );
+    let read = invoke(&webview, "e2e_reamp_state", serde_json::json!({})).expect("read");
+    assert_eq!(
+        read,
+        serde_json::json!({ "mixer": false, "settings": false })
+    );
+}
+
+/// `/sim/inject` answers every kind with its tag and an unknown kind with 400; armed
+/// injections show on `/sim/state`, and a fresh `/sim/reset` clears them.
+#[test]
+fn sim_inject_tags_every_kind_and_refuses_an_unknown_one() {
+    let _g = serial();
+    let (_app, webview) = reamp_webview();
+    let cases = [
+        (
+            serde_json::json!({ "kind": "lose-first-confirm" }),
+            "reachable",
+        ),
+        (
+            serde_json::json!({ "kind": "reject-replace", "nth": 2 }),
+            "reachable",
+        ),
+        (
+            serde_json::json!({ "kind": "drop-first-structural" }),
+            "unreachable",
+        ),
+        (
+            serde_json::json!({ "kind": "bare-confirms" }),
+            "unreachable",
+        ),
+        (
+            serde_json::json!({ "kind": "stale-push-after-save" }),
+            "unverified",
+        ),
+        (
+            serde_json::json!({ "kind": "truncated-scene-push", "scene": 1, "cutBefore": "ACD_" }),
+            "not-device-shaped",
+        ),
+        (
+            serde_json::json!({ "kind": "drop-next-reamp-off" }),
+            "reachable",
+        ),
+        (
+            serde_json::json!({ "kind": "reamp-off-never-lands" }),
+            "unverified",
+        ),
+    ];
+    for (body, tag) in &cases {
+        let (status, v) = route_json(&webview, "POST", "/sim/inject", body.clone());
+        assert_eq!(status, "200 OK", "{body}");
+        assert_eq!(v["tag"], serde_json::json!(tag), "{body}");
+    }
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    let armed = state["injections"].as_array().map(Vec::len);
+    assert_eq!(armed, Some(cases.len()));
+    assert_eq!(
+        state["injections"][1]["kind"],
+        serde_json::json!("reject-replace")
+    );
+    assert_eq!(state["injections"][1]["nth"], serde_json::json!(2));
+    assert_eq!(
+        state["injections"][5]["cutBefore"],
+        serde_json::json!("ACD_")
+    );
+
+    let (status, _) = route_json(
+        &webview,
+        "POST",
+        "/sim/inject",
+        serde_json::json!({ "kind": "no-such-fault" }),
+    );
+    assert_eq!(status, "400 Bad Request");
+    let (status, _) = route_json(
+        &webview,
+        "POST",
+        "/sim/inject",
+        serde_json::json!({ "kind": "reject-replace" }),
+    );
+    assert_eq!(status, "400 Bad Request", "a missing nth is refused");
+
+    route_json(&webview, "POST", "/sim/reset", serde_json::json!({}));
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    assert_eq!(state["injections"], serde_json::json!([]));
+}
+
+/// The census: every unanswered kind is counted on `/sim/state`, and one outside
+/// `UNHANDLED_CENSUS` is listed in `unhandled_new` — reported, not failed.
+#[test]
+fn sim_state_counts_unanswered_kinds_and_lists_the_ones_outside_the_census() {
+    let _g = serial();
+    let (_app, webview) = reamp_webview();
+    let mut s = crate::session::Session::connect().expect("connect");
+    s.heartbeat().expect("heartbeat");
+    drop(s);
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    assert!(
+        state["unhandled"]["4.4"].as_u64().unwrap_or(0) >= 1,
+        "{state}"
+    );
+    for kind in state["unhandled_new"].as_array().into_iter().flatten() {
+        let (tms, inner) = kind
+            .as_str()
+            .and_then(|k| k.split_once('.'))
+            .expect("tms.inner");
+        assert!(
+            !crate::sim_device::in_census(tms.parse().unwrap_or(0), inner.parse().unwrap_or(0)),
+            "{kind} is in the census, so it is not new"
+        );
+    }
+    // A Mixer read the fake has no handler for: masterLevelInfoRequest (5).
+    let mut s = crate::session::Session::connect().expect("connect");
+    let _ = s.send_and_dump(&crate::proto::mixer_request(5), 50);
+    drop(s);
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    let new: Vec<_> = state["unhandled_new"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(new.contains(&"5.5"), "{state}");
+}
+
+/// A command that streams two rows over a Channel, as the leveling commands do.
+#[tauri::command]
+fn stream_two_rows(on_row: tauri::ipc::Channel<serde_json::Value>) -> Result<(), String> {
+    for n in 1..=2 {
+        on_row
+            .send(serde_json::json!({ "n": n }))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The UI bridge end to end: an app emit reaches the ring through its listener, and a
+/// command's Channel sends land there keyed by the Channel id the page passed, in order.
+#[test]
+fn events_and_channel_sends_reach_the_ui_ring() {
+    let _g = serial();
+    let (_, head) = crate::e2e_ui_bridge::after(0);
+    let app = tauri::test::mock_builder()
+        .channel_interceptor(crate::e2e_ui_bridge::intercept_channel)
+        .invoke_handler(tauri::generate_handler![stream_two_rows])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    crate::e2e_ui_bridge::listen_events(&app);
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    tauri::Emitter::emit(
+        &app,
+        "tmp://backup-progress",
+        serde_json::json!({ "done": 1 }),
+    )
+    .expect("emit");
+    invoke(
+        &webview,
+        "stream_two_rows",
+        serde_json::json!({ "onRow": "__CHANNEL__:77" }),
+    )
+    .expect("stream");
+    let (entries, _) = crate::e2e_ui_bridge::after(head);
+    let mine: Vec<_> = entries
+        .iter()
+        .filter(|e| e.name == "tmp://backup-progress" || e.name == "77")
+        .map(|e| (e.kind, e.name.as_str(), e.index, e.payload.clone()))
+        .collect();
+    assert_eq!(
+        mine,
+        vec![
+            (
+                "event",
+                "tmp://backup-progress",
+                None,
+                serde_json::json!({ "done": 1 })
+            ),
+            ("channel", "77", Some(0), serde_json::json!({ "n": 1 })),
+            ("channel", "77", Some(1), serde_json::json!({ "n": 2 })),
+        ]
+    );
+}
+
+/// The run-end re-amp OFF is read back, and an OFF that never reads back OFF reaches the
+/// run result as `reamp_warning` (the Summary renders it). Gate for the stranded re-amp mute:
+/// `reamp_off_guaranteed` used to send its OFF and log "sent" with no read.
+#[test]
+fn a_base_run_whose_final_off_never_lands_carries_the_reamp_warning() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    sim.arm(crate::sim_device::Injection::ReampOffNeverLands);
+    let (_app, webview) = level_preset_app();
+    let r = run_base_level(&webview, FRIEDMAN, -23.0, false);
+    assert_eq!(
+        r["reamp_warning"],
+        serde_json::json!(crate::leveller::REAMP_STILL_ON_WARNING),
+        "{r}"
+    );
+}
+
+/// A stale-flag OFF (a no-op that still echoes) inside the run is caught by the run-end
+/// backstop: the run ends with the latch OFF and no warning on the result.
+#[test]
+fn a_base_run_with_a_dropped_off_ends_with_reamp_read_back_off() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    sim.arm(crate::sim_device::Injection::DropNextReampOff);
+    let (_app, webview) = level_preset_app();
+    let r = run_base_level(&webview, FRIEDMAN, -23.0, false);
+    assert!(r.get("reamp_warning").is_none(), "{r}");
+    let state = crate::session::Session::connect()
+        .and_then(|mut s| s.read_reamp_state())
+        .expect("read");
+    assert_eq!(state.mixer, Some(false), "the latch ends OFF");
+    assert!(
+        sim.events()
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::ReAmp(false)))
+            .count()
+            >= 2,
+        "the dropped OFF and the one that landed"
+    );
+}
+
+/// `/sim/state` counts the fake's server aborts (the offline e2e teardown asserts zero).
+#[test]
+fn sim_state_counts_server_aborts() {
+    let _g = serial();
+    let (_app, webview) = reamp_webview();
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    assert_eq!(state["server_aborts"], serde_json::json!(0), "{state}");
+    let mut s = crate::session::Session::connect().expect("connect");
+    let _ = s.replace_node("G1", "no-such-node", "ACD_Boost");
+    drop(s);
+    let (_, state) = route_json(&webview, "GET", "/sim/state", serde_json::json!({}));
+    assert_eq!(state["server_aborts"], serde_json::json!(1), "{state}");
+    assert!(
+        crate::session::Session::connect().is_err(),
+        "the server is down"
+    );
 }

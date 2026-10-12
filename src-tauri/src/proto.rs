@@ -333,17 +333,20 @@ pub fn change_parameter_bool(
     len_delimited(2, &len_delimited(12, &inner))
 }
 
-/// PresetMessage.replaceNode{ destGroup, nodeIdToReplace, fenderId } (field **39**) —
-/// swap a node to a different model; the device fills the new model's default
-/// parameters and emits `nodeReplaced` (40). Unlike the pure setters this is
-/// request/response-shaped, so it REQUIRES a top-level `batchStatus` (field 10) — the
-/// device silently ignores it without one (HW-confirmed; matches the proven
-/// `drive_replace_node.py` framing, which sends batch=11).
+// PresetMessage.replaceNode{ destGroup, nodeIdToReplace, fenderId } (field **39**) —
+// swap a node to a different model; the device fills the new model's default
+// parameters and emits `nodeReplaced` (40). It is setter-framed: no `batchStatus`, as
+// production's `Session::replace_node` sends it. (An older note said it needed
+// batch=11; on fw 1.8.58 a `batchStatus` of 4 or more is dropped with no reply,
+// device-confirmed.)
+
 /// PresetMessage.nodeJsonRequest (field 119){ groupId=1, nodeId=2 } — Pro Control
 /// sends this immediately BEFORE `replaceNode` to put the device into the
 /// node-edit context (the device replies `nodeJsonResponse`, field 120). Without
 /// it, fw 1.8.45 silently DROPS the subsequent `replaceNode` (HW-confirmed via a
-/// Pro Control USB capture). NO batchStatus (matches the capture).
+/// Pro Control USB capture). NO batchStatus (matches the capture). On fw 1.8.58
+/// `nodeJsonRequest` is a stateless read whose `nodeJsonResponse` (120) goes to every
+/// client (static RE): the preamble is harmless, not required.
 pub fn node_json_request(group_id: &str, node_id: &str) -> Vec<u8> {
     let mut inner = Vec::new();
     field_bytes(&mut inner, 1, group_id.as_bytes());
@@ -604,11 +607,9 @@ pub fn mixer_state_request() -> Vec<u8> {
 /// `reAmpModeRequest` (4), `masterLevelInfoRequest` (5) — are the same
 /// `{ bool dummy = 1 }` shape, so one builder covers the sweep.
 ///
-/// `reAmpModeRequest` is itself one of these five TMS-5 requests, not an
-/// independent control on a different, known-working branch — re-amp state being
-/// provably real (the `SettingsMessage` path drives it every leveling run) says
-/// nothing about whether *this* message type is served. A silent reply to it is
-/// one more untested instance of the same branch, not proof TMS 5 is unserved.
+/// On fw 1.8.45 `probe --mixer` got silence from all five. On fw 1.8.58 they are served
+/// on a kept-alive session, and `reAmpModeRequest` (4) → field 9 is the device-confirmed
+/// re-amp oracle (`Session::read_reamp_state`).
 pub fn mixer_request(request_field: u32) -> Vec<u8> {
     let mut inner = Vec::new();
     field_varint(&mut inner, 1, 1); // dummy=true
@@ -617,13 +618,11 @@ pub fn mixer_request(request_field: u32) -> Vec<u8> {
 
 /// `MixerMessage{ SetMasterLevel{ masterLevel: float } }` — field **16** on TMS 5.
 ///
-/// A WRITE, not a read. TMS 5 *reads* are unserved on fw 1.8.45 — `probe --mixer`
-/// got silence from all five requests — but a write can still land on a path
-/// whose notification side is dead, so the two have to be tested separately.
+/// A WRITE, not a read. On fw 1.8.45 TMS 5 *reads* went unanswered (`probe --mixer` got
+/// silence from all five requests); on fw 1.8.58 they are served on a kept-alive session.
 ///
-/// Consequently this write is NEVER verified by a reply. It is verified out of
-/// band by re-reading `settingsBackup.mixerSaveData.masterVolume` from a fresh
-/// `--device-backup`, which does not touch the dead TMS-5 notify path at all.
+/// This write is still never verified by a reply here. It is verified out of band by
+/// re-reading `settingsBackup.mixerSaveData.masterVolume` from a fresh `--device-backup`.
 ///
 /// `masterLevel` is `float` (wire type 5 / fixed32 LE), not a varint — the mixer
 /// schema uses floats for every level, and a varint here would encode a silently

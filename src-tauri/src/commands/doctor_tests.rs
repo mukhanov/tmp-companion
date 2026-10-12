@@ -147,10 +147,23 @@ fn doctor_apply_result_serializes_camel_case() {
     let r = DoctorApplyResult {
         before_clip: "data:audio/wav;base64,AAA".into(),
         after_clip: "data:audio/wav;base64,BBB".into(),
+        reamp_warning: None,
     };
     let v = serde_json::to_value(&r).unwrap();
     assert_eq!(v["beforeClip"], "data:audio/wav;base64,AAA");
     assert_eq!(v["afterClip"], "data:audio/wav;base64,BBB");
+    assert!(
+        v.get("reampWarning").is_none(),
+        "omitted when the OFF read back: {v}"
+    );
+    let warned = DoctorApplyResult {
+        reamp_warning: Some(crate::leveller::REAMP_STILL_ON_WARNING.into()),
+        ..r
+    };
+    assert_eq!(
+        serde_json::to_value(&warned).unwrap()["reampWarning"],
+        crate::leveller::REAMP_STILL_ON_WARNING
+    );
 }
 
 // ── doctor_force_bypass: isolation force-list per sound (base / footswitch) ──
@@ -1170,5 +1183,23 @@ fn effective_nodes_ignores_unknown_nodes_and_keeps_an_unknown_graph_unknown() {
     assert_eq!(
         format!("{:?}", doctor::effective_nodes(&base, &[stray])),
         format!("{base:?}")
+    );
+}
+
+/// Doctor's job scene comes from the frontend, so it is proven against the stored
+/// document before any recall: a scene-less preset refuses outright; a past-the-end index
+/// refuses only when the read delivered `scenes` whole.
+#[test]
+fn a_doctor_scene_the_stored_preset_cannot_back_is_refused() {
+    use crate::commands::doctor::doctor_scene_refusal;
+    let none = serde_json::json!({"scenes": []});
+    let two = serde_json::json!({"scenes": [{"sceneName": "A"}, {"sceneName": "B"}]});
+    assert!(doctor_scene_refusal(&none, 2, true).is_some());
+    assert!(doctor_scene_refusal(&none, 2, false).is_some());
+    assert!(doctor_scene_refusal(&two, 1, true).is_none());
+    assert!(doctor_scene_refusal(&two, 2, true).is_some());
+    assert!(
+        doctor_scene_refusal(&two, 2, false).is_none(),
+        "a cut list proves nothing about a high index"
     );
 }
