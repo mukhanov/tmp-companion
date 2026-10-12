@@ -78,4 +78,24 @@ describe("Summary unconverged row", () => {
     expect(screen.getByText("−28.1")).toBeTruthy();
     expect(screen.queryByText("off target")).toBeNull();
   });
+  // A row whose verify capture failed was written but never measured at its new level.
+  // It must not read as leveled, and its copy must say why, not "ran out of tries".
+  it("shows an unconfirmed row as not confirmed, never done or off target", () => {
+    // A Base row: only preset and scene results carry a verification state.
+    renderSummary([
+      fsRow({
+        key: "b3",
+        isBase: true,
+        sceneName: "Base",
+        tag: null,
+        footswitch: null,
+        unverified: true,
+        value: -20,
+      }),
+    ]);
+    expect(screen.getByText("not confirmed")).toBeTruthy();
+    expect(screen.getByText(/couldn’t confirm it landed/)).toBeTruthy();
+    expect(screen.queryByText("off target")).toBeNull();
+    expect(screen.getByText("Run again")).toBeTruthy();
+  });
 });

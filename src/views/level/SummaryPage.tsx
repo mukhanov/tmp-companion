@@ -67,11 +67,18 @@ const PROBLEM: Record<ProblemKey, (it: RunItem) => Problem> = {
     msg: "The knob is already all the way up. A quieter target would let this one match.",
     fix: "Level lower",
   }),
-  unconverged: () => ({
-    short: "off target",
-    msg: "It had room left but ran out of tries. Running it again usually finishes the job.",
-    fix: "Run again",
-  }),
+  unconverged: (it) =>
+    it.unverified
+      ? {
+          short: "not confirmed",
+          msg: "We set it, but the check measurement failed, so we couldn’t confirm it landed. Running it again usually confirms it.",
+          fix: "Run again",
+        }
+      : {
+          short: "off target",
+          msg: "It had room left but ran out of tries. Running it again usually finishes the job.",
+          fix: "Run again",
+        },
   offbranch: (it) => {
     const status = offbranchStatus(it.silenceHint);
     return {
@@ -209,8 +216,6 @@ export function SummaryPage({
     byEarReasons.push(
       "an envelope filter responds to the test signal differently than to real playing",
     );
-  if (items.some((it) => byEarOf(it) === "dynamic"))
-    byEarReasons.push("loud/quiet swings make the number an average");
   if (items.some((it) => byEarOf(it) === "wet_floor"))
     byEarReasons.push("floored at 25% of its designed mix");
   if (items.some((it) => byEarOf(it) === "rebalance"))

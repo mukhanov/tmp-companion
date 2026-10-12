@@ -559,11 +559,6 @@ export function chosenFrom(
 export type Outcome =
   "done" | "clamped" | "unconverged" | "offbranch" | "skipped";
 
-/** Dynamics-spread flag threshold (LU): short-term-max − integrated above this
- *  marks a DYNAMIC sound — the gated reading understates its peaks vs a
- *  compressed one, so the leveled result deserves an ear-check. */
-export const DYNAMIC_SPREAD_LU = 6;
-
 export interface RunItem {
   key: string;
   /** 0-based list index of the preset. */
@@ -595,6 +590,9 @@ export interface RunItem {
    *  reverts it, so a later re-run's default is never shadowed by a stale caption. */
   activeMessage?: string | null;
   outcome?: Outcome;
+  /** The write landed but its check capture failed, so the row's number is a prediction —
+   *  shown as `unconverged` ("run it again") with its own copy. */
+  unverified?: boolean;
   /** WHY a row was skipped — the backend's own per-sound message (the planner's
    *  "no active amp" / a capture error / a refused scene write), shown verbatim.
    *  Null when the skip happened client-side with no message. */
@@ -607,20 +605,17 @@ export interface RunItem {
   /** Base rows only: this row's handle pick, carried from Set up into the dispatch
    *  (mirrors `SetupOption.baseHandle`). */
   baseHandle?: BaseHandlePick | null;
-  /** Dynamics spread of the measure capture (LU); drives the "dynamic" by-ear cause. */
-  spreadLu?: number | null;
   /** PREDICTED true peak (dBTP) at the leveled setting — an estimate, never a
    *  re-measurement. Only Base rows carry a value (undefined/null elsewhere); drives
    *  the Summary "may clip" chip when > −1 dBTP. */
   truePeakDbtp?: number | null;
   /** Cause of the "verify by ear" marker (undefined = no flag): `envelope` = the preset
    *  contains an envelope-follower effect, which tracks the synthetic stimulus differently
-   *  than real playing (the measurement itself is suspect); `dynamic` = peaks ride
-   *  above the gated average; `wet_floor` = a footswitch's wet-mix clamp is pinned at the
+   *  than real playing (the measurement itself is suspect); `wet_floor` = a footswitch's wet-mix clamp is pinned at the
    *  25% floor, not headroom (`FootswitchLevelResult.wet_floor`); `rebalance` = shallow
    *  lane-mute isolation made the parallel balance approximate. Resolved to a single
    *  cause when the RunItem is built. */
-  verifyByEar?: "envelope" | "dynamic" | "wet_floor" | "rebalance";
+  verifyByEar?: "envelope" | "wet_floor" | "rebalance";
   /** The preset's backup-scan silence hint, stamped at item build — refines the
    *  offbranch row status (see `offbranchStatus`). */
   silenceHint?: SilenceHint;

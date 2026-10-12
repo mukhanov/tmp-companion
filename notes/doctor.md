@@ -42,7 +42,7 @@ the intersection. The metric is fully DETERMINISTIC per sound: a verdict
 depends only on that sound's own measurements, never on which other sounds ran
 in the same check.
 
-## Diagnoses (13)
+## Diagnoses (12)
 
 - **Band rules** (consensus, above): muddy / boomy / harsh / lost / thin /
   buried.
@@ -58,7 +58,10 @@ in the same check.
   own confidence gate can't detect a PEAKLESS correlation curve, which is what
   a wash/reverb chain actually produces (HW-measured flat, 0.27–0.37 across
   every lag 0–250 ms, on a 65%-wet plate, fw 1.8.45).
-- **spiky** — dynamics-spread rule (clean chains only).
+- **spiky** — REMOVED (#241). The dynamics-spread rule (`spread_lu > 4.0`, clean
+  chains only) was unreachable on real DI captures (max ~1.88 LU, see
+  `doctor-calibration.md`), so the rule, its post-cab compressor Rx and 407's
+  SPIKY oracle row were deleted.
 - **resonant / boxy** — ENABLED since the 2026-07-17 parametric-EQ
   ground-truth round (`LOCALIZED_RULES_ENABLED = true`). Lineage: three
   earlier shape-only HW rounds (raw capture space → transfer space →

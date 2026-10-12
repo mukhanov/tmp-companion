@@ -40,14 +40,18 @@ import { MODELS } from "../../models/catalog";
 import { resolveDeviceId } from "../../models/blockArt";
 import {
   buildLevelJob,
-  DYNAMIC_SPREAD_LU,
   resolvedTargetLufs,
   sortRunItems,
   type RunItem,
   type SetupOption,
 } from "./leveling";
 import type { Stage } from "../overlays";
-import type { AmpCandidate, LevelBlock, Profile } from "../../lib/types";
+import type {
+  AmpCandidate,
+  LevelBlock,
+  Profile,
+  Verification,
+} from "../../lib/types";
 
 // AMP model ids (the catalog's amp categories) — the amp's outputLevel knob is the
 // one with real loudness authority. A non-amp level control saturates to ~1.7 LU;
@@ -105,13 +109,12 @@ function ampBlocks(blocks: LevelBlock[]): Candidate[] {
 
 // The result fields the per-item mappers read — the STRUCTURAL subset shared by
 // `LevelResult` (preset/scene) and `FootswitchLevelResult` (footswitch). The latter
-// has no `verify_by_ear`, so its by-ear cause is dynamic-only.
+// has no `verify_by_ear`, so its by-ear cause is `wet_floor` or none.
 interface LevelOutcomeFields {
   clamped: boolean;
   clamp_reason: string | null;
   verify_lufs: number | null;
   predicted_lufs: number;
-  dynamic_spread_lu: number | null;
   verify_by_ear?: boolean;
   /** Footswitch rows only — `LevelResult` (preset/scene) has no such field, so it stays
    *  optional and those lanes simply never report an unconverged row. */
@@ -119,6 +122,8 @@ interface LevelOutcomeFields {
   /** Footswitch rows only: the clamp's pinned bound is the wet/mix floor, not headroom —
    *  see `FootswitchLevelResult.wet_floor`. */
   wet_floor?: boolean;
+  /** Preset/scene rows only (footswitch rows always measure their result). */
+  verification?: Verification;
 }
 
 // A `clamp_reason` is set ONLY when the leveled signal isn't effectively reaching the USB 1/2
@@ -128,32 +133,25 @@ interface LevelOutcomeFields {
 // A plain headroom/authority clamp (the knob has real effect but can't reach target) has
 // `clamped` set with NO reason → "clamped at X". `unconverged` is last of the miss states
 // (the backend's own precedence): it is only ever set when `clamped` is not, and it means
-// the knob had room left, so a re-run helps.
+// the knob had room left, so a re-run helps. A row whose check capture FAILED is reported
+// the same way: its number is only a prediction, and a re-run confirms it.
+const unverifiedOf = (r: LevelOutcomeFields): boolean =>
+  r.verification === "verify_failed";
 const outcomeOf = (r: LevelOutcomeFields): RunItem["outcome"] =>
   r.clamp_reason != null
     ? "offbranch"
     : r.clamped
       ? "clamped"
-      : r.unconverged
+      : r.unconverged || unverifiedOf(r)
         ? "unconverged"
         : "done";
 const valueOf = (r: LevelOutcomeFields): number =>
   r.verify_lufs ?? r.predicted_lufs;
-// Resolve to a SINGLE by-ear cause. If a row is both dynamic AND rebalance-uncertain (rare —
-// rebalance is opt-in), "dynamic" wins INTENTIONALLY: it's the primary, more common ear-check
-// signal. `wet_floor` ranks between them: it's definitionally a CLAMP cause (why the row
-// stopped where it did), not a measurement-quality flag like `dynamic`, but it only ever
-// rides on a footswitch row, which never sets `verify_by_ear` (scene-only) — so the two
-// can't actually collide in practice. Each row resolves to one cause; the summary footnote
-// counts whichever each resolved to.
+// Resolve to a SINGLE by-ear cause. `wet_floor` only ever rides on a footswitch row, which
+// never sets `verify_by_ear` (scene-only), so the two can't collide in practice. There is no
+// dynamics-spread cause (#241): a wide-spread capture is not a measurement problem.
 const byEarCause = (r: LevelOutcomeFields): RunItem["verifyByEar"] =>
-  (r.dynamic_spread_lu ?? 0) >= DYNAMIC_SPREAD_LU
-    ? "dynamic"
-    : r.wet_floor
-      ? "wet_floor"
-      : r.verify_by_ear
-        ? "rebalance"
-        : undefined;
+  r.wet_floor ? "wet_floor" : r.verify_by_ear ? "rebalance" : undefined;
 
 /** Copy a batched command's run-end re-amp warning (stamped on every row it returned)
  *  onto every run item of the batch, so the Summary can show it. */
@@ -516,8 +514,8 @@ export async function runLeveling(
         } else if (status === "done" && result) {
           entry.item.activeMessage = null;
           entry.item.outcome = outcomeOf(result);
+          entry.item.unverified = unverifiedOf(result);
           entry.item.value = valueOf(result);
-          entry.item.spreadLu = result.dynamic_spread_lu;
           entry.item.verifyByEar = causeOf(result);
           finishItem(entry.item, entry.idx);
         } else if (status === "error") {
@@ -603,9 +601,9 @@ export async function runLeveling(
               buildLevelJob(it.slot, targetLufs, profile, true, it.baseHandle),
             );
             it.outcome = outcomeOf(res);
+            it.unverified = unverifiedOf(res);
             it.value = valueOf(res);
             it.ceilingLufs = res.constant_c;
-            it.spreadLu = res.dynamic_spread_lu;
             it.truePeakDbtp = res.true_peak_dbtp;
             it.verifyByEar = causeOf(res);
             it.baseBoost = res.base_boost;
