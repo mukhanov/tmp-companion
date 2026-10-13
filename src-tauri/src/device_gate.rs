@@ -1,5 +1,6 @@
 //! Process-global device-op serialization gate + monitor-pause guard.
 
+use crate::error::LevelError;
 use crate::session::Session;
 use crate::{lock_ok, MONITOR_ENABLED, MONITOR_PAUSED_ACK, MONITOR_PAUSE_REQ};
 use std::sync::atomic::Ordering::SeqCst;
@@ -25,7 +26,7 @@ static DEVICE_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// the ~6 s re-amp capture (or the settles around it) used to sit out the whole thing —
 /// 10 s of dead time, ~22 s when the floor guard's 5 s retry gap fired. This flag makes
 /// those waits interruptible: every sleep on a leveling/Doctor path polls it and bails
-/// with [`crate::leveller::CANCELLED`].
+/// with [`LevelError::Cancelled`].
 ///
 /// ponytail: ONE process-global flag, not one per lane — [`DEVICE_OP_LOCK`] serializes
 /// device work, so exactly one operation can ever observe it. Per-lane abort flags if a
@@ -40,8 +41,15 @@ pub(crate) fn request_op_abort() {
     OP_ABORT.store(true, SeqCst);
 }
 
-/// Has an abort been requested? Polled inside the re-amp capture window.
+/// Has an abort been requested for the work on this thread's rig (`crate::rig`)? Polled
+/// inside the re-amp capture window and by every abortable settle. The device rig reads the
+/// process's [`OP_ABORT`]; a test's own rig reads its own flag.
 pub(crate) fn op_aborted() -> bool {
+    crate::rig::aborted()
+}
+
+/// The process's Stop flag ([`OP_ABORT`]) — what the device rig's abort check reads.
+pub(crate) fn op_abort_requested() -> bool {
     OP_ABORT.load(SeqCst)
 }
 
@@ -66,12 +74,10 @@ pub(crate) fn settle_ms(ms: u64) -> u64 {
     applied
 }
 
+/// The wait this thread's rig (`crate::rig`) applies: `ms` on the device, zero on the
+/// offline e2e fake (see `sim_device::LiveSimRig`) and on a test's own SimDevice rig.
 fn applied_settle_ms(ms: u64) -> u64 {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_offline_fake() && std::env::var_os("TMP_E2E_KEEP_SETTLES").is_none() {
-        return 0;
-    }
-    ms
+    crate::rig::settle_ms(ms)
 }
 
 /// [`settle_ms`] as a blocking sleep. Takes a `Duration` rather than millis so the ~80
@@ -110,12 +116,12 @@ pub(crate) fn sleep_abortable(ms: u64) -> bool {
     }
 }
 
-/// [`sleep_abortable`] as a `?`-able step: `Ok(())` if the wait completed, the
-/// [`crate::leveller::CANCELLED`] sentinel if a Stop landed. The shape of nearly every
-/// settle on a leveling/Doctor path — `sleep_or_cancel(SETTLE_X)?;`.
-pub(crate) fn sleep_or_cancel(ms: u64) -> Result<(), String> {
+/// [`sleep_abortable`] as a `?`-able step: `Ok(())` if the wait completed,
+/// [`LevelError::Cancelled`] if a Stop landed. The shape of nearly every settle on a
+/// leveling/Doctor path — `sleep_or_cancel(SETTLE_X)?;`.
+pub(crate) fn sleep_or_cancel(ms: u64) -> Result<(), LevelError> {
     if sleep_abortable(ms) {
-        Err(crate::leveller::CANCELLED.to_string())
+        Err(LevelError::Cancelled)
     } else {
         Ok(())
     }
@@ -130,7 +136,7 @@ pub(crate) fn settle_abortable(ms: u64) -> bool {
 
 /// [`sleep_or_cancel`] for a HARDWARE SETTLE — the `?`-able form of [`settle_abortable`].
 /// The abort check runs before the (possibly zero) wait, so Stop still wins in both tiers.
-pub(crate) fn settle_or_cancel(ms: u64) -> Result<(), String> {
+pub(crate) fn settle_or_cancel(ms: u64) -> Result<(), LevelError> {
     sleep_or_cancel(settle_ms(ms))
 }
 

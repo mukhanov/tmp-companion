@@ -18,10 +18,11 @@
 //! | `TMP_TRACE_WAV=pair` | write each capture's processed pair as a WAV |
 //! | `TMP_TRACE_FW_FILE` | where a device session's firmware version is written |
 //!
-//! THE SEAMS. [`open`] is the one hook in `session::open_transport`, so every session
-//! (command lane, monitor lane, probe) is recorded below `TrackedHid` and its
-//! auto-reopens are on the wire record too. [`settle`] is called from
-//! `device_gate::settle_ms`; [`capture`] wraps `audio::reamp_capture`; [`record_field8`]
+//! THE SEAMS. [`open`] wraps every rig's transport open (`rig::Rig::open_transport`, the
+//! one path `session::open_transport` takes), so every session (command lane, monitor lane,
+//! probe) is recorded below `TrackedHid` and its auto-reopens are on the wire record too.
+//! [`settle`] is called from `device_gate::settle_ms`; [`capture`] wraps every rig's
+//! capture (`audio::reamp_capture`); [`record_field8`]
 //! follows the seed's field-8 reads; [`record_cmd`] is for the e2e server's `/invoke`
 //! route. The event table and file layout are in `notes/e2e-test-plan.md` ("Recording").
 //!
@@ -71,10 +72,10 @@ fn recorder() -> Option<&'static Arc<Recorder>> {
 /// Open a device transport through `f`, recording the open and, when it succeeds, every
 /// call on the transport. `backend` names the branch that ran. Returns `f`'s transport
 /// unwrapped when the recorder is off.
-pub(crate) fn open(
+pub(crate) fn open<E: std::fmt::Display>(
     backend: Backend,
-    f: impl FnOnce() -> Result<Box<dyn HidTransport>, String>,
-) -> Result<Box<dyn HidTransport>, String> {
+    f: impl FnOnce() -> Result<Box<dyn HidTransport>, E>,
+) -> Result<Box<dyn HidTransport>, E> {
     match recorder() {
         Some(r) => r.open(backend, f),
         None => f(),
@@ -95,8 +96,8 @@ pub(crate) fn capture(
     stimulus: &[f32],
     rate: u32,
     tail_ms: u64,
-    f: impl FnOnce() -> Result<crate::audio::Capture, String>,
-) -> Result<crate::audio::Capture, String> {
+    f: impl FnOnce() -> Result<crate::audio::Capture, crate::error::LevelError>,
+) -> Result<crate::audio::Capture, crate::error::LevelError> {
     let Some(r) = recorder() else {
         return f();
     };
@@ -109,7 +110,7 @@ pub(crate) fn capture(
             channels: c.channels,
             sample_rate: c.sample_rate,
         }),
-        Err(e) => Err(e.clone()),
+        Err(e) => Err(e.to_string()),
     };
     r.capture(capture::CaptureJob {
         backend: backend.as_str(),

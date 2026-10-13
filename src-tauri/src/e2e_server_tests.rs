@@ -10,8 +10,50 @@ use tauri::WebviewWindow;
 /// they stomp each other's fake (a hard-to-spot cross-contamination).
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    lock_ok(&SERIAL)
+fn serial() -> Serial {
+    // The lock first, so the mark cannot include another test's requests.
+    let lock = lock_ok(&SERIAL);
+    Serial {
+        mark: crate::sim_device::unmodeled_mark(),
+        allowed: Vec::new(),
+        _lock: lock,
+    }
+}
+
+/// [`SERIAL`] held for one test, plus the #279 gate: when the test ends (without already
+/// panicking), every request an installed fake answered with nothing during the test, if
+/// its kind is outside `UNHANDLED_CENSUS`, must be opted in with
+/// [`Serial::allow_unmodeled`]. Otherwise the test fails, naming the kinds. Requests are
+/// counted per test, across fake replacements, whatever earlier tests sent.
+struct Serial {
+    mark: usize,
+    allowed: Vec<(u32, u32)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Serial {
+    /// Opt this test in to sending `(tms, inner)`, a request the fake does not model.
+    fn allow_unmodeled(&mut self, tms: u32, inner: u32) {
+        self.allowed.push((tms, inner));
+    }
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let mut new: Vec<_> = crate::sim_device::unmodeled_since(self.mark)
+            .into_iter()
+            .filter(|k| !self.allowed.contains(k))
+            .collect();
+        new.dedup();
+        assert!(
+            new.is_empty(),
+            "the fake answered request kinds it does not model (tms.inner): {new:?}; model \
+             them in sim_device.rs or add them to UNHANDLED_CENSUS with the reason"
+        );
+    }
 }
 
 /// How many presets `e2e/fixtures/scenario-presets.json` ships (= the offline snapshot list
@@ -4386,7 +4428,7 @@ impl crate::hid::HidTransport for CancelAtSceneWrite {
 }
 
 /// ⟦F2⟧ CANCEL AFTER A LANDED TRADE RETURNS ITS OUTCOMES AND DISCLOSES THE TRADE — it does not
-/// come back as the bare `CANCELLED` sentinel, whose results the command maps to an EMPTY vec.
+/// come back as a bare cancel error, whose results the command maps to an EMPTY vec.
 /// That historical shape is the silent-wrong-numbers outcome this codebase refuses: the save
 /// on the stopped path has already persisted the raised `presetLevel` + the base fader holding
 /// base on target, every scene already solved was solved AT that raised level, and handing
@@ -5041,10 +5083,11 @@ fn sim_inject_tags_every_kind_and_refuses_an_unknown_one() {
 }
 
 /// The census: every unanswered kind is counted on `/sim/state`, and one outside
-/// `UNHANDLED_CENSUS` is listed in `unhandled_new` — reported, not failed.
+/// `UNHANDLED_CENSUS` is listed in `unhandled_new` (which fails a test that did not opt in).
 #[test]
 fn sim_state_counts_unanswered_kinds_and_lists_the_ones_outside_the_census() {
-    let _g = serial();
+    let mut g = serial();
+    g.allow_unmodeled(5, 5);
     let (_app, webview) = reamp_webview();
     let mut s = crate::session::Session::connect().expect("connect");
     s.heartbeat().expect("heartbeat");
@@ -5076,6 +5119,17 @@ fn sim_state_counts_unanswered_kinds_and_lists_the_ones_outside_the_census() {
         .filter_map(serde_json::Value::as_str)
         .collect();
     assert!(new.contains(&"5.5"), "{state}");
+}
+
+/// The #279 gate itself: a test that makes the fake answer an unmodelled kind without
+/// opting in fails when its `serial()` guard drops.
+#[test]
+#[should_panic(expected = "does not model")]
+fn a_test_that_sends_an_unmodelled_request_without_opting_in_fails() {
+    let _g = serial();
+    let (_app, _webview) = reamp_webview();
+    let mut s = crate::session::Session::connect().expect("connect");
+    let _ = s.send_and_dump(&crate::proto::mixer_request(5), 50);
 }
 
 /// A command that streams two rows over a Channel, as the leveling commands do.
