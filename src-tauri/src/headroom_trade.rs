@@ -28,7 +28,7 @@
 //! real solve then pins at [`BASE_FADER_FLOOR`] anyway, that is reported at RUN time as
 //! [`ClampKind::TradeFloor`], not predicted here.
 //!
-//! Everything in this module is pure. The device-facing half lives in `leveller.rs`.
+//! Everything in this module is pure. The device-facing half lives in `leveller::trade`.
 
 /// The lowest base amp `outputLevel` the trade may solve down to. `outputLevel = 0` is DEEP
 /// DIGITAL SILENCE on the real TMP (`danger.md`) and `loudest_loudness` errors on a silent
@@ -262,11 +262,10 @@ fn base_fader_room_db(base_fader: f32) -> f64 {
 /// flag is off, knobs share base) — a raise buys it nothing, since no per-scene write can ever
 /// land. `Unknown` (a truncated field-8 read) stays the conservative NO: a wrong YES churns the
 /// base pair for a sound that may gain nothing and leaves every other sound quieter.
-pub fn benefits_from_base_raise(overlay: &crate::probe_api::scene_jobs::SceneOverlay<'_>) -> bool {
+pub fn benefits_from_base_raise(overlay: &crate::scene_jobs::SceneOverlay<'_>) -> bool {
     matches!(
         overlay,
-        crate::probe_api::scene_jobs::SceneOverlay::Full(_)
-            | crate::probe_api::scene_jobs::SceneOverlay::Absent
+        crate::scene_jobs::SceneOverlay::Full(_) | crate::scene_jobs::SceneOverlay::Absent
     )
 }
 
@@ -282,10 +281,8 @@ pub fn benefits_from_base_raise(overlay: &crate::probe_api::scene_jobs::SceneOve
 /// it by `+raise_db` would predict a ceiling the scene never had; the reading is dropped
 /// instead ([`crate::leveller::retarget_prepass_after_trade`]) and the scene's own PHASE-3
 /// solve re-measures fresh, AFTER its own overlay exists.
-pub fn retains_prepass_after_raise(
-    overlay: &crate::probe_api::scene_jobs::SceneOverlay<'_>,
-) -> bool {
-    matches!(overlay, crate::probe_api::scene_jobs::SceneOverlay::Full(_))
+pub fn retains_prepass_after_raise(overlay: &crate::scene_jobs::SceneOverlay<'_>) -> bool {
+    matches!(overlay, crate::scene_jobs::SceneOverlay::Full(_))
 }
 
 /// The worst *benefiting* clamp's missing dB — the TRIGGER for a base-pair trade. A
@@ -750,7 +747,7 @@ mod tests {
     // the raise matters that scene is exactly as independent of base as a Full one.
     #[test]
     fn benefit_is_read_off_the_overlay_full_and_absent_accept_bypassonly_and_unknown_refuse() {
-        use crate::probe_api::scene_jobs::SceneOverlay;
+        use crate::scene_jobs::SceneOverlay;
         let params = serde_json::Map::new();
         assert!(benefits_from_base_raise(&SceneOverlay::Full(&params)));
         assert!(
@@ -768,7 +765,7 @@ mod tests {
     // base's (not yet raised) fader and must be dropped, not shifted.
     #[test]
     fn retains_prepass_after_raise_is_full_only() {
-        use crate::probe_api::scene_jobs::SceneOverlay;
+        use crate::scene_jobs::SceneOverlay;
         let params = serde_json::Map::new();
         assert!(retains_prepass_after_raise(&SceneOverlay::Full(&params)));
         assert!(!retains_prepass_after_raise(&SceneOverlay::Absent));
@@ -1020,7 +1017,7 @@ mod tests {
     // scene-0 leveling) is enforced at the Phase-2 call site that decides WHICH amp
     // candidates ever reach this planner -- `plan_level_pair` is pure arithmetic over whatever
     // `sounds`/levels it is handed and has no way to see "how many amps" produced them. See
-    // leveller.rs's Base-arm derivation for that guard.
+    // the `leveller` Base-arm derivation for that guard.
 
     // U9. `LevelPairPlan::preset_level` must be EXACTLY what `raised_preset_level` computes
     // from the SAME `dp_db` -- two call sites (the plan and the eventual write) must never be

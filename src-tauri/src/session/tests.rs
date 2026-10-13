@@ -1948,7 +1948,7 @@ fn scene_index_ok_takes_base_always_and_a_scene_only_when_the_document_has_it() 
 /// would swap in the empty template. A cut (short) list never drops it.
 #[test]
 fn a_scene_less_preset_has_no_scene_to_restore() {
-    use crate::probe_api::scene_jobs::last_loaded_scene;
+    use crate::scene_jobs::last_loaded_scene;
     let doc = |scenes: serde_json::Value, last: u32| serde_json::json!({"scenes": scenes, "lastLoadedScene": last});
     assert_eq!(last_loaded_scene(&doc(serde_json::json!([]), 3)), None);
     assert_eq!(
@@ -1981,7 +1981,7 @@ fn drained_pushes_stay_bounded_and_decode_as_they_close() {
     }
     let t = crate::test_support::ScriptedTransport::default().with_pending(batches);
     let mut s = crate::test_support::session_over(&t, Vec::new());
-    let mut pushes = proto::FinalReassembler::default();
+    let mut pushes = proto::Reassembler::new(proto::SingleFrame::ClosesStream);
     let mut decoded = Vec::new();
     for tick in 0..2 * N {
         s.pump_silent(1).unwrap();
@@ -2028,7 +2028,7 @@ fn final_reassembler_matches_the_batch_reassembly() {
     reports.push(vec![0x00, 0x33, 0x00, 1, 3]);
     reports.push(vec![0x00, 0x34, 0x00, 1, 4]);
     let batch = proto::reassemble_streams_final(&reports);
-    let mut r = proto::FinalReassembler::default();
+    let mut r = proto::Reassembler::new(proto::SingleFrame::ClosesStream);
     let mut closed = Vec::new();
     for rep in &reports {
         r.push(rep, &mut closed);

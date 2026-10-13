@@ -371,13 +371,12 @@ fn emit_to_as(
     mode: crate::profiles::PlaybackChannels,
 ) {
     let stem = unique_wav_stem(dir, &sanitize(&row.label));
-    let (wav, wav_error) =
-        match crate::probe_api::stimulus::dump_metered_capture(cap, dir, &stem, mode) {
-            Ok(path) => (json_str(&path), "null".to_string()),
-            // A dump failure must still produce a ROW: a swallowed row is an empty log, and
-            // an empty log reads to the consumer as "nothing was leveled", i.e. a pass.
-            Err(e) => ("null".to_string(), json_str(&e)),
-        };
+    let (wav, wav_error) = match crate::stimulus::dump_metered_capture(cap, dir, &stem, mode) {
+        Ok(path) => (json_str(&path), "null".to_string()),
+        // A dump failure must still produce a ROW: a swallowed row is an empty log, and
+        // an empty log reads to the consumer as "nothing was leveled", i.e. a pass.
+        Err(e) => ("null".to_string(), json_str(&e)),
+    };
     // `tol_lu: null` = "the consumer's own default applies". Emitted explicitly so the
     // field exists in every row and a future per-row override needs no shape change.
     let line = format!(

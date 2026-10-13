@@ -1,7 +1,7 @@
 //! Tauri app bootstrap — builder, logger, menu, setup, `run()` entry point.
 // Commands are registered by path through `app_invoke_handler!` (`lib.rs`), from the
 // one list in `app_commands.rs`.
-use crate::*;
+use crate::{monitor, watcher, AppState};
 
 /// Mirrors `scripts/tauri-dev-env.sh`'s Wayland workaround (see its header for the
 /// hardware evidence: WebKitGTK's native-Wayland window sometimes maps but never
@@ -290,7 +290,7 @@ pub fn run() {
             log::info!("TMP Companion {} started", env!("CARGO_PKG_VERSION"));
             // Dock icon for `tauri dev` (the raw binary has no bundle .icns).
             #[cfg(target_os = "macos")]
-            dock::set_dock_icon();
+            crate::dock::set_dock_icon();
             // Hotplug watcher: attach/detach events + dead-seize cleanup.
             use tauri::Manager;
             let session = app.state::<AppState>().session.clone();
