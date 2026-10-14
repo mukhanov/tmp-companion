@@ -60,6 +60,10 @@ const DELTA_FS = 1.0; // footswitch re-measure: KNOB_TOL_LU (0.3, leveller.rs) +
 // The footswitch SOLVE's own acceptance band (not a re-measure) — matches leveller.rs's
 // KNOB_TOL_LU exactly, no extra margin needed since this checks the solver's own report.
 const KNOB_TOL_LU = 0.3;
+// "On target" in every lane (leveller::ACCEPT_TOL_LU): the band inside which the footswitch
+// solver accepts a reading and an idempotent re-run skips its write. About 2 sigma of the
+// ~0.12 LU capture noise; the old 0.1 band sat below it.
+const ACCEPT_TOL_LU = 0.25;
 
 interface LevelResult {
   saved: boolean;
@@ -471,7 +475,7 @@ regression has widened BOOST's trigger and would start moving a fader nothing as
           Math.abs(r.predicted_lufs - fsTarget410),
           `switch ${String(r.switch)} skipped its save on the first run, legitimate only \
 when the stored value already measured within tolerance of target`,
-        ).toBeLessThanOrEqual(0.11);
+        ).toBeLessThanOrEqual(ACCEPT_TOL_LU);
       }
     }
 
@@ -497,7 +501,7 @@ when the stored value already measured within tolerance of target`,
 
     // ── Footswitch skip-branch (410's own TubeScreamer row only — the carried-over
     // UniVibe row belongs to T1′'s modulated-solve coverage, not this idempotency proof) ──
-    const wroteInLane2 = fs.filter((r) => r.saved).map((r) => r.switch);
+    const firstRun = fs.map((r) => r.switch);
     const fs2 = (await invoke(
       page,
       "level_footswitches_apply",
@@ -522,12 +526,14 @@ when the stored value already measured within tolerance of target`,
     )) as FootswitchLevelResult[];
 
     const fsTarget410Narrowed = fsTarget410;
-    assertFsSolved(fs2, () => fsTarget410Narrowed, 0.11);
+    assertFsSolved(fs2, () => fsTarget410Narrowed, ACCEPT_TOL_LU);
+    // Every switch the arc test leveled is on target now, whether it wrote a value there or
+    // skipped as already within ACCEPT_TOL_LU, so the re-run at the same target writes nothing.
     for (const r2 of fs2) {
-      if (wroteInLane2.includes(r2.switch)) {
+      if (firstRun.includes(r2.switch)) {
         expect(
           r2.saved,
-          `switch ${String(r2.switch)} wrote a real value at target in the arc test → this re-run at the same target must skip the write`,
+          `switch ${String(r2.switch)} is on target after the arc test (written there or already within tolerance) → this re-run at the same target must skip the write`,
         ).toBe(false);
       }
     }
