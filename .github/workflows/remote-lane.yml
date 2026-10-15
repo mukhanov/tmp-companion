@@ -8,12 +8,20 @@ name: remote-lane
 # TWIN_LANE_REPO variable (on the TWIN_LANE_REF branch, if set) to run exactly those specs on
 # the PR's head commit. That run posts the final `remote-lane` status back on the same commit.
 #
-# Advisory: `remote-lane` is not a required check. Same-repository PRs only: a fork's PR
-# never gets the dispatch token (and pull_request_target is never used here), so outside
-# code never reaches the remote device.
+# `remote-lane` is a REQUIRED check on main, so every PR from this repository must end with
+# one: "not needed", the lane's own verdict, or `error` (a missing TWIN_LANE_TOKEN or
+# TWIN_LANE_REPO is named in the description, never skipped silently). Same-repository PRs
+# only: a fork's PR never gets the dispatch token (and pull_request_target is never used
+# here), so outside code never reaches the remote device on its own, and the PR waits until
+# a maintainer has read it and dispatches the lane for its head commit by hand
+# (`twin-lane.yml` with companion_ref=<head SHA>, specs=<this job's selection>, pr=<number>);
+# a fork PR with no device-facing change gets "not needed" from the `fork` job below.
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Fork PRs only (the `fork` job): their pull_request token cannot post a status.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -21,12 +29,15 @@ permissions:
   statuses: write
 
 concurrency:
-  group: remote-lane-${{ github.event.pull_request.number }}
+  group: remote-lane-${{ github.event_name }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   dispatch:
-    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -62,16 +73,23 @@ jobs:
         if: steps.specs.outputs.specs != ''
         env:
           GH_TOKEN: ${{ secrets.TWIN_LANE_TOKEN }}
+          STATUS_TOKEN: ${{ github.token }}
           LANE_REPO: ${{ vars.TWIN_LANE_REPO }}
           LANE_REF: ${{ vars.TWIN_LANE_REF }}
           SPECS: ${{ steps.specs.outputs.specs }}
         run: |
-          if [ -z "$GH_TOKEN" ] || [ -z "$LANE_REPO" ]; then
-            echo "::warning::remote lane not configured (TWIN_LANE_TOKEN / TWIN_LANE_REPO); skipping"
-            exit 0
+          # Statuses go through this repository's own token, so a missing dispatch token can
+          # still be reported on the PR instead of leaving the required check absent.
+          status() { GH_TOKEN="$STATUS_TOKEN" gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$1" -f context=remote-lane -f description="$2" >/dev/null; }
+          missing=""
+          [ -n "$GH_TOKEN" ] || missing="the TWIN_LANE_TOKEN secret (unset or empty)"
+          [ -n "$LANE_REPO" ] || missing="${missing:+$missing and }the TWIN_LANE_REPO variable"
+          if [ -n "$missing" ]; then
+            echo "::error::remote lane not configured: $missing"
+            status error "not configured: $missing"
+            exit 1
           fi
-          status() { gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$1" -f context=remote-lane \
-            -f description="$2" >/dev/null; }
           # Pending first, so it can never land after the final status the run posts.
           status pending "running: $SPECS"
           # TWIN_LANE_REF picks the runner's branch; unset, its default branch.
@@ -81,3 +99,47 @@ jobs:
             exit 1
           fi
           echo "dispatched: $SPECS for $SHA"
+
+  # A fork PR still needs a `remote-lane` status, or the required check never resolves. This
+  # job runs in the base repository's context (pull_request_target) and never fetches or runs
+  # the fork's code: it checks out the BASE commit, reads the PR's changed-file NAMES from the
+  # API, and classifies them with the base's own gates.sh and gate map. No device-facing file
+  # posts "not needed"; otherwise the status stays pending until a maintainer has read the PR
+  # and dispatches the lane by hand. It never dispatches, and never sees TWIN_LANE_TOKEN.
+  fork:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      SHA: ${{ github.event.pull_request.head.sha }}
+      PR: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Classify the fork's changed files (names only, base scripts)
+        run: |
+          # Renames count under both names: moving a device file away is device-facing too.
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+          req=$(TMP_GATES_CHANGED_FILES="$files" bash scripts/gates.sh --required-online \
+            | tr '\n' ' ' | sed 's/ *$//')
+          [ "$req" = ANY ] && req=songs
+          echo "required: ${req:-none}"
+          if [ -z "$req" ]; then
+            state=success desc="not needed: no device-facing change"
+          else
+            state=pending desc="fork PR: a maintainer must dispatch the remote lane ($req)"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$state" -f context=remote-lane \
+            -f description="${desc:0:140}" >/dev/null
