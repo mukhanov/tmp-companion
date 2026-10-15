@@ -249,56 +249,26 @@ struct Row {
     noise_floor_db: Option<f64>,
 }
 
-/// One capture's `SoundProfile` + its CAPTURED OUTPUT's own coverage (mirrors
-/// production's `output_coverage_with_body` gate — a stimulus-only coverage
-/// would read a preset-suppressed band as "covered" and put this sweep's
-/// metrics/verdicts in a different space than the shipped engine), off ONE
-/// shared post-onset body PSD. Shared by both sweeps below.
-fn profile_and_coverage(
-    samples: &[f32],
-    rate: u32,
-    stim: &[f32],
-    onset: &leveller::DoctorOnset,
-    tail_ms: u32,
-    family: doctor::Family,
-) -> Result<(doctor::SoundProfile, Vec<bool>, usize), String> {
-    let body_psd = doctor::body_psd(samples, rate, onset.signal_start);
-    let stim_psd = crate::psd::welch_psd(stim, rate as f32);
-    let mut profile = doctor::SoundProfile::from_capture_with_psd(
-        samples,
-        rate,
-        onset.body_len,
-        onset.body_start,
-        tail_ms,
-        family,
-        &body_psd,
-        Some(&stim_psd),
-    )?;
-    // Mirror production's stimulus-transfer anchor (shared by both
-    // --doctor-calib and --doctor-calib-factory) so the sweep derives
-    // thresholds/targets in the same anchored space the engine diagnoses in.
-    profile.stim_bands = Some(stim_psd.band_powers(family.bands()));
-    let coverage =
-        doctor::output_coverage_with_body(samples, rate, onset.signal_start, family, &body_psd);
-    Ok((profile, coverage, onset.signal_start))
-}
-
-/// `profile_and_coverage`, sweep-flavored: log + `None` on failure so callers
-/// `let … else { continue }` — one bad slot never ends a sweep, and no `?` can
-/// return past the sweep's re-amp OFF cleanup. `label` distinguishes the user
-/// and factory sweeps' log lines.
+/// One capture's `SoundProfile` + its CAPTURED OUTPUT's own coverage, in the
+/// EXACT production measurement space (`leveller::analyze_capture`, the seam
+/// `doctor_check` itself runs) — a sweep in any other space would derive
+/// thresholds and targets the shipped engine never measures in. Shared by both
+/// sweeps below; logs + `None` on failure so callers `let … else { continue }` —
+/// one bad slot never ends a sweep, and no `?` can return past the sweep's
+/// re-amp OFF cleanup. `label` distinguishes the user and factory sweeps' log
+/// lines.
 #[allow(clippy::too_many_arguments)]
 fn profile_or_skip(
     label: &str,
     slot: ListIndex,
-    samples: &[f32],
+    sig: &leveller::DoctorSignal,
     rate: u32,
     stim: &[f32],
-    onset: &leveller::DoctorOnset,
     tail_ms: u32,
     family: doctor::Family,
-) -> Option<(doctor::SoundProfile, Vec<bool>, usize)> {
-    match profile_and_coverage(samples, rate, stim, onset, tail_ms, family) {
+) -> Option<leveller::ProfiledCapture> {
+    let stim_psd = leveller::stim_body_psd(stim, rate);
+    match leveller::analyze_capture(sig, rate, stim, &stim_psd, family, tail_ms, None) {
         Ok(v) => Some(v),
         Err(e) => {
             eprintln!("[probe] {label}slot {slot}: profile failed: {e} (skipping)");
@@ -367,24 +337,20 @@ pub fn probe_doctor_calib(
         };
         match leveller::doctor_capture(slot, None, &fb, &[], &stim, Some(0.5), tail_ms, false) {
             Ok((samples, rate)) => {
-                let onset = leveller::doctor_onset(&stim, &samples, rate);
-                let Some((profile, coverage, signal_start)) = profile_or_skip(
-                    "",
-                    slot,
-                    &samples,
-                    rate,
-                    &stim,
-                    &onset,
-                    tail_ms as u32,
-                    family,
-                ) else {
+                let Some(leveller::ProfiledCapture {
+                    profile,
+                    coverage,
+                    onset,
+                    ..
+                }) = profile_or_skip("", slot, &samples, rate, &stim, tail_ms as u32, family)
+                else {
                     continue;
                 };
                 // the floor window ends at the pad-shifted start.
                 let noise_floor_db = noise_floor_db(
-                    &samples,
+                    &samples.mix,
                     rate,
-                    signal_start,
+                    onset.signal_start,
                     onset.confident(),
                     onset.body_end(),
                 );
@@ -623,17 +589,18 @@ pub fn probe_doctor_calib_factory(
         }
         match leveller::doctor_capture_current(&stim, None, &[], Some(0.5), tail_ms) {
             Ok((samples, rate)) => {
-                let onset = leveller::doctor_onset(&stim, &samples, rate);
-                let Some((profile, coverage, _)) = profile_or_skip(
+                let Some(leveller::ProfiledCapture {
+                    profile, coverage, ..
+                }) = profile_or_skip(
                     "factory ",
                     slot,
                     &samples,
                     rate,
                     &stim,
-                    &onset,
                     tail_ms as u32,
                     family,
-                ) else {
+                )
+                else {
                     continue;
                 };
                 rows.push(Row {
@@ -703,6 +670,94 @@ pub fn probe_doctor_calib_factory(
         out += &format!(
             "  {:>4} | {:>8.2} | {:>8.1} | {:>6.2}\n",
             r.slot, r.profile.integrated_lufs, r.profile.tail_ratio_db, r.profile.spread_lu,
+        );
+    }
+    Ok(out)
+}
+
+/// OFFLINE: re-diagnose raw Doctor captures (multichannel float WAVs of the
+/// whole capture window plus its tail) through the shipped engine, with no
+/// unit attached. The capture runs through the same `leveller::analyze_capture`
+/// seam a live sweep uses, so a detector or constant change can be checked
+/// against recorded hardware audio. `stim_path` is the stimulus the capture was
+/// played through; the tail is whatever the capture holds past it.
+pub fn probe_doctor_replay(
+    wavs_csv: &str,
+    stim_path: &str,
+    family_id: &str,
+) -> Result<String, String> {
+    let family = super::parse_family_arg(family_id)?;
+    let stim = leveller::doctor_stim_slice(crate::stimulus::read_stimulus_48k(stim_path)?);
+    let mut out = String::new();
+    for wav in wavs_csv.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        let mut r = hound::WavReader::open(wav).map_err(|e| format!("open {wav}: {e}"))?;
+        let spec = r.spec();
+        // The stimulus is 48 kHz and `doctor_onset` sizes the body window from its length,
+        // so a capture at any other rate would shift the window into the tail.
+        if spec.sample_rate != leveller::RATE {
+            return Err(format!(
+                "capture {wav} has sample rate {}, expected {}",
+                spec.sample_rate,
+                leveller::RATE
+            ));
+        }
+        let interleaved: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>(),
+            hound::SampleFormat::Int => {
+                let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                r.samples::<i32>()
+                    .map(|s| s.map(|v| v as f32 / scale))
+                    .collect::<Result<_, _>>()
+            }
+        }
+        .map_err(|e| format!("read {wav}: {e}"))?;
+        let cap = crate::audio::Capture {
+            interleaved,
+            channels: usize::from(spec.channels),
+            sample_rate: spec.sample_rate,
+        };
+        let frames = cap.interleaved.len() / cap.channels.max(1);
+        let tail_ms = (frames.saturating_sub(stim.len()) as u64 * 1000
+            / u64::from(cap.sample_rate.max(1))) as u32;
+        let sig = leveller::DoctorSignal::from_capture(&cap);
+        let Some(pc) = profile_or_skip(
+            "replay ",
+            ListIndex(0),
+            &sig,
+            cap.sample_rate,
+            &stim,
+            tail_ms,
+            family,
+        ) else {
+            out += &format!("{wav}\tprofile failed\n");
+            continue;
+        };
+        let peaks: Vec<String> = pc
+            .profile
+            .peaks
+            .iter()
+            .filter(|p| {
+                p.freq_hz < doctor::RESONANT_MAX_FREQ_HZ
+                    && (doctor::RESONANT_MIN_Q..=doctor::RESONANT_MAX_Q).contains(&p.q)
+                    && p.height_db >= doctor::BOXY_MIN_HEIGHT_DB
+            })
+            .take(6)
+            .map(|p| format!("{:.0}Hz h{:.1} q{:.1}", p.freq_hz, p.height_db, p.q))
+            .collect();
+        let (locals, centered) = doctor::band_locals(&pc.profile, family, Some(&pc.coverage));
+        let fmt = |v: &[f64]| {
+            v.iter()
+                .map(|x| format!("{x:+.1}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        out += &format!(
+            "{wav}\ttail {:.1} dB\t[{}]\t{}\tlocals {}\tcentered {}\n",
+            pc.profile.tail_ratio_db,
+            row_verdicts(&pc.profile, &pc.coverage, family).join(","),
+            peaks.join("; "),
+            fmt(&locals),
+            centered.as_deref().map_or_else(|| "-".to_string(), fmt),
         );
     }
     Ok(out)

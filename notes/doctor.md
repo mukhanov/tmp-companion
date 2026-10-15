@@ -51,6 +51,35 @@ corroborate in it) abstains (#192). The metric is fully DETERMINISTIC per sound:
 depends only on that sound's own measurements, never on which other sounds ran
 in the same check.
 
+### Re-deriving on a new stimulus
+
+The Doctor's constants (`GUITAR_TARGET`, the `GUITAR` gates, `GUITAR_STIM_REF`,
+`FACTORY_CONTRAST_DB`, `CUT_THROUGH_ADVISORY_DB`) come from a factory sweep
+through the shipped humbucker. They were last re-derived on 2026-10-15 for the
+pitched-pluck stimuli (#235). To redo it after a stimulus change:
+
+1. `probe --doctor-calib-factory 0..254 --stim resources/samples/guitar-humbucker.wav --family guitar --out <report.json>` (~37 min, through `leveller::analyze_capture`). Keep the previous sweep: it is the baseline.
+2. `probe --doctor-derive <report.json> --baseline <previous report.json>` prints the target (the bank's median shape), the contrast population, and the gates. Each gate is RANK-TRANSFERRED (`benchmark::transfer_gate`): it keeps the percentile the shipped gate held in the baseline population, so every rule's false-alarm rate on healthy presets carries over. A max-plus-margin re-derive over the whole bank widened `lost` by 21 dB and silenced the defect presets. Paste `GUITAR_STIM_REF` from `print_guitar_stim_ref`.
+3. `probe --doctor-loo <report.json>` for the false-positive rate per rule against the baseline's, then the defects suite (all 7 recipes must hit) and the empty-slot capture (no finding).
+4. `probe --doctor-replay <capture.wav,…> --stim <wav>` re-runs the analysis on raw captures offline, so a detector change can be checked without the unit.
+
+The 2026-10-15 result: every rule's in-sample rate matches the old stimulus's
+(any rule 50.0% of the bank both times, in-sample being the deliberately
+sensitive end), and `washed` moved from −10 to −8.5 dB because the darker
+stimulus lifts every tail ratio. The pitched stimulus also made the transfer
+rougher: between its harmonic lines the capture holds the chain's own noise
+and intermodulation, which read as narrow fake peaks at the same frequencies
+in every capture and fired `resonant` and `boxy` on healthy presets. Peak
+detection now reads the transfer only where the stimulus reaches its own
+one-octave median (`Psd::observable_transfer_db`); on the raw factory captures
+that removed 5 of 6 healthy `resonant` fires and 2 of 5 `boxy` ones, and both
+injected defects kept their height within 1.2 dB. The `muddy`/`boomy` gates
+the Stage playback level tightens are floored at 0 dB, so a band sitting on
+the target never reads as excess (#247: a wire chain read muddy at Stage).
+
+The bass and Bass VI anchors (user slots 21 and 8–9) need re-capturing on the
+new bass stimuli the same way.
+
 ## Diagnoses (12)
 
 - **Band rules** (consensus, above): muddy / boomy / harsh / lost / thin /
@@ -175,14 +204,30 @@ Window: a **3 s stimulus slice + 200 ms silent preamble pad**
 a time-based block (the wash rule needs the decay), 0.3 s dry
 (`doctor::doctor_tail_ms`). HW-A/B'd against the original 6 s + 2.5 s oracle
 (`probe --doctor-window-ab`): 0 verdict flips. Capture runs ~4.7 s/sound
-(pad + tail included). Band/PSD analysis (bands, air-flatness, localized
-peaks) runs on the **stereo mix** of USB-out 1/2 (`Capture::stereo_mix`, the
-per-sample AVERAGE — Doctor seams only, unaffected by the PR2 metering
-re-baseline: it never switched average→sum). The reported `integrated_lufs`
-is the exception — it adopts the same 2-ch BS.1770 SUM every other
-output-side measurement uses now (`leveller::doctor_capture_with_loudness`),
-so a Doctor sound's displayed loudness matches Companion's own Level-tab
-number rather than the `stereo_mix` average's mono-equivalent reading.
+(pad + tail included). Every capture is analysed through ONE seam,
+`leveller::analyze_capture`, which the production check, its apply A/B and the
+calibration sweeps all call, so the shipped constants are derived in exactly
+the space they are applied in:
+
+- **Stereo combines in power (#250).** Band powers, air-flatness, localized
+  peaks, the coverage floor and the tail ratio take USB-out 1/2 separately
+  (`leveller::DoctorSignal`) and average their PSDs and RMS², not their
+  waveforms. A mono chain reads bit-identically to before; a decorrelated
+  stereo reverb tail keeps its full power (the sample average lost 3 dB of
+  it, a large share of the `washed` gate's margin), and chorus or doublers no
+  longer comb-filter into notches the player never hears. The onset detector
+  still reads the per-sample average (`DoctorSignal::mix`). The reported
+  `integrated_lufs` is the 2-ch BS.1770 SUM every other output-side
+  measurement uses (`leveller::doctor_capture_with_loudness`).
+- **The body excludes the tail and the pad (#249, #259).** The body PSD spans
+  `[signal_start, body_end)` (`doctor::body_psd_span`), and the stimulus PSD
+  spans the stimulus without its pad (`leveller::stim_body_psd`): same length,
+  same Welch grid, so a wire chain's transfer is flat to <0.05 dB instead of
+  rippling ±1.9 dB, and a wet preset's decay no longer mixes into its band
+  powers. The tail ratio's body RMS starts at the signal too, so the 200 ms
+  pad no longer reads the body 0.28 dB low.
+- **Band edges are half-open (#259)** (`[lo, hi)`), so a 3 or 6 kHz edge that
+  lands exactly on a bin counts once.
 
 The body/tail split is onset-aligned: `leveller::doctor_onset` locates the
 stimulus in the capture via a floor-relative energy step first, falling back
