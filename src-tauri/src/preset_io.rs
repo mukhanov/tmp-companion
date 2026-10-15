@@ -4,7 +4,7 @@
 //!
 //! * [`OfflineIo`] — structural / full-preset edits.
 //!   Re-encodes the mutated JSON to `.preset` bytes and lands it via the
-//!   HW-validated AC7 **in-place re-import** ([`crate::replace_inplace_core`]),
+//!   HW-validated AC7 **in-place re-import** ([`crate::replace_inplace::replace_inplace_core`]),
 //!   preserving the slot + Song binding. Refuses any edit that changes `info.preset_id`
 //!   (a different identity empties the Song row).
 //!
@@ -54,7 +54,7 @@ impl PresetIo for OfflineIo {
         assert_identity_preserved(&target.before_json, after_json)?;
         // Re-encode to `.preset` bytes (XOR is self-inverse; TMP exports are compact JSON).
         let bytes = backup::xor_jld(after_json.as_bytes());
-        let outcome = crate::replace_inplace_core(target.list_index, &bytes)?;
+        let outcome = crate::replace_inplace::replace_inplace_core(target.list_index, &bytes)?;
         if !outcome.edit_landed {
             return Err(format!(
                 "in-place edit did not land at list index {} (slot name unchanged: {:?})",

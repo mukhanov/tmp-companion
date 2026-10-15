@@ -54,7 +54,7 @@ specs prove the bridge, the command layer and, now, the rendered rows.
   - `E2E Preset24 Min` (408) / `E2E Hiwatt Min` (409) — the smallest presets still reproducing each incident's own bug class.
   - `E2E Friedman 3S` (410) — the P4 leveling-regression fixture: `ACD_TubeScreamer` (base-ON) → `ACD_MarshallPlexi` (the catalog-verified stand-in for a Friedman HBE-class amp) → `ACD_CabSimTMS`, 3 FULL-overlay scenes (Rhythm/Lead/Base Scene), no `leveledParams` (a plain flat-C/`ol_term` fixture).
 - **THE CAB RULE (standing user directive):** every guitar amp in every fixture is a combo, an amp+cab-merged model (a cab/IR-suffixed id), or a bare head with a cabinet block DOWNSTREAM IN ITS OWN LANE. Enforced by `fixture_gates::every_guitar_amp_in_every_fixture_reaches_a_cab`, which walks the production routing decoder's signal paths — so a trunk head with a cab in each parallel lane passes and a lane-less cab does not. Offline the `scenario-loudness.json` C table _is_ the model — each entry's `_comment` records what its C folds in; the real unit's own loudness is measured, never read from the table.
-- **Fixtures are generated, not hand-edited in place, and every regen bumps `FIXTURE_SOURCE_STAMP`'s `#rN` suffix** (`probe_api/seed_scenario.rs`) — a resident copy of an older rev must fail the pristine check and self-migrate. A regen also means rerunning `cargo test build_scenario_fixture -- --ignored` to rebuild `backup-fixture.bin`.
+- **Fixtures are generated, not hand-edited in place, and every regen bumps `FIXTURE_SOURCE_STAMP`'s `#rN` suffix** (`e2e_seed.rs`) — a resident copy of an older rev must fail the pristine check and self-migrate. A regen also means rerunning `cargo test build_scenario_fixture -- --ignored` to rebuild `backup-fixture.bin`.
 
 ## Online preconditions — the unit's own global settings count
 
@@ -124,7 +124,7 @@ Online and soak runs archive into dated run folders under the git common dir, an
 ## Fixtures
 
 - The offline `backup-fixture.bin` and `scenario-presets.json` **must stay in sync** — regenerate both from one script.
-- **Fixture drift-lock trap:** a drift-lock or round-trip test that compares fixtures **through a typed struct** silently covers only the fields that struct carries. `info.product_id` and `info.preset_id` drifted while the lock test stayed green. Assert fixture invariants against the **RAW JSON** (`lib.rs`'s `fixture_gates`, deliberately OUTSIDE `#[cfg(feature = "e2e")]` — a gate that only compiles in a build nobody makes is not a gate). It pins `product_id == "tmStomp"` (a `"pro"` preset is rejected on the unit as "created using a newer firmware revision") and a unique `preset_id` per fixture preset.
+- **Fixture drift-lock trap:** a drift-lock or round-trip test that compares fixtures **through a typed struct** silently covers only the fields that struct carries. `info.product_id` and `info.preset_id` drifted while the lock test stayed green. Assert fixture invariants against the **RAW JSON** (`fixture_gates.rs`, deliberately OUTSIDE `#[cfg(feature = "e2e")]` — a gate that only compiles in a build nobody makes is not a gate). It pins `product_id == "tmStomp"` (a `"pro"` preset is rejected on the unit as "created using a newer firmware revision") and a unique `preset_id` per fixture preset.
 - The preset XOR key is committed as `const PRESET_XOR_KEY: [u8;3] = *b"JLD"` in `backup.rs`. The runtime `derive_key`/`learn_key`/panic recovery was deleted — **do NOT reintroduce it**.
 
 ## Ports

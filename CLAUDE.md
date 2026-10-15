@@ -35,7 +35,7 @@ Path-scoped rules only load once Claude **reads** a matching file, so anything t
 ## Invariants no single module can state
 
 - **`blockcaps.rs` is the SOLE enforcement of the 5 block-count caps.** The device enforces none of the 4 count caps, and its CPU-budget check is fatal: an over-budget INSERT gets no reply and aborts the server (fw 1.8.58 static RE; a replace gets `presetError` 14). Any new apply path must call it, because nothing downstream will.
-- **`SCRATCH_SLOTS` (`probe_api/mod.rs`) is the ONE declaration of the scratch zone** — widening it is one edit, not four. It is not a universal guard: `probe_import_file` (and the in-place replace path behind it) guards an EMPTY TARGET slot instead, so an import — or the scratch copy a refused in-place replace leaves behind — can land at any empty USER slot, outside the zone.
+- **`SCRATCH_SLOTS` (`slot.rs`) is the ONE declaration of the scratch zone** — widening it is one edit, not four. It is not a universal guard: `probe_import_file` (and the in-place replace path behind it) guards an EMPTY TARGET slot instead, so an import — or the scratch copy a refused in-place replace leaves behind — can land at any empty USER slot, outside the zone.
 - **Block art is original SVG through the BlockArt engine — never an `<img>` photo tile.** The copyrighted vendor PNGs are not bundled and must not be reintroduced (Fender IP).
 - **`ui/primitives.tsx` is deliberately NOT split** — `Modal` renders `Button`, so splitting reintroduces a circular import.
 - **`blockArt.ts` must NOT import `catalog.ts`** — it closes a module-init cycle (a TDZ crash). Enforced by `no-restricted-imports` in `eslint.config.js`.
@@ -71,7 +71,7 @@ cargo run --bin probe                         # headless HW re-validation (devic
 - **Auto-merge arms ONLY for `main`-targeted PRs.** [→ evidence](notes/gotchas.md#auto-merge-arms-only-for-main-targeted-prs)
 - **Connection is fully automatic** — there are no manual Connect/Disconnect buttons. [→ evidence](notes/gotchas.md#fully-automatic-connection)
 - **Editing `index.html` triggers a FULL webview reload** (not HMR) in `tauri dev`, re-running connect-on-mount. Reload via the UI instead.
-- **Shared seams** — the cross-module reuse contracts: `backup::xor_jld` (the `.preset` codec) + `library::decode_preset_bytes`; `crate::replace_inplace_core` (in-place re-import); `audiograph::for_each_node` / `for_each_node_mut` + `node_id` (the node-walk helpers the scan and edit modules share).
+- **Shared seams** — the cross-module reuse contracts: `backup::xor_jld` (the `.preset` codec) + `library::decode_preset_bytes`; `crate::replace_inplace::replace_inplace_core` (in-place re-import); `audiograph::for_each_node` / `for_each_node_mut` + `node_id` (the node-walk helpers the scan and edit modules share).
 
 ## How leveling works
 
