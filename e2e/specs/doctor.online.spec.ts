@@ -6,11 +6,8 @@ import {
   expectReampBalanced,
   invoke,
   isOnline,
-  openLevel,
   reampCounters,
   reampOff,
-  runDoctorCheck,
-  selectPresetsForCheck,
 } from "../fixtures/scenario";
 
 // ONLINE Doctor consolidation (8-file → 4-file suite shrink). Two oracles that both need
@@ -22,18 +19,15 @@ import {
 //     BRIGHT, are covered numerically by src-tauri/src/doctor_audio_oracle.rs) — the executable proof that all 13 of E2E Doctor Oracle's (407) spectral checks
 //     actually diagnose on real audio, not just that the fixture carries the right shape
 //     (that structural half stays pinned offline by fixture_gates.rs).
-// (b) is doctor.spec.ts's online UI run on E2E Edge (402) alone: the 2.6 kHz EQ-ring chip
-//     must fire on every one of Edge's played sounds, and opening a ringing row must surface
-//     the "notch it out" prescription. The CROSS-CARD scoping proof (a ring diagnosed on Edge
-//     never renders on a sibling's card) is a pure rendering property of the Results view, so
-//     it lives in Vitest (`DoctorResults.test.tsx`, "keeps a ring chip on its own card"),
-//     not here: selecting E2E Rig and E2E Pedalboard as well cost ~20 real captures (4-6 min
-//     on the unit) for a property no device behaviour can change. (a) proves the BACKEND
-//     never diagnoses a ring on healthy audio. doctor.spec.ts keeps its full 3-preset flow
-//     OFFLINE (test.skip'd online there, trade — see that file's own header); the
-//     cut-through-estimate UI assertion (generic capture plumbing, not preset-specific)
-//     stays covered there too.
-test.describe("Doctor online — spectral oracle (407) + Edge EQ-ring UI (402)", () => {
+// (b) is E2E Edge's (402) baked 2.6 kHz EQ ring on real audio, by raw invoke: base plus two
+//     consecutive scenes. (a)'s RESONANT row is a q14 +24 dB spike far over the ring gate;
+//     Edge's ring is the near-threshold one (a hedged chip still counts), and its scenes are
+//     the only online Doctor sounds that run the SCENE path — the second scene skips its
+//     preset load (`doctor_skip_load`). It used to drive the Doctor UI over all ~10 Edge
+//     sounds behind a whole-library backup scan; the chip's rendering, its scoping to its own
+//     card and the select → check → Results flow are `DoctorResults.test.tsx`'s and
+//     doctor.spec.ts's offline.
+test.describe("Doctor online — spectral oracle (407) + Edge EQ ring (402)", () => {
   // Shared across both tests below (mirrors doctor-oracle.online.spec.ts's own teardown):
   // reamp-off FIRST on every test so a mid-test failure can't strand the unit
   // input-muted, and ONE afterAll clearScenario rather than a per-test clear — a per-test
@@ -53,7 +47,7 @@ test.describe("Doctor online — spectral oracle (407) + Edge EQ-ring UI (402)",
 
   interface DoctorSoundResult {
     key: string;
-    diags: { key: string }[];
+    diags: { key: string; label: string }[];
     integratedLufs: number;
     error: string | null;
   }
@@ -257,85 +251,67 @@ test.describe("Doctor online — spectral oracle (407) + Edge EQ-ring UI (402)",
     await expectReampBalanced(page, reampBase);
   });
 
-  // (b) — doctor.spec.ts's online UI run on E2E Edge alone (COVERAGE row 31; the cross-card
-  // scoping property is Vitest's — see this file's own header).
-  test("E2E Edge: the 2.6 kHz EQ ring fires on every Edge sound and its row prescribes the notch", async ({
+  // (b) — COVERAGE row 31.
+  test("E2E Edge: the 2.6 kHz EQ ring fires on base and on two consecutive scenes", async ({
     page,
   }) => {
     test.skip(
       !(await isOnline(page)),
       "online-only: the EQ-ring oracle needs real audio",
     );
-    // Budget, added up rather than eyeballed (a bare 600 s ceiling here previously left the
-    // Results wait below alone eating 500 s against it — cold-seed runs died on a vague "Test
-    // timeout exceeded" instead of the real assertion). Edge alone: ~10 sounds (base + 8
-    // scenes + its footswitch) x 18 s/capture (worst end of doctor.spec.ts's documented
-    // 12-18 s range) ≈ 180 s, + up to 3 floor-suspect recapture retries (5 s gap + 18 s
-    // recapture each, leveller.rs) ≈ 69 s, + a cold `ensureScenario` reseed (240 s worst
-    // case, fixtures/scenario.ts's own request budget), + the real backup scan the preset
-    // picker pays before Check enables (up to ~180 s on a full bank, copy.spec.ts's SCAN_MS),
-    // + small UI-click slack (~10 s) ≈ 680 s. 1_200_000 ms gives headroom, matching this
-    // file's other test's generous-ceiling style.
-    test.setTimeout(1_200_000);
+    // 3 sounds x 18 s/capture (worst end) + up to 3 floor-suspect retries (23 s each) + a
+    // cold `ensureScenario` (240 s) ≈ 360 s; the request budget sits under the ceiling so a
+    // hang names itself.
+    test.setTimeout(900_000);
+    const DOCTOR_T = 600_000;
     await ensureScenario(page);
     const reampBase = await reampCounters(page);
 
-    await openLevel(page);
+    const baseItem = {
+      key: "base",
+      listIndex: EDGE.slot,
+      scene: null as number | null,
+      footswitch: null,
+      label: "Base",
+      tag: null,
+      topologyId: "guitar-humbucker",
+      calibrationLufs: null,
+      profileId: null,
+      nodes: [],
+      footswitches: [],
+    };
+    // Base first, then two scenes back to back: the second scene follows a scene of the same
+    // preset that wrote nothing, so it takes `doctor_skip_load`'s no-reload path.
+    const items = [
+      baseItem,
+      { ...baseItem, key: "scene0", scene: 0, label: "Scene 1" },
+      { ...baseItem, key: "scene1", scene: 1, label: "Scene 2" },
+    ];
+    const result = (await invoke(
+      page,
+      "doctor_check",
+      { items, restoreListIndex: null, onResult: "__CHANNEL__:1" },
+      DOCTOR_T,
+    )) as DoctorCheckResult;
 
-    await selectPresetsForCheck(page, [EDGE]);
-    await runDoctorCheck(page);
-
-    // Terminal Results, or a fast-fail error pane (see doctor.spec.ts's own header for
-    // why the error pane is matched in the same wait). ~10 sounds at up to 18 s/capture
-    // (~180 s) plus floor-suspect recapture retries (~69 s) ≈ 250 s, behind a backup scan of
-    // up to ~180 s. 900 s keeps real headroom without eating most of this test's own
-    // ceiling — see that ceiling's budget comment above.
-    await expect(
-      page
-        .getByText(/presets? need a look|All clear|check couldn.t finish/)
-        .first(),
-    ).toBeVisible({ timeout: 900_000 });
-    await expect(page.getByText(/check couldn.t finish/)).toHaveCount(0);
-
-    const everything = page.getByRole("radio", { name: "Everything" });
-    if (await everything.isVisible().catch(() => false)) {
-      await everything.click();
+    expect(result.stopped, "the run must complete, not stop early").toBe(false);
+    expect(result.presets.length, "exactly one preset was checked").toBe(1);
+    const preset = result.presets[0];
+    expect(preset.listIndex).toBe(EDGE.slot);
+    expect(
+      preset.sounds.map((s) => s.key),
+      "every requested sound must come back, none dropped mid-run",
+    ).toEqual(items.map((i) => i.key));
+    // The ring lives in Edge's BASE graph, so every played sound carries it. Hedged counts:
+    // the backend's key is `resonant` whatever the z (the "Possible" prefix is the UI's).
+    for (const sound of preset.sounds) {
+      expect(sound.error, `${sound.key} must not have errored`).toBeNull();
+      const ring = sound.diags.find((d) => d.key === "resonant");
+      expect(
+        ring?.label,
+        `${sound.key} diags [${sound.diags.map((d) => d.key).join(", ")}] must ring at 2.x kHz`,
+      ).toMatch(/^Rings at 2\.\d kHz$/);
     }
-
-    await expect(page.getByText(EDGE.name).first()).toBeVisible();
-
-    // Hedged accepted too: z < 2.5 (0.75 dB of peak height) renders "Possible Rings at N kHz" via
-    // possibleLabel() (severity.ts), and TubeScreamer-engaged Edge rows can erode the
-    // margin into hedge territory — a hedged detection is still a detection.
-    const ringChip = /^(?:Possible )?Rings at 2\.\d kHz$/;
-    const edgeCard = page.locator(`[data-preset-card="${EDGE.name}"]`);
-    await expect(edgeCard).toHaveCount(1);
-
-    // AS-PLAYED SEMANTICS: the EQ ring lives in Edge's BASE graph, so it is present in
-    // every one of Edge's played sounds, not one isolated row — expand the collapsed
-    // "N sounds check out" healthy bucket (present whenever any sound on the card IS
-    // flagged) BEFORE counting, or a healthy-rendering sound would drop out of both
-    // sides of the equality and mask a regression.
-    const healthySummary = edgeCard.getByText(/\d+ sounds? checks? out/);
-    if (await healthySummary.isVisible().catch(() => false)) {
-      await healthySummary.click();
-    }
-    const edgeRowCount = await edgeCard.locator("[data-sound-row]").count();
-    expect(edgeRowCount).toBeGreaterThanOrEqual(9);
-    await expect(edgeCard.getByText(ringChip)).toHaveCount(edgeRowCount);
-
-    // Click the ROW HEADER's label, scoped inside a [data-sound-row] — a bare
-    // page-wide getByText(name).last() resolves into the "Level jumps" advisory panel
-    // below the rows instead (doctor.spec.ts's own incident note, HW run 2026-08-09).
-    const edgeRingRow = edgeCard.locator("[data-sound-row]").first();
-    await edgeRingRow.getByText(EDGE.name).first().click();
-    await expect(
-      page.getByText(/Rings at 2\.\d kHz — notch it out/).first(),
-    ).toBeVisible();
-    await edgeRingRow.getByText(EDGE.name).first().click(); // collapse
-    await expect(
-      page.getByText(/Rings at 2\.\d kHz — notch it out/),
-    ).toHaveCount(0);
 
     await expectReampBalanced(page, reampBase);
   });
