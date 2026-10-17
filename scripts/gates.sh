@@ -537,11 +537,53 @@ if [ "$want_shell" -eq 1 ]; then
   run_gate "e2e-evidence spec" /bin/bash scripts/e2e-evidence.spec.sh
 fi
 
+# The frontend and Rust gates share nothing, so they run side by side: the frontend group in a
+# background subshell whose output is held in a file and printed whole once it ends (the two
+# groups' lines never interleave), the Rust group in the foreground. A Rust failure, Ctrl-C
+# or a TERM exits through the traps, which stop the frontend group and remove its log (the
+# EXIT/INT/TERM shape `scripts/e2e.sh` uses).
+fe_pid=""
+fe_log=""
+# <pid> — every descendant of pid, parents before children. bun runs eslint, tsc and vitest as
+# grandchildren of the subshell, so `pkill -P` alone would leave them running.
+# shellcheck disable=SC2329,SC2317  # invoked from the traps, not statically traced
+descendants() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do
+    printf '%s\n' "$c"
+    descendants "$c"
+  done
+}
+# The tree is listed BEFORE anything is signalled: a killed parent's children are reparented
+# away from it, where a later `pgrep -P` can no longer find them. A terminal Ctrl-C needs
+# none of this: it already reaches every process in the foreground group, the frontend
+# tree included; the walk is for an early Rust failure and a TERM sent to this script alone.
+# shellcheck disable=SC2329,SC2317  # invoked from the traps, not statically traced
+stop_frontend() {
+  trap - EXIT INT TERM
+  local p tree
+  if [ -n "$fe_pid" ]; then
+    tree="$(descendants "$fe_pid")"
+    kill "$fe_pid" 2>/dev/null || true
+    for p in $tree; do kill "$p" 2>/dev/null || true; done
+  fi
+  if [ -n "$fe_log" ]; then rm -f "$fe_log"; fi
+  if [ -n "${1:-}" ]; then exit "$1"; fi
+}
+trap stop_frontend EXIT
+trap 'stop_frontend 130' INT
+trap 'stop_frontend 143' TERM
+
 if [ "$want_frontend" -eq 1 ]; then
-  run_gate "lint (eslint)"       bun run lint
-  run_gate "typecheck (tsc)"     bun run typecheck
-  run_gate "frontend tests"      bun run test
-  run_gate "format (prettier)"   bun run format:check
+  fe_log="$(mktemp)"
+  (
+    run_gate "lint (eslint)"       bun run lint
+    run_gate "typecheck (tsc)"     bun run typecheck
+    run_gate "frontend tests"      bun run test
+    run_gate "format (prettier)"   bun run format:check
+  ) >"$fe_log" 2>&1 &
+  fe_pid=$!
+  printf '\ngates: frontend gates running in the background (output follows the Rust gates)\n'
 fi
 
 if [ "$want_rust" -eq 1 ]; then
@@ -562,6 +604,14 @@ if [ "$want_rust" -eq 1 ]; then
   else
     printf 'gates: meter parity (ffmpeg) skipped — ffmpeg is not on PATH\n'
   fi
+fi
+
+if [ -n "$fe_pid" ]; then
+  fe_rc=0
+  wait "$fe_pid" || fe_rc=$?
+  fe_pid=""
+  cat "$fe_log"
+  if [ "$fe_rc" -ne 0 ]; then exit 1; fi   # its own run_gate already printed FAILED
 fi
 
 if [ "$want_e2e" -eq 1 ]; then
