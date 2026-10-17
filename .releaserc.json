@@ -31,6 +31,10 @@
           {
             "path": "release-linux/*.rpm",
             "name": "TMP-Companion-linux-alpha-x86_64.rpm"
+          },
+          {
+            "path": "release-windows/*.exe",
+            "name": "TMP-Companion-windows-alpha-x64-setup.exe"
           }
         ]
       }

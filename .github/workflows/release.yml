@@ -230,8 +230,82 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Alpha Windows artifact, built in the same run as the macOS release but never
+  # blocking it (continue-on-error) — the same contract as build-deb/build-rpm.
+  # The setup.exe is UNSIGNED (no Windows code-signing certificate — SmartScreen
+  # warns on first launch) and has no updater feed (tauri.windows.conf.json turns
+  # updater artifacts off), so it publishes as a plain release asset only.
+  build-nsis:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.version != ''
+    continue-on-error: true
+    runs-on: windows-latest
+    # Fresh-cache MSVC builds of the full tauri tree run 15-25 min on the hosted
+    # runner; rust-cache (key: windows-nsis) brings repeats down to a few. 40 min
+    # leaves headroom over the Linux jobs' 30 without inheriting the 360-min default.
+    timeout-minutes: 40
+    env:
+      # Routed through env rather than inline `${{ }}` in run: — same rationale
+      # as build-deb (the value is already regex-constrained by resolve-version's
+      # own extraction; a plain env var beats interpolating a workflow expression
+      # into a shell command).
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          key: windows-nsis
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # shell: bash on every step that expands $VERSION or globs paths: the
+      # windows-latest default shell is pwsh, where "$VERSION" is NOT the env var.
+      # Git Bash ships with the runner image — same fail-fast choice ci.yml makes
+      # for its Windows cargo steps.
+      - name: Bump version
+        shell: bash
+        run: node scripts/bump-version.mjs "$VERSION"
+
+      - name: Build frontend (also produces dist/ for tauri-build)
+        run: bun run build
+
+      - name: Build the NSIS installer
+        # tauri.windows.conf.json auto-merges on a Windows host (Tauri picks it up
+        # by platform): it selects the NSIS bundler and disables updater artifacts,
+        # so no TAURI_SIGNING_PRIVATE_KEY is needed here. The --bundles flag is
+        # explicit for parity with the deb/rpm legs. bash because package.json's
+        # `tauri` script wraps a bash script.
+        shell: bash
+        run: bun run tauri build --bundles nsis
+
+      - name: Stage the bundle for the release job
+        # Fixed target name so .releaserc.json's asset glob never depends on the
+        # version string embedded in the NSIS output filename.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-windows
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe release-windows/TMP-Companion-windows-alpha-x64-setup.exe
+          printf '%s' "$VERSION" > release-windows/version.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-nsis
+          path: release-windows
+          retention-days: 1
+          if-no-files-found: error
+
   release:
-    needs: [resolve-version, build-deb, build-rpm]
+    needs: [resolve-version, build-deb, build-rpm, build-nsis]
     # Runs whether the Linux jobs succeeded, failed (continue-on-error), or were
     # skipped (nothing releasable) — this job's own behavior is unchanged from
     # before the Linux jobs existed either way. Only a cancelled run, or a genuine
@@ -291,6 +365,16 @@ jobs:
           pattern: linux-*
           path: release-linux
           merge-multiple: true
+
+      # Never blocks, same shape as the Linux download: a missing/failed Windows
+      # build just means .releaserc.json's Windows asset glob matches nothing —
+      # @semantic-release/github logs that per-asset and continues.
+      - name: Download Windows build artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-nsis
+          path: release-windows
 
       - name: Release
         env:
