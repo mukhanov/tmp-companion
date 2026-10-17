@@ -19,6 +19,7 @@ import {
   forceTauri,
   makeBackupPresetRow,
   makeBackupRead,
+  makeBatchRun,
   makeLevelResult,
   makeStore,
   mockCommands,
@@ -93,9 +94,10 @@ function mockHappyPath(baseOver: Partial<LevelResult> = {}) {
           status: "done",
           result: results[i],
           message: null,
+          skipKind: null,
         });
       });
-      return results;
+      return makeBatchRun(results);
     },
   });
 }
@@ -130,13 +132,15 @@ describe("LevelView — full Level wizard happy path (e2e, device mocked)", () =
     expect(screen.queryByText("Set instrument & target")).toBeNull();
 
     // ── 2. select the whole preset → open the wizard directly at Set up ──────────
-    await user.click(screen.getAllByTitle("Select preset to level")[0]);
     await user.click(
-      await screen.findByRole("button", { name: /level 1 preset/i }),
+      screen.getByRole("checkbox", { name: "Choose Stadium Lead" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: /^level 3 sounds$/i }),
     );
     // Opens straight at Set up — there is no separate Back-up step.
     expect(
-      await screen.findByText("Make all your sounds equally loud"),
+      await screen.findByRole("heading", { name: /^Level \d+ sounds?$/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText("Back up your unit first")).toBeNull();
 
@@ -145,23 +149,23 @@ describe("LevelView — full Level wizard happy path (e2e, device mocked)", () =
     // on the apply-to bar and per-row — at least once each).
     expect(screen.getAllByText("Telecaster").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Rhythm/i).length).toBeGreaterThan(0);
-    // Commit: tick the footer backup ack, then Base + Rhythm + Lead → "Start — 3 sounds".
+    // Commit: tick the footer backup ack, then "Start leveling" (Base + Rhythm + Lead).
     await ackBackup(user);
     await user.click(
-      await screen.findByRole("button", { name: /start.*3 sounds/i }),
+      await screen.findByRole("button", { name: "Start leveling" }),
     );
 
     // ── 4 + 5. run auto-advances (650 ms) to the summary headline ───────────────
     expect(
-      await screen.findByText("All 3 sounds match now.", undefined, {
+      await screen.findByText("All 3 sounds leveled.", undefined, {
         timeout: 3000,
       }),
     ).toBeInTheDocument();
 
     // ── 6. Done → footer returns to the idle hint ───────────────────────────────
-    await user.click(screen.getByRole("button", { name: /done/i }));
+    await user.click(screen.getByRole("button", { name: "Done" }));
     expect(
-      await screen.findByText(/select presets to level/i),
+      await screen.findByText("Choose presets or sounds to level"),
     ).toBeInTheDocument();
 
     // ── assertions: the three device commands fired ─────────────────────────────
@@ -177,7 +181,9 @@ describe("LevelView — full Level wizard happy path (e2e, device mocked)", () =
   });
 
   // #187: the store maps the backend's `verify_failed` to a "not confirmed" row. A Base
-  // whose check capture failed carries only a prediction, so it must not count as matched.
+  // whose check capture failed carries only a prediction, so it must not count as leveled:
+  // it needs you, and Try again confirms it (with its preset's leveled scenes, which a
+  // main sound's new level moves).
   it("a Base whose verify failed is reported not confirmed, never matched", async () => {
     mockHappyPath({ verification: "verify_failed", verify_lufs: null });
     const user = userEvent.setup();
@@ -185,18 +191,28 @@ describe("LevelView — full Level wizard happy path (e2e, device mocked)", () =
 
     await screen.findByText("Stadium Lead");
     await screen.findByText("2 scenes");
-    await user.click(screen.getAllByTitle("Select preset to level")[0]);
     await user.click(
-      await screen.findByRole("button", { name: /level 1 preset/i }),
+      screen.getByRole("checkbox", { name: "Choose Stadium Lead" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: /^level 3 sounds$/i }),
     );
     await ackBackup(user);
     await user.click(
-      await screen.findByRole("button", { name: /start.*3 sounds/i }),
+      await screen.findByRole("button", { name: "Start leveling" }),
     );
 
     expect(
-      await screen.findByText("not confirmed", undefined, { timeout: 3000 }),
+      await screen.findByText(
+        "Volume set, but the final check didn't finish. Try again to confirm it.",
+        undefined,
+        { timeout: 3000 },
+      ),
     ).toBeInTheDocument();
-    expect(screen.queryByText("All 3 sounds match now.")).toBeNull();
+    expect(
+      screen.getByRole("heading", { name: "2 sounds leveled. 1 needs you." }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("All 3 sounds leveled.")).toBeNull();
+    expect(screen.getByRole("button", { name: "Try again (3)" })).toBeEnabled();
   });
 });

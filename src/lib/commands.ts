@@ -19,15 +19,13 @@ import type {
   AppInfo,
   BackupReadResult,
   BaseAnchor,
+  BatchLevelRun,
   CalibrateResult,
   ConnectResult,
   CopyApplyItem,
   CopyJob,
-  DoctorApplyJob,
-  DoctorApplyResult,
   DoctorCheckResult,
   DoctorInputArg,
-  DoctorOp,
   DoctorProgressItem,
   FootswitchLevelJobWire,
   FootswitchLevelProgressItem,
@@ -111,7 +109,7 @@ export interface Commands {
   cancel_preset_leveling: { args: undefined; ret: Unit };
   level_scenes_apply_batched: {
     args: SceneLevelApplyArgs & { onResult: Channel<SceneLevelProgressItem> };
-    ret: LevelResult[];
+    ret: BatchLevelRun<LevelResult>;
   };
   cancel_scene_leveling: { args: undefined; ret: Unit };
   list_scene_level_handles: { args: { slot: number }; ret: SceneHandleRow[] };
@@ -123,7 +121,7 @@ export interface Commands {
     args: FootswitchLevelApplyArgs & {
       onResult: Channel<FootswitchLevelProgressItem>;
     };
-    ret: FootswitchLevelResult[];
+    ret: BatchLevelRun<FootswitchLevelResult>;
   };
   cancel_footswitch_leveling: { args: undefined; ret: Unit };
 
@@ -137,17 +135,6 @@ export interface Commands {
     ret: DoctorCheckResult;
   };
   cancel_doctor_check: { args: undefined; ret: Unit };
-  doctor_apply: { args: { job: DoctorApplyJob }; ret: DoctorApplyResult };
-  doctor_save: {
-    args: {
-      listIndex: number;
-      expectName: string;
-      scene: number | null;
-      ops: DoctorOp[];
-    };
-    ret: Unit;
-  };
-  doctor_discard: { args: { listIndex: number }; ret: Unit };
 
   // Instrument profiles + persisted store
   get_store: { args: undefined; ret: Store };
@@ -156,6 +143,10 @@ export interface Commands {
   set_playback_level: { args: { level: PlaybackLevel }; ret: Unit };
   set_playback_channels: { args: { channels: PlaybackChannels }; ret: Unit };
   set_auto_install_updates: { args: { on: boolean }; ret: Unit };
+  set_preset_instrument: {
+    args: { slot: number; profileId: string };
+    ret: Unit;
+  };
   calibrate_profile: {
     args: { profileId: string; secs: number };
     ret: CalibrateResult;

@@ -13,9 +13,10 @@ import {
   useSyncExternalStore,
 } from "react";
 
-import { listPresets, getStore } from "../../lib/invoke";
+import { listPresets, getStore, setPresetInstrument } from "../../lib/invoke";
 import { useDeviceLoad } from "../../lib/useDeviceLoad";
 import { baseKey, childKeys } from "./leveling";
+import { presetChoice, presetKeys } from "./presetChoice";
 import { subscribeLibraryScan, getLibraryScan } from "../../device/libraryScan";
 import type { PresetRow } from "./leveling";
 import type {
@@ -108,29 +109,53 @@ export function usePresetData(
       : lib.footswitchesPerIndex;
   const scan: ScanState = { scanning: lib.scanning };
 
-  // rows + sceneInfo + footswitchInfo in refs so the stable toggle callbacks see the
-  // latest data. Synced in an effect (after commit) rather than during render — the
-  // callbacks only read these when they fire, which is always after a commit.
+  // rows + sceneInfo + footswitchInfo (and the selection and scan state the toggles
+  // decide on) in refs so the stable toggle callbacks see the latest data. Synced in an
+  // effect (after commit) rather than during render — the callbacks only read these when
+  // they fire, which is always after a commit.
   const rowsRef = useRef<PresetRow[]>(rows);
   const sceneInfoRef = useRef<Map<number, SceneInfo[]>>(sceneInfo);
   const footswitchInfoRef =
     useRef<Map<number, FootswitchInfo[]>>(footswitchInfo);
+  const selRef = useRef<Set<string>>(sel);
+  const pendingWholeRef = useRef<Set<number>>(pendingWhole);
+  const readyRef = useRef(ready);
   useEffect(() => {
     rowsRef.current = rows;
     sceneInfoRef.current = sceneInfo;
     footswitchInfoRef.current = footswitchInfo;
+    selRef.current = sel;
+    pendingWholeRef.current = pendingWhole;
+    readyRef.current = ready;
   });
 
   // Case-insensitive lookup by target NAME (the leveling flow carries the display
-  // name, e.g. "Crunch"); −27 is the conservative fallback when a name is unknown
-  // (PR2 re-baseline: +3 from the mono-era −30, same audible loudness under the
-  // new 2-ch BS.1770 convention).
+  // name, e.g. "Crunch"). `null` when no configured target has that name (an empty
+  // name, a target deleted in Settings, or the store not loaded yet): there is no
+  // fallback loudness, so the run refuses such a sound instead of leveling and saving
+  // it at a value no dropdown showed (danger.md, UI values).
   const targetLufsByName = useCallback(
-    (name: string | null): number =>
+    (name: string | null): number | null =>
       store?.targets.find((tg) => tg.name.toLowerCase() === name?.toLowerCase())
-        ?.lufs ?? -27,
+        ?.lufs ?? null,
     [store],
   );
+
+  // Remember the instrument chosen for a preset: saved in the app's own
+  // store on this computer, never on the unit, and mirrored into this view's copy of the
+  // store so the next Set up starts from it. A failed save keeps the old copy (the command
+  // logs it); the choice still applies to this run.
+  const rememberInstrument = useCallback((slot: number, id: string) => {
+    void setPresetInstrument(slot, id)
+      .then(() => {
+        setStore((st) =>
+          st
+            ? { ...st, profile_by_slot: { ...st.profile_by_slot, [slot]: id } }
+            : st,
+        );
+      })
+      .catch(() => undefined);
+  }, []);
 
   // ── read-only loads (mount + after connect) ───────────────────────────────
   // The active graph is no longer fetched here — it arrives from the combined
@@ -194,28 +219,46 @@ export function usePresetData(
   }
 
   // ── selection ─────────────────────────────────────────────────────────────
-  // Tick a WHOLE preset: when its scenes are known, toggle all child keys (all-on ⇒
-  // clear, else select all). When still unknown (mid-load), track it in pendingWhole
-  // — the reconcile effect folds it into `sel` once scenes land. Reads fresh
-  // rows/sceneInfo from refs so the callbacks stay stable.
+  // Tick a WHOLE preset (`presetKeys` says what that stands for): when its scenes are
+  // known, toggle all child keys (all-on ⇒ clear, else select all). When the scan
+  // finished without them, toggle its main sound alone. While the scan is still reading,
+  // the tick waits in pendingWhole — the reconcile above folds it into `sel` once scenes
+  // land — and an untick also drops a main sound kept from before a re-read. Reads fresh
+  // state from refs so the callbacks stay stable.
   const togglePreset = useCallback((slot: number) => {
     const row = rowsRef.current.find((r) => r.slot === slot);
     if (!row || row.empty) return;
-    const scenes = sceneInfoRef.current.get(slot);
-    if (scenes === undefined) {
+    const keys = presetKeys(
+      slot,
+      sceneInfoRef.current.get(slot),
+      footswitchInfoRef.current.get(slot),
+      readyRef.current,
+    );
+    if (keys === null) {
+      const on =
+        presetChoice(
+          slot,
+          null,
+          selRef.current,
+          pendingWholeRef.current.has(slot),
+        ) === "on";
       setPendingWhole((prev) => {
         const next = new Set(prev);
-        if (next.has(slot)) next.delete(slot);
+        if (on) next.delete(slot);
         else next.add(slot);
         return next;
       });
+      if (on) {
+        const base = baseKey(slot);
+        setSel((prev) => {
+          if (!prev.has(base)) return prev;
+          const next = new Set(prev);
+          next.delete(base);
+          return next;
+        });
+      }
       return;
     }
-    const keys = childKeys(
-      slot,
-      scenes,
-      footswitchInfoRef.current.get(slot) ?? [],
-    );
     setSel((prev) => {
       const next = new Set(prev);
       const allOn = keys.every((k) => next.has(k));
@@ -254,22 +297,57 @@ export function usePresetData(
     });
   }, []);
 
-  // Select-all toggle (header checkbox): every scene key of every non-empty preset ↔
-  // none. Reads fresh rows/sceneInfo from the refs so it isn't stale.
-  const toggleAll = useCallback(() => {
-    const named = rowsRef.current.filter((r) => !r.empty);
-    const everyKey: string[] = named.flatMap((r) =>
-      childKeys(
-        r.slot,
-        sceneInfoRef.current.get(r.slot) ?? [],
-        footswitchInfoRef.current.get(r.slot) ?? [],
-      ),
+  // Select-all ("Select all N shown"): acts on the presets the filter SHOWS — the caller
+  // passes their slots — and leaves every hidden preset's choice as it is. If every
+  // shown preset is fully chosen, unchoose them all; otherwise choose every sound of every
+  // shown, non-empty preset (a preset still being read waits whole in pendingWhole).
+  // Reads fresh state from the refs so it isn't stale.
+  const toggleAll = useCallback((slots: readonly number[]) => {
+    const named = new Set(
+      rowsRef.current.filter((r) => !r.empty).map((r) => r.slot),
     );
+    const shown = slots.filter((s) => named.has(s));
+    if (shown.length === 0) return;
+    const entries = shown.map((slot) => ({
+      slot,
+      keys: presetKeys(
+        slot,
+        sceneInfoRef.current.get(slot),
+        footswitchInfoRef.current.get(slot),
+        readyRef.current,
+      ),
+    }));
+    const allOn = entries.every(
+      (e) =>
+        presetChoice(
+          e.slot,
+          e.keys,
+          selRef.current,
+          pendingWholeRef.current.has(e.slot),
+        ) === "on",
+    );
+    if (allOn) {
+      const shownSet = new Set(shown);
+      setSel(
+        (prev) => new Set([...prev].filter((k) => !shownSet.has(slotOfKey(k)))),
+      );
+      setPendingWhole(
+        (prev) => new Set([...prev].filter((s) => !shownSet.has(s))),
+      );
+      return;
+    }
     setSel((prev) => {
-      const all = everyKey.length > 0 && everyKey.every((k) => prev.has(k));
-      return all ? new Set() : new Set(everyKey);
+      const next = new Set(prev);
+      entries.forEach((e) => e.keys?.forEach((k) => next.add(k)));
+      return next;
     });
-    setPendingWhole(new Set());
+    setPendingWhole((prev) => {
+      const next = new Set(prev);
+      entries.forEach((e) => {
+        if (e.keys === null) next.add(e.slot);
+      });
+      return next;
+    });
   }, []);
 
   // ── derived selection counts (memoized — only recompute when the selection
@@ -311,6 +389,7 @@ export function usePresetData(
     deselectKeys,
     toggleAll,
     targetLufsByName,
+    rememberInstrument,
     refresh,
   };
 }

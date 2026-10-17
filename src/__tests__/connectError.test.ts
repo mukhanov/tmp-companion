@@ -1,52 +1,49 @@
-// Locks the connect-error classification (App shell banner vs friendly gate), keyed on
-// the backend's typed error KIND (#269), never on the message text. The cold-boot case
-// is the one that bit us: the TMP's HID interface enumerates (hotplug fires, open/seize
-// succeeds) seconds before its USB stack accepts reports, so the first handshake send
-// fails — `not_ready` — and that must NOT flash the red banner.
+// Locks the connect-error classification (which page a device tab shows while no unit
+// is connected), keyed on the backend's typed error KIND (#269), never on the message
+// text. The cold-boot case is the one that bit us: the TMP's HID interface enumerates
+// (hotplug fires, open/seize succeeds) seconds before its USB stack accepts reports, so
+// the first handshake send fails — `not_ready` — and that must read as "plug it in /
+// wait", not as a failure.
 
 import { describe, it, expect } from "vitest";
 import {
-  connectBannerMessage,
   errorKind,
+  errorReampStillOn,
+  errorSkipKind,
   isCommandErrorKind,
   isConnectGateKind,
+  noUnitState,
 } from "../lib/connectError";
 import { CommandError } from "../lib/invoke";
 
-describe("connectBannerMessage", () => {
-  it("suppresses not_connected (nothing plugged in → friendly gate)", () => {
-    expect(
-      connectBannerMessage(
-        "not_connected",
-        "no TMP found (VID 0x1ED8 / PID 0x44) — is it plugged in?",
-      ),
-    ).toBeNull();
+describe("noUnitState", () => {
+  it("is connecting until the first attempt settles, whatever the kind", () => {
+    expect(noUnitState(true, null)).toBe("connecting");
+    expect(noUnitState(true, "busy")).toBe("connecting");
   });
 
-  it("suppresses not_ready (unit present but still booting → gate)", () => {
-    expect(
-      connectBannerMessage(
-        "not_ready",
-        "IOHIDDeviceSetReport failed: 0xe00002d6",
-      ),
-    ).toBeNull();
+  it("nothing plugged in or a unit still booting → the plain plug-it-in page", () => {
+    expect(noUnitState(false, null)).toBe("off");
+    expect(noUnitState(false, "not_connected")).toBe("off");
+    expect(noUnitState(false, "not_ready")).toBe("off");
   });
 
-  it("surfaces busy — the actionable 'close Pro Control' open failure (red banner)", () => {
-    const msg =
-      "IOHIDDeviceOpen failed: 0xe00002c5 — close Fender Pro Control (it holds the device) and retry";
-    expect(connectBannerMessage("busy", msg)).toBe(msg);
+  it("busy → another app is using it", () => {
+    expect(noUnitState(false, "busy")).toBe("busy");
   });
 
-  it("surfaces any other error verbatim", () => {
-    expect(connectBannerMessage("other", "connect task failed: panic")).toBe(
-      "connect task failed: panic",
+  it("any other kind → couldn't connect", () => {
+    expect(noUnitState(false, "other")).toBe("failed");
+  });
+
+  it("classifies by kind, not by text: a gate-like message of kind other fails", () => {
+    // The old regexes read the text; only the typed kind decides now.
+    expect(noUnitState(false, errorKind(new Error("no TMP found")))).toBe(
+      "failed",
     );
-  });
-
-  it("classifies by kind, not by text: a gate-like message of kind other surfaces", () => {
-    // The old regexes would have hidden this; only the kind decides now.
-    expect(connectBannerMessage("other", "no TMP found")).toBe("no TMP found");
+    expect(
+      noUnitState(false, errorKind({ kind: "busy", message: "no TMP found" })),
+    ).toBe("busy");
   });
 });
 
@@ -81,7 +78,70 @@ describe("errorKind", () => {
     for (const k of ["not_connected", "busy", "not_ready", "other"]) {
       expect(isCommandErrorKind(k)).toBe(true);
     }
-    expect(isCommandErrorKind("cancelled")).toBe(false);
+    // The leveling commands' kinds (`error::SkipKind`, pinned on the Rust side by
+    // `a_skip_kind_serializes_as_its_wire_token`).
+    for (const k of [
+      "preset_unreadable",
+      "footswitches_unreadable",
+      "no_active_amp",
+      "level_manually",
+      "scene_write_refused",
+      "unsupported_knob",
+      "knob_missing",
+      "block_off",
+      "scene_change_discards",
+      "no_stimulus",
+      "clipped_capture",
+      "no_signal",
+      "connection_lost",
+      "cancelled",
+    ]) {
+      expect(isCommandErrorKind(k)).toBe(true);
+    }
+    expect(isCommandErrorKind("skipped")).toBe(false);
     expect(isCommandErrorKind(3)).toBe(false);
+  });
+});
+
+describe("errorSkipKind", () => {
+  it("reads a leveling command's typed kind, never its text", () => {
+    expect(
+      errorSkipKind(
+        new CommandError("level_preset", "x", "footswitches_unreadable"),
+      ),
+    ).toBe("footswitches_unreadable");
+    expect(errorSkipKind({ kind: "connection_lost", message: "x" })).toBe(
+      "connection_lost",
+    );
+    // Text that names a kind picks nothing.
+    expect(errorSkipKind(new Error("no active guitar amp in scene"))).toBe(
+      "other",
+    );
+    expect(errorSkipKind("preset_unreadable")).toBe("other");
+  });
+
+  it("folds the connect kinds into other: no leveling failure is one", () => {
+    for (const k of ["not_connected", "busy", "not_ready"] as const)
+      expect(errorSkipKind(new CommandError("level_preset", "x", k))).toBe(
+        "other",
+      );
+  });
+});
+
+describe("errorReampStillOn", () => {
+  it("is true only for a rejection that says so", () => {
+    expect(
+      errorReampStillOn(
+        new CommandError("level_preset", "x", "no_signal", true),
+      ),
+    ).toBe(true);
+    expect(
+      errorReampStillOn({ kind: "other", message: "x", reampStillOn: true }),
+    ).toBe(true);
+    expect(errorReampStillOn(new CommandError("level_preset", "x"))).toBe(
+      false,
+    );
+    expect(errorReampStillOn({ reampStillOn: "yes" })).toBe(false);
+    expect(errorReampStillOn("Re-amp may still be on.")).toBe(false);
   });
 });

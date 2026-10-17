@@ -109,19 +109,17 @@ export function InlineEdit({
         variant="bare"
         aria-label={commitLabel}
         onClick={commit}
-        title={commitLabel}
         style={{ display: "flex" }}
       >
-        <Icon name="check" size={14} stroke={t.accentDeep} />
+        <Icon name="check" size={14} stroke={t.link} strokeWidth={2} />
       </Button>
       <Button
         variant="bare"
         aria-label="Cancel"
         onClick={cancel}
-        title="Cancel"
         style={{ display: "flex" }}
       >
-        <Icon name="x" size={13} stroke={t.faint} />
+        <Icon name="x" size={13} stroke={t.textSecondary} strokeWidth={2} />
       </Button>
     </div>
   );

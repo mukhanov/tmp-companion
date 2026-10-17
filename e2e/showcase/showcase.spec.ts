@@ -1,4 +1,5 @@
 import { test, expect } from "../fixtures/test";
+import { runDoctorCheck } from "../fixtures/scenario";
 import { fileURLToPath } from "node:url";
 
 // Marketing-screenshot tour (NOT a gate): drives the REAL React UI against the curated,
@@ -77,7 +78,7 @@ test.describe("Marketing screenshots", () => {
 
     await page.goto("/");
     await page.getByRole("button", { name: /backed up/i }).click(); // startup disclaimer
-    await expect(page.getByText(/connected · \d+\.\d+/)).toBeVisible({
+    await expect(page.getByText(/Connected · firmware \d+\.\d+/)).toBeVisible({
       timeout: 30_000,
     });
 
@@ -92,13 +93,13 @@ test.describe("Marketing screenshots", () => {
     ).toBeVisible();
     await grab("level");
 
-    // ── Copy: pick a reference + two targets, place the blocks, wait for the per-target
+    // ── Copy: pick the source + two targets, choose blocks, wait for the per-target
     // signal paths to render their tiles.
     await page.getByRole("button", { name: "Copy", exact: true }).click();
     await page.getByText("Stadium Lead", { exact: true }).first().click();
     await page.getByText("Brit Combo 65", { exact: true }).last().click();
     await page.getByText("Worship Swell", { exact: true }).last().click();
-    const place = page.getByRole("button", { name: /Place the blocks/i });
+    const place = page.getByRole("button", { name: "Choose blocks" });
     await expect(place).toBeEnabled({ timeout: 60_000 }); // backup scan settles
     await place.click();
     await expect(
@@ -120,7 +121,7 @@ test.describe("Marketing screenshots", () => {
     await expect(page.getByPlaceholder(/Search a model/i)).toBeVisible({
       timeout: 30_000,
     });
-    await expect(page.locator('[title*="—"]').first()).toBeVisible(); // a model card
+    await expect(page.locator("[data-model]").first()).toBeVisible(); // a model tile
     await grab("catalog");
 
     // ── Doctor: check three PLAIN presets (Base only). The backend injects curated
@@ -131,19 +132,20 @@ test.describe("Marketing screenshots", () => {
     const filter = page.getByPlaceholder(/Filter by name or slot/i);
     for (const name of ["Scooped Verse", "Tweed Warm", "Direct Acoustic"]) {
       await filter.fill(name);
-      await page.getByTitle("Select preset to check").first().click();
+      await page
+        .getByRole("checkbox", { name: `Choose ${name}`, exact: true })
+        .click();
     }
     await filter.fill("");
-    await page.getByRole("button", { name: /Check 3 sounds/ }).click();
-    await page.getByRole("button", { name: /Run check on 3 sounds/ }).click();
-    // The run auto-advances to Results on a natural finish (fake capture is instant).
-    // Capture the COLLAPSED results — the full list of diagnoses as chips across the
-    // three cards. Wait on a chip from the first and last card so the list is painted.
-    await expect(page.getByText(/presets? need a look/).first()).toBeVisible({
-      timeout: 120_000,
-    });
-    await expect(page.getByText("Gets lost in the mix").first()).toBeVisible();
-    await expect(page.getByText("Harsh").first()).toBeVisible();
+    await runDoctorCheck(page);
+    // The check moves on to Results by itself (the fake capture is instant). Capture the
+    // results with the worst sound open — the findings listed worst first across the three
+    // presets. Wait on a finding from the first and last preset so the list is painted.
+    await expect(
+      page.getByRole("heading", { name: /sounds? needs? a look/ }),
+    ).toBeVisible({ timeout: 120_000 });
+    await expect(page.getByText(/Gets lost in the mix/).first()).toBeVisible();
+    await expect(page.getByText(/Harsh/).first()).toBeVisible();
     await grab("doctor");
 
     // ── Frame pass: composite each captured tab into a floating macOS window. Done last

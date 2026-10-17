@@ -6,7 +6,6 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import type { LevelResult } from "../lib/types";
 import type { RunItem } from "../views/level/leveling";
 import {
   applyPatches,
@@ -19,7 +18,16 @@ import {
   type EngineStep,
   type LevelOutcomeFields,
 } from "../views/level/runEngine";
-import { makeFootswitchLevelResult, makeLevelResult } from "./commandMocks";
+import {
+  buildSummary,
+  SUMMARY_TEXT,
+  type SummaryContext,
+} from "../views/level/summaryModel";
+import {
+  makeBatchRun,
+  makeFootswitchLevelResult,
+  makeLevelResult,
+} from "./commandMocks";
 
 const row = (key: string, over: Partial<RunItem> = {}): RunItem => ({
   key,
@@ -28,7 +36,6 @@ const row = (key: string, over: Partial<RunItem> = {}): RunItem => ({
   isBase: false,
   sceneSlot: null,
   sceneName: key,
-  tag: null,
   instId: "",
   targetName: "Rhythm",
   status: "queued",
@@ -61,6 +68,17 @@ const outcome = (
   clamp_reason: null,
   verify_lufs: -20,
   predicted_lufs: -21,
+  ...over,
+});
+
+const summaryCtx = (over: Partial<SummaryContext> = {}): SummaryContext => ({
+  stopped: false,
+  reampStillOn: false,
+  targetLufsByName: () => -26,
+  sceneNamesOf: () => [],
+  enablingScenesOf: () => null,
+  sceneOverrides: {},
+  hookKeyOf: (it) => it.key,
   ...over,
 });
 
@@ -138,15 +156,17 @@ function fakeDeps(over: Partial<EngineDeps> = {}): EngineDeps {
             status: "active",
             result: null,
             message: "measuring",
+            skipKind: null,
           });
           onResult({
             sceneSlot: job.sceneSlot,
             status: "done",
             result: makeLevelResult({ verify_lufs: job.targetLufs }),
             message: null,
+            skipKind: null,
           });
         }
-        return Promise.resolve([]);
+        return Promise.resolve(makeBatchRun());
       },
     ),
     levelFootswitchesApply: vi.fn<EngineDeps["levelFootswitchesApply"]>(
@@ -157,8 +177,9 @@ function fakeDeps(over: Partial<EngineDeps> = {}): EngineDeps {
             status: "done",
             result: makeFootswitchLevelResult({ switch: job.switch }),
             message: null,
+            skipKind: null,
           });
-        return Promise.resolve([]);
+        return Promise.resolve(makeBatchRun());
       },
     ),
     isCancelled: () => false,
@@ -178,7 +199,7 @@ function fakeDeps(over: Partial<EngineDeps> = {}): EngineDeps {
       ],
     ]),
     blocksByIndex: new Map(),
-    rebalance: false,
+    rebalance: new Set(),
     ...over,
   };
 }
@@ -193,7 +214,7 @@ async function drive(items: RunItem[], deps: EngineDeps) {
     items.map((it) => Object.freeze(it)),
   );
   published.push({ rows, copy: JSON.stringify(rows) });
-  await runEngine(rows, deps, (step) => {
+  const verdict = await runEngine(rows, deps, (step) => {
     steps.push(step);
     rows = Object.freeze(
       applyPatches(rows, step.patches).map((it) => Object.freeze(it)),
@@ -201,7 +222,7 @@ async function drive(items: RunItem[], deps: EngineDeps) {
     published.push({ rows, copy: JSON.stringify(rows) });
   });
   for (const p of published) expect(JSON.stringify(p.rows)).toBe(p.copy);
-  return { steps, rows };
+  return { steps, rows, verdict };
 }
 
 describe("runEngine", () => {
@@ -242,6 +263,32 @@ describe("runEngine", () => {
     expect(idx).toEqual([...idx].sort((a, b) => a - b));
   });
 
+  // The Summary's Try again: a scene tried again without its preset's
+  // main sound still anchors its batch on that main sound, at the main sound's target,
+  // exactly as the first run's batch did; a run's own base row wins over an earlier one.
+  it("anchors a Try again scene batch on the main sound an earlier run carried", async () => {
+    const earlier = base("b", { targetName: "Lead", status: "result" });
+    const deps = fakeDeps({ earlierBaseRows: [earlier] });
+    await drive([scene("s1", 1)], deps);
+    expect(deps.levelPreset).not.toHaveBeenCalled();
+    const [args] = vi.mocked(deps.levelScenesApplyBatched).mock.calls[0];
+    expect(args.baseAnchor).toEqual({ targetLufs: -20 });
+
+    const own = fakeDeps({ earlierBaseRows: [earlier] });
+    await drive([base("b"), scene("s1", 1)], own);
+    expect(
+      vi.mocked(own.levelScenesApplyBatched).mock.calls[0][0].baseAnchor,
+    ).toEqual({ targetLufs: -26 });
+
+    const other = fakeDeps({
+      earlierBaseRows: [base("x", { slot: 5, targetName: "Lead" })],
+    });
+    await drive([scene("s1", 1)], other);
+    expect(
+      vi.mocked(other.levelScenesApplyBatched).mock.calls[0][0],
+    ).not.toHaveProperty("baseAnchor");
+  });
+
   it("keeps at most one row active at every step", async () => {
     const items = [
       scene("s1", 1),
@@ -259,12 +306,22 @@ describe("runEngine", () => {
     }
   });
 
-  it("passes the run's rebalance choice to the scene call", async () => {
-    const deps = fakeDeps({ rebalance: true });
-    await drive([scene("s1", 1)], deps);
-    expect(
-      vi.mocked(deps.levelScenesApplyBatched).mock.calls[0][0].rebalance,
-    ).toBe(true);
+  it("passes each preset's own rebalance choice to its scene call", async () => {
+    // "Balance its two amps first" is per preset: preset 0 ticked it, preset 1 did not.
+    const amp = { groupId: "G", nodeId: "amp", parameterId: "outputLevel" };
+    const deps = fakeDeps({
+      rebalance: new Set([0]),
+      ampCandidates: new Map([
+        [0, [{ ...amp, value: 0.5 }]],
+        [1, [{ ...amp, value: 0.5 }]],
+      ]),
+    });
+    await drive([scene("s1", 1), scene("t1", 1, { slot: 1 })], deps);
+    const calls = vi.mocked(deps.levelScenesApplyBatched).mock.calls;
+    expect(calls.map(([job]) => [job.slot, job.rebalance])).toEqual([
+      [0, true],
+      [1, false],
+    ]);
   });
 
   it("skips a failed call's rows with its reason and carries on", async () => {
@@ -289,7 +346,7 @@ describe("runEngine", () => {
       levelScenesApplyBatched: vi.fn<EngineDeps["levelScenesApplyBatched"]>(
         () => {
           cancelled = true; // Stop pressed while the batch is in flight
-          return Promise.resolve([]);
+          return Promise.resolve(makeBatchRun());
         },
       ),
     });
@@ -298,7 +355,6 @@ describe("runEngine", () => {
       deps,
     );
     expect(rows.map((r) => r.status)).toEqual(["queued", "queued"]);
-    expect(rows[0].activeMessage).toBeNull();
     expect(deps.levelPreset).not.toHaveBeenCalled();
   });
 
@@ -312,11 +368,13 @@ describe("runEngine", () => {
               status: "done",
               result: makeLevelResult(),
               message: null,
+              skipKind: null,
             });
-          const warned: LevelResult = makeLevelResult({
-            reamp_warning: "re-amp may still be on",
-          });
-          return Promise.resolve([warned]);
+          return Promise.resolve(
+            makeBatchRun([makeLevelResult()], {
+              reampWarning: "re-amp may still be on",
+            }),
+          );
         },
       ),
     });
@@ -324,6 +382,402 @@ describe("runEngine", () => {
     expect(rows.map((r) => r.reampWarning)).toEqual([
       "re-amp may still be on",
       "re-amp may still be on",
+    ]);
+  });
+
+  // The screen reads the TYPED re-amp flag, never the warning text.
+  it("stamps the typed re-amp flag on every row of a batch, from its return or its error", async () => {
+    const deps = fakeDeps({
+      levelFootswitchesApply: vi.fn<EngineDeps["levelFootswitchesApply"]>(
+        (args, onResult) => {
+          for (const job of args.jobs)
+            onResult({
+              switch: job.switch,
+              status: "done",
+              result: makeFootswitchLevelResult({ switch: job.switch }),
+              message: null,
+              skipKind: null,
+            });
+          return Promise.resolve(
+            makeBatchRun([makeFootswitchLevelResult({ switch: 0 })], {
+              reampStillOn: true,
+            }),
+          );
+        },
+      ),
+      levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+        Promise.reject(
+          Object.assign(new Error("no signal captured"), {
+            kind: "no_signal",
+            reampStillOn: true,
+          }),
+        ),
+      ),
+    });
+    const { rows } = await drive(
+      [footswitch("f0", 0), footswitch("f1", 1), base("b", { slot: 1 })],
+      deps,
+    );
+    expect(rows.map((r) => r.reampStillOn)).toEqual([true, true, true]);
+    expect(rows[2]).toMatchObject({
+      outcome: "skipped",
+      skipKind: "no_signal",
+    });
+    // The text is never what decided it: no warning text was sent at all.
+    expect(rows.map((r) => r.reampWarning)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  // A target deleted in Settings has no loudness: the run refuses its sounds before
+  // anything reaches the unit, with a typed kind, and never levels them at a stand-in.
+  it("refuses a sound whose target is not configured, before any command", async () => {
+    const deps = fakeDeps({
+      targetLufsByName: (name) =>
+        name === "Gone" || name === "" ? null : name === "Lead" ? -20 : -26,
+    });
+    const { rows, verdict } = await drive(
+      [
+        base("b", { targetName: "Gone" }),
+        scene("s1", 1),
+        scene("s2", 2, { targetName: "" }),
+        footswitch("f0", 0, { targetName: "Gone" }),
+      ],
+      deps,
+    );
+    expect(rows.map((r) => [r.key, r.outcome, r.skipKind ?? null])).toEqual([
+      ["b", "skipped", "no_target"],
+      ["s1", "done", null],
+      ["s2", "skipped", "no_target"],
+      ["f0", "skipped", "no_target"],
+    ]);
+    expect(deps.levelPreset).not.toHaveBeenCalled();
+    expect(deps.levelFootswitchesApply).not.toHaveBeenCalled();
+    // The scene batch carries only the sound it can level, at its own target, and no
+    // anchor for a main sound that has none.
+    const [args] = vi.mocked(deps.levelScenesApplyBatched).mock.calls[0];
+    expect(args.jobs.map((j) => [j.sceneSlot, j.targetLufs])).toEqual([
+      [1, -26],
+    ]);
+    expect(args.baseAnchor).toBeUndefined();
+    expect(rows[1].targetLufs).toBe(-26);
+    expect(verdict.reampStillOn).toBe(false);
+  });
+
+  it("knows nothing new about re-amp when no command ran", async () => {
+    const deps = fakeDeps({ targetLufsByName: () => null });
+    const { verdict } = await drive([base("b"), scene("s1", 1)], deps);
+    expect(deps.levelPreset).not.toHaveBeenCalled();
+    expect(deps.levelScenesApplyBatched).not.toHaveBeenCalled();
+    expect(verdict.reampStillOn).toBeNull();
+  });
+
+  // A command that returned read re-amp back; a rejection without the flag may have been
+  // refused before anything engaged, so it reads nothing.
+  it("takes a rejection's still-on, and nothing from a rejection without it", async () => {
+    const rejecting = (reampStillOn: boolean) =>
+      fakeDeps({
+        levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+          Promise.reject(
+            Object.assign(new Error("refused"), {
+              kind: "other",
+              reampStillOn,
+            }),
+          ),
+        ),
+      });
+    expect((await drive([base("b")], rejecting(false))).verdict).toEqual({
+      reampStillOn: null,
+    });
+    expect((await drive([base("b")], rejecting(true))).verdict).toEqual({
+      reampStillOn: true,
+    });
+    // A later command of the same run that reads it back off doesn't undo an earlier
+    // still-on.
+    const both = fakeDeps({
+      levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+        Promise.resolve(makeLevelResult({ reamp_still_on: true })),
+      ),
+    });
+    expect(
+      (await drive([base("b"), scene("s1", 1)], both)).verdict.reampStillOn,
+    ).toBe(true);
+  });
+
+  it("leaves the re-amp flag unset when the run-end OFF read back", async () => {
+    const { rows } = await drive([base("b"), scene("s1", 1)], fakeDeps());
+    expect(rows[0].reampStillOn).toBe(false);
+    expect(rows[1].reampStillOn).toBeUndefined();
+  });
+
+  // A batch can return no rows at all and still have left re-amp on: the verdict comes back
+  // beside the rows, so the Summary still says to restart the unit.
+  it("stamps the re-amp flag from a scene batch stopped before any row finished", async () => {
+    let cancelled = false;
+    const deps = fakeDeps({
+      isCancelled: () => cancelled,
+      levelScenesApplyBatched: vi.fn<EngineDeps["levelScenesApplyBatched"]>(
+        (args, onResult) => {
+          // The ceiling prepass: every row goes active, then the Stop lands.
+          for (const job of args.jobs)
+            onResult({
+              sceneSlot: job.sceneSlot,
+              status: "active",
+              result: null,
+              message: "measuring",
+              skipKind: null,
+            });
+          cancelled = true;
+          return Promise.resolve(makeBatchRun([], { reampStillOn: true }));
+        },
+      ),
+    });
+    const { rows, verdict } = await drive(
+      [scene("s1", 1), scene("s2", 2)],
+      deps,
+    );
+    expect(rows.map((r) => [r.status, r.reampStillOn])).toEqual([
+      ["queued", true],
+      ["queued", true],
+    ]);
+    expect(verdict.reampStillOn).toBe(true);
+    expect(
+      buildSummary(
+        rows,
+        summaryCtx({
+          stopped: true,
+          reampStillOn: verdict.reampStillOn === true,
+        }),
+      ).notice,
+    ).toEqual({
+      tone: "caution",
+      title: null,
+      text: SUMMARY_TEXT.reampStillOn,
+    });
+  });
+
+  it("stamps the re-amp flag from a footswitch batch with no solved switch", async () => {
+    const deps = fakeDeps({
+      levelFootswitchesApply: vi.fn<EngineDeps["levelFootswitchesApply"]>(
+        (args, onResult) => {
+          for (const job of args.jobs)
+            onResult({
+              switch: job.switch,
+              status: "error",
+              result: null,
+              message: "no signal captured",
+              skipKind: "no_signal",
+            });
+          return Promise.resolve(makeBatchRun([], { reampStillOn: true }));
+        },
+      ),
+    });
+    const { rows, verdict } = await drive(
+      [footswitch("f0", 0), footswitch("f1", 1)],
+      deps,
+    );
+    expect(rows.map((r) => [r.outcome, r.skipKind, r.reampStillOn])).toEqual([
+      ["skipped", "no_signal", true],
+      ["skipped", "no_signal", true],
+    ]);
+    expect(verdict.reampStillOn).toBe(true);
+    expect(
+      buildSummary(
+        rows,
+        summaryCtx({ reampStillOn: verdict.reampStillOn === true }),
+      ).notice?.text,
+    ).toBe(SUMMARY_TEXT.reampStillOn);
+  });
+
+  // The Summary must hear when a save didn't hold. The save's verdict is only known once
+  // the command returns — the streamed rows predate the save — so it is merged from the
+  // RETURNED rows by identity.
+  it("merges the save's verdict from the returned rows onto the rows they name", async () => {
+    const deps = fakeDeps({
+      levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+        Promise.resolve(makeLevelResult({ persist_mismatch: true })),
+      ),
+      levelScenesApplyBatched: vi.fn<EngineDeps["levelScenesApplyBatched"]>(
+        (args, onResult) => {
+          for (const job of args.jobs)
+            onResult({
+              sceneSlot: job.sceneSlot,
+              status: "done",
+              result: makeLevelResult({ scene_slot: job.sceneSlot }),
+              message: null,
+              skipKind: null,
+            });
+          // Returned out of order: identity, never position, picks the row.
+          return Promise.resolve(
+            makeBatchRun([
+              makeLevelResult({ scene_slot: 2, persist_mismatch: true }),
+              makeLevelResult({ scene_slot: 1, persist_mismatch: false }),
+            ]),
+          );
+        },
+      ),
+      levelFootswitchesApply: vi.fn<EngineDeps["levelFootswitchesApply"]>(
+        (args, onResult) => {
+          for (const job of args.jobs)
+            onResult({
+              switch: job.switch,
+              status: "done",
+              result: makeFootswitchLevelResult({ switch: job.switch }),
+              message: null,
+              skipKind: null,
+            });
+          return Promise.resolve(
+            makeBatchRun([
+              makeFootswitchLevelResult({ switch: 1, persist_mismatch: true }),
+            ]),
+          );
+        },
+      ),
+    });
+    const { rows } = await drive(
+      [
+        base("b"),
+        scene("s1", 1),
+        scene("s2", 2),
+        footswitch("f0", 0),
+        footswitch("f1", 1),
+      ],
+      deps,
+    );
+    expect(rows.map((r) => [r.key, r.outcome, r.persistMismatch])).toEqual([
+      ["b", "done", true],
+      ["s1", "done", false],
+      ["s2", "done", true],
+      // f0's save was never verified (no returned verdict): nothing is claimed.
+      ["f0", "done", undefined],
+      ["f1", "done", true],
+    ]);
+  });
+
+  it("reports a stopped batch's save verdict on the rows it leveled", async () => {
+    let cancelled = false;
+    const deps = fakeDeps({
+      isCancelled: () => cancelled,
+      levelScenesApplyBatched: vi.fn<EngineDeps["levelScenesApplyBatched"]>(
+        (_args, onResult) => {
+          onResult({
+            sceneSlot: 1,
+            status: "done",
+            result: makeLevelResult({ scene_slot: 1 }),
+            message: null,
+            skipKind: null,
+          });
+          cancelled = true; // Stop pressed; the batch still saves what it leveled
+          return Promise.resolve(
+            makeBatchRun([
+              makeLevelResult({ scene_slot: 1, persist_mismatch: true }),
+            ]),
+          );
+        },
+      ),
+    });
+    const { rows } = await drive([scene("s1", 1), scene("s2", 2)], deps);
+    expect(rows.map((r) => [r.status, r.persistMismatch])).toEqual([
+      ["result", true],
+      ["queued", undefined],
+    ]);
+  });
+
+  // The screen picks a skipped row's words by kind; the text is for the log only.
+  it("gives every skipped row a typed kind: the streamed one, the error's, or other", async () => {
+    const deps = fakeDeps({
+      levelScenesApplyBatched: vi.fn<EngineDeps["levelScenesApplyBatched"]>(
+        (args, onResult) => {
+          onResult({
+            sceneSlot: args.jobs[0].sceneSlot,
+            status: "error",
+            result: null,
+            message: "no active guitar amp in scene",
+            skipKind: "no_active_amp",
+          });
+          return Promise.reject(
+            Object.assign(new Error("scene 2 could not be read"), {
+              kind: "preset_unreadable",
+            }),
+          );
+        },
+      ),
+      levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+        Promise.reject(new Error("no active amp")),
+      ),
+    });
+    const { rows } = await drive(
+      [base("b", { slot: 1 }), scene("s1", 1), scene("s2", 2)],
+      deps,
+    );
+    expect(rows.map((r) => [r.key, r.outcome, r.skipKind])).toEqual([
+      // Untyped text never picks a kind, whatever it says.
+      ["b", "skipped", "other"],
+      ["s1", "skipped", "no_active_amp"],
+      ["s2", "skipped", "preset_unreadable"],
+    ]);
+    expect(rows[1].skipReason).toBe("no active guitar amp in scene");
+  });
+
+  it("names a client-side skip's kind: no amp to drive, or a preset it couldn't read", async () => {
+    const noAmp = await drive(
+      [scene("s1", 1)],
+      fakeDeps({ ampCandidates: new Map([[0, []]]) }),
+    );
+    expect(noAmp.rows[0]).toMatchObject({
+      outcome: "skipped",
+      skipKind: "no_active_amp",
+    });
+    const unread = await drive(
+      [scene("s1", 1)],
+      fakeDeps({
+        ampCandidates: new Map(),
+        listLevelBlocks: vi.fn<EngineDeps["listLevelBlocks"]>(() =>
+          Promise.reject(new Error("read timed out")),
+        ),
+      }),
+    );
+    expect(unread.rows[0]).toMatchObject({
+      outcome: "skipped",
+      skipKind: "preset_unreadable",
+      skipReason: "read timed out",
+    });
+  });
+
+  it("carries the result's clamp cause onto the row", async () => {
+    const deps = fakeDeps({
+      levelFootswitchesApply: vi.fn<EngineDeps["levelFootswitchesApply"]>(
+        (args, onResult) => {
+          onResult({
+            switch: args.jobs[0].switch,
+            status: "done",
+            result: makeFootswitchLevelResult({
+              clamped: true,
+              wet_floor: true,
+              clamp_kind: "wet_floor",
+            }),
+            message: null,
+            skipKind: null,
+          });
+          return Promise.resolve(makeBatchRun());
+        },
+      ),
+      levelPreset: vi.fn<EngineDeps["levelPreset"]>(() =>
+        Promise.resolve(
+          makeLevelResult({ clamped: true, clamp_kind: "scene_ceiling" }),
+        ),
+      ),
+    });
+    const { rows } = await drive(
+      [base("b", { slot: 1 }), footswitch("f0", 0), scene("s1", 1)],
+      deps,
+    );
+    expect(rows.map((r) => [r.key, r.outcome, r.clampKind])).toEqual([
+      ["b", "clamped", "scene_ceiling"],
+      ["f0", "clamped", "wet_floor"],
+      ["s1", "done", null],
     ]);
   });
 });

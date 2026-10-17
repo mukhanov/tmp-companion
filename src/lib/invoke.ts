@@ -19,11 +19,16 @@ import type {
   FootswitchLevelApplyArgs,
   SceneLevelApplyArgs,
 } from "./commands";
-import { errorKind, isConnectGateKind } from "./connectError";
+import {
+  errorKind,
+  errorReampStillOn,
+  isConnectGateKind,
+} from "./connectError";
 import { errMsg } from "./format";
 import { logError } from "./log";
 import type {
   AppInfo,
+  BatchLevelRun,
   CommandErrorKind,
   PresetEntry,
   LevelJob,
@@ -52,9 +57,6 @@ import type {
   DoctorInputArg,
   DoctorProgressItem,
   DoctorCheckResult,
-  DoctorApplyJob,
-  DoctorApplyResult,
-  DoctorOp,
   SupportBundleResult,
 } from "./types";
 
@@ -67,24 +69,48 @@ export { isTauri } from "./log";
  * A rejected backend command. Most commands return `Result<_, String>`, so a
  * rejection reaches JS as a bare STRING — and `e instanceof Error ? e.message :
  * "generic text"` at a call site silently threw the backend's real reason away.
- * A command migrated to the typed error (`error::AppError`, today `connect_device`)
- * rejects with `{ kind, message }` instead. `invoke` normalizes BOTH shapes into
+ * A command migrated to the typed error (`error::AppError`: `connect_device` and the
+ * three leveling commands) rejects with `{ kind, message }` instead — the leveling
+ * ones add `reampStillOn`. `invoke` normalizes BOTH shapes into
  * this one `Error` subclass at the seam, so a `catch` always gets an `Error` whose
  * `message` is the backend text and whose `kind` says what failed (`"other"` for a
  * bare string). Branch on `kind`, never on the message text.
  */
 export class CommandError extends Error {
-  /** The backend command that rejected (e.g. `doctor_apply`). */
+  /** The backend command that rejected (e.g. `copy_apply`). */
   readonly cmd: string;
-  /** What failed, for a caller that presents kinds differently. */
+  /** What failed, for a caller that presents kinds differently. A leveling command's
+   *  kind is a `SkipKind` (why the run, or the sound, was not leveled). */
   readonly kind: CommandErrorKind;
+  /** A failed leveling command whose run-end re-amp OFF never read back OFF: the unit's
+   *  guitar input may still be muted. `false` for every other rejection. */
+  readonly reampStillOn: boolean;
 
-  constructor(cmd: string, message: string, kind: CommandErrorKind = "other") {
+  constructor(
+    cmd: string,
+    message: string,
+    kind: CommandErrorKind = "other",
+    reampStillOn = false,
+  ) {
     super(message);
     this.name = "CommandError";
     this.cmd = cmd;
     this.kind = kind;
+    this.reampStillOn = reampStillOn;
   }
+}
+
+/**
+ * Log a caught failure unless it is a {@link CommandError}, which `invokeCommand` has
+ * already logged. The UI never prints a failure's text (it says what happened in plain
+ * words), so a failure thrown by the app's own code around a command — post-processing a
+ * reply, say — would otherwise reach neither the screen nor the log, and so never a bug
+ * report. `where` names the caller in the log line.
+ */
+export function logUnlessCommandError(where: string, e: unknown): void {
+  if (e instanceof CommandError) return;
+  const stack = e instanceof Error && e.stack ? `\n${e.stack}` : "";
+  logError(`${where} failed: ${errMsg(e)}${stack}`);
 }
 
 /**
@@ -108,7 +134,7 @@ function invokeCommand<K extends CommandName>(
     // so the connect gate's kinds (no unit / unit still booting) stay quiet.
     if (cmd !== "connect_device" || !isConnectGateKind(kind))
       logError(`invoke(${cmd}) failed: ${message}`);
-    throw new CommandError(cmd, message, kind);
+    throw new CommandError(cmd, message, kind, errorReampStillOn(e));
   });
 }
 
@@ -146,11 +172,12 @@ export const cancelPresetLeveling = (): Promise<void> =>
 
 /** Batched APPLY path. One backend command levels all selected scenes and streams row
  * progress over a Tauri channel. Each job carries its OWN per-scene target, so a
- * mixed-target preset still levels in ONE batch. */
+ * mixed-target preset still levels in ONE batch. Resolves with the leveled rows and the
+ * run-end re-amp verdict beside them (`BatchLevelRun`). */
 export const levelScenesApplyBatched = (
   args: SceneLevelApplyArgs,
   onResult: (item: SceneLevelProgressItem) => void,
-): Promise<LevelResult[]> => {
+): Promise<BatchLevelRun<LevelResult>> => {
   const channel = new Channel<SceneLevelProgressItem>();
   channel.onmessage = onResult;
   return invokeCommand("level_scenes_apply_batched", {
@@ -186,11 +213,11 @@ export const listFootswitchSceneContexts = (
 
 /** Level one or more block-acting footswitches' engaged states for preset `slot`,
  * streaming a progress row per switch. Each job picks a switch + the block param to
- * solve. Mirrors `levelScenesApplyBatched`. */
+ * solve. Mirrors `levelScenesApplyBatched`, return shape included. */
 export const levelFootswitchesApply = (
   args: FootswitchLevelApplyArgs,
   onResult: (item: FootswitchLevelProgressItem) => void,
-): Promise<FootswitchLevelResult[]> => {
+): Promise<BatchLevelRun<FootswitchLevelResult>> => {
   const channel = new Channel<FootswitchLevelProgressItem>();
   channel.onmessage = onResult;
   return invokeCommand("level_footswitches_apply", {
@@ -230,32 +257,6 @@ export const doctorCheck = (
 export const cancelDoctorCheck = (): Promise<void> =>
   invokeCommand("cancel_doctor_check");
 
-/** Apply one prescription's ops LIVE (no save): captures the stored state
- * (before clip), applies the edits to the device's edit buffer, captures again
- * without reloading (after clip). Revert with `doctorDiscard`; persist with
- * `doctorSave`. On a failed structural edit the preset is auto-restored. */
-export const doctorApply = (job: DoctorApplyJob): Promise<DoctorApplyResult> =>
-  invokeCommand("doctor_apply", { job });
-
-/** Persist an applied prescription. Structurally safe: the backend rebuilds
- * SAVED+`ops` from scratch (reload the stored preset, recall `scene`, re-apply
- * `ops` on a fresh confirmed session, save) rather than persisting whatever the
- * A/B left in the live edit buffer — so `ops`/`scene` must be the SAME the card
- * applied (the diagnosed sound's own scene, `null` for base — see `doctorApply`'s
- * `job.scene`). Only offered behind the backup acknowledgment. */
-export const doctorSave = (
-  listIndex: number,
-  expectName: string,
-  scene: number | null,
-  ops: DoctorOp[],
-): Promise<void> =>
-  invokeCommand("doctor_save", { listIndex, expectName, scene, ops });
-
-/** Discard an applied-but-unsaved prescription by reloading the stored preset
- * (the device's edit buffer is dropped on load — the established revert). */
-export const doctorDiscard = (listIndex: number): Promise<void> =>
-  invokeCommand("doctor_discard", { listIndex });
-
 // ─── Instrument profiles + persisted store (Settings window) ──────────────────
 
 /** Settings — profiles + per-slot assignment + named loudness targets. */
@@ -281,6 +282,15 @@ export const setPlaybackChannels = (
 /** Settings — persist the auto-install-updates preference. */
 export const setAutoInstallUpdates = (on: boolean): Promise<void> =>
   invokeCommand("set_auto_install_updates", { on });
+
+/** Remember the instrument chosen for one preset (0-based list index) in the app's own
+ * store on this computer — never on the unit. `profileId` is a profile id or
+ * `NO_INSTRUMENT` ("none"), an explicit "None" that is saved and counts as chosen; a
+ * later choice overwrites it. Read back as `Store.profile_by_slot`. */
+export const setPresetInstrument = (
+  slot: number,
+  profileId: string,
+): Promise<void> => invokeCommand("set_preset_instrument", { slot, profileId });
 
 /** Settings — Tier-2 calibration: capture dry instrument for `secs` (clamped
  * 2..30), store K-weighted LUFS, return it + clip/stimulus-ceiling caveats.

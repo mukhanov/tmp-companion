@@ -84,6 +84,12 @@ interface LevelResult {
    *  read the run's own measured ceiling instead of trusting a fixture number. */
   constant_c: number;
 }
+/** A batched leveling command's return: the rows, with the run-end re-amp verdict beside them. */
+interface BatchLevelRun<R> {
+  rows: R[];
+  reampStillOn: boolean;
+}
+
 interface FootswitchLevelResult {
   switch: number;
   saved: boolean;
@@ -269,7 +275,7 @@ regression has widened BOOST's trigger and would start moving a fader nothing as
         footswitch: 1,
       });
 
-    const fs410 = (await invoke(
+    const fs410Run = (await invoke(
       page,
       "level_footswitches_apply",
       {
@@ -290,7 +296,8 @@ regression has widened BOOST's trigger and would start moving a fader nothing as
         onResult: "__CHANNEL__:1",
       },
       T * 2,
-    )) as FootswitchLevelResult[];
+    )) as BatchLevelRun<FootswitchLevelResult>;
+    const fs410 = fs410Run.rows;
     expectEverySwitch(fs410, [{ switch: 1 }]);
     assertFsSolved(fs410, () => fsTargetUsed410);
 
@@ -335,7 +342,7 @@ regression has widened BOOST's trigger and would start moving a fader nothing as
     }
     const sceneTarget410 = Math.min(...asIsScenes) - 2.0;
 
-    const scenes = (await invoke(
+    const scenesRun = (await invoke(
       page,
       "level_scenes_apply_batched",
       {
@@ -353,7 +360,8 @@ regression has widened BOOST's trigger and would start moving a fader nothing as
         onResult: "__CHANNEL__:1",
       },
       T * 3,
-    )) as LevelResult[];
+    )) as BatchLevelRun<LevelResult>;
+    const scenes = scenesRun.rows;
     // Row identity comes off `scene_slot`, not array index (a mid-batch failure shortens
     // this array).
     expect(
@@ -563,27 +571,17 @@ preset's graph if the Twin is absent (a cross-slot load that did not take)`,
       );
     }
 
-    // The UI journey itself: the wizard end to end, proving the base_boost summary-row
-    // disclosure (SummaryPage.tsx's `baseBoostSentence`) renders in the real app, not just on
-    // the wire. `Rhythm` = -23 LUFS (profiles.rs::default_targets), matching BASE_TARGET_405.
-    // Both forms of `baseBoostSentence`: "raised" (applied) and "would raise" (not applied).
-    const boostSentence = page.getByText(
-      /Turned this preset up as far as it goes and (raised|would raise) the amp/,
+    // The UI journey itself: the flow end to end, proving the base boost's Summary
+    // sentence renders in the real app, not just on the wire. `Rhythm` = -23 LUFS
+    // (profiles.rs::default_targets), matching BASE_TARGET_405. Look B states the boost in
+    // words only, and only once it was applied; the row's `data-base-boost` hook says
+    // whether the run applied it or only planned it (`summaryModel.ts`).
+    const boostRow = page.locator(
+      `[data-summary-row="p${String(PRESET24.slot)}"][data-base-boost]`,
     );
     const runAndReadBoost = async (): Promise<boolean> => {
       await runBaseLevel(page, [{ preset: PRESET24, label: "Rhythm" }]);
-      // `useGroupOpen`'s `badSlots` auto-open list is built from non-"done" rows only
-      // (SummaryPage.tsx) — an all-good run's preset group starts COLLAPSED on Summary, same
-      // as level-defaults.spec.ts's own boost-sentence test (a). Expand it before reading the
-      // row detail, or the sentence is never in the DOM to match against — but only when it
-      // is collapsed: a click on an auto-opened group would close it.
-      const group = page.locator(
-        `[data-preset-group="${String(PRESET24.slot)}"]`,
-      );
-      if ((await group.getAttribute("aria-expanded")) === "false") {
-        await group.click();
-      }
-      const shown = await boostSentence
+      const shown = await boostRow
         .waitFor({ timeout: 5_000 })
         .then(() => true)
         .catch(() => false);
@@ -591,9 +589,14 @@ preset's graph if the Twin is absent (a cross-slot load that did not take)`,
       // A boost the run planned but did not apply is a failure of its own, not a reason to
       // calibrate and run again.
       expect(
-        await boostSentence.textContent(),
-        'the base boost must be APPLIED ("raised"), not only planned ("would raise")',
-      ).toContain("raised the amp");
+        await boostRow.getAttribute("data-base-boost"),
+        "the base boost must be APPLIED, not only planned",
+      ).toBe("applied");
+      await expect(
+        boostRow.getByText(
+          "Turned the preset up as far as it goes, then raised the amp's output to reach Rhythm.",
+        ),
+      ).toBeVisible();
       return true;
     };
 
@@ -763,7 +766,7 @@ preset's graph if the Twin is absent (a cross-slot load that did not take)`,
     // 2 footswitch rows (base MUST run first — the pl-context trap 405's own fixture
     // ordering pins, e2e/fixtures/COVERAGE.md row 36) — raw invoke, the channel-streaming
     // seam (.claude/rules/e2e.md).
-    const fs = (await invoke(
+    const fsRun = (await invoke(
       page,
       "level_footswitches_apply",
       {
@@ -776,7 +779,8 @@ preset's graph if the Twin is absent (a cross-slot load that did not take)`,
         onResult: "__CHANNEL__:1",
       },
       T * 3,
-    )) as FootswitchLevelResult[];
+    )) as BatchLevelRun<FootswitchLevelResult>;
+    const fs = fsRun.rows;
     expectEverySwitch(fs, SWITCH_JOBS_405);
     assertFsSolved(fs, (r) => {
       const job = SWITCH_JOBS_405.find((j) => j.switch === r.switch);

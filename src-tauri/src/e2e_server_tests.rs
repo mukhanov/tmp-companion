@@ -156,6 +156,7 @@ fn fs_written_row(switch: u32, value: f32, method: &str) -> crate::leveller::Foo
         method: method.into(),
         persist_mismatch: None,
         reamp_warning: None,
+        reamp_still_on: false,
     }
 }
 
@@ -192,7 +193,9 @@ fn fs_batch_one(
             }
         },
         &|| false,
-    )?;
+        crate::watcher::DetachWatch::start(),
+    )?
+    .rows;
     rows.into_iter()
         .next()
         .ok_or_else(|| format!("footswitch {switch} produced no result: {errors:?}"))
@@ -1200,7 +1203,8 @@ fn bake_path_footswitch_rerun_skips_the_persist_when_already_at_target() {
                 "onResult": "__CHANNEL__:0",
             }),
         )
-        .expect("level_footswitches_apply")
+        .expect("level_footswitches_apply")["rows"]
+            .clone()
     };
 
     // ── RUN 1 ── must actually solve and persist (the non-vacuous premise run 2's skip needs).
@@ -1886,7 +1890,7 @@ fn a_truncated_swap_scene_levels_its_own_amp_not_the_base_one() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
     scene_row(&rows, Some(u64::from(SWAP_SCENE)))
         .unwrap_or_else(|| panic!("the cut scene must come back leveled, not skipped: {rows:?}"));
 
@@ -1998,7 +2002,7 @@ fn level_defaults_403_scenes_solve_and_offbranch() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array");
+    let rows = res["rows"].as_array().expect("results array");
     assert_eq!(rows.len(), 4, "one result per scene: {rows:?}");
     let offbranch: Vec<&serde_json::Value> = rows
         .iter()
@@ -2067,7 +2071,7 @@ fn level_403_with_verify_faults(verify_faults: u32) -> Vec<serde_json::Value> {
         }),
     )
     .expect("level_scenes_apply_batched");
-    res.as_array().expect("results array").clone()
+    res["rows"].as_array().expect("results array").clone()
 }
 
 /// BUG→GATE (#187): a scene whose post-write verify capture fails must never report the
@@ -2292,6 +2296,11 @@ fn offline_batched_song_saves_open_one_connection_each() {
         "create: one connection for the work: {created}"
     );
     assert_eq!(created["bpm_warning"], serde_json::Value::Null, "{created}");
+    assert_eq!(
+        created["duplicate_name"],
+        serde_json::json!(false),
+        "{created}"
+    );
     let slot = sim
         .song_names()
         .iter()
@@ -2337,12 +2346,9 @@ fn offline_batched_song_saves_open_one_connection_each() {
         }),
     )
     .expect("create_song_full (duplicate name)");
-    assert!(
-        dup["bpm_warning"]
-            .as_str()
-            .is_some_and(|w| w.contains("isn't unique")),
-        "{dup}"
-    );
+    // Reported by kind, not as warning text: the UI words it on its own.
+    assert_eq!(dup["duplicate_name"], serde_json::json!(true), "{dup}");
+    assert_eq!(dup["bpm_warning"], serde_json::Value::Null, "{dup}");
     assert_eq!(dup["members"], serde_json::Value::Null, "{dup}");
     assert_eq!(sim.song(2).unwrap(), encore_before);
 }
@@ -2626,7 +2632,7 @@ fn hiwatt_scene_leveling_never_reseeds_an_existing_overlay() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array");
+    let rows = res["rows"].as_array().expect("results array");
     assert_eq!(rows.len(), 3, "one result per scene: {rows:?}");
 
     let events = sim.events();
@@ -3300,7 +3306,7 @@ fn the_footswitch_rows_still_converge_after_a_base_boost() {
         }),
     )
     .expect("level_footswitches_apply");
-    let results = results.as_array().expect("results array");
+    let results = results["rows"].as_array().expect("results array");
     assert_eq!(results.len(), rows.len(), "{results:?}");
 
     for (row, (switch, _, _, target)) in results.iter().zip(rows.iter()) {
@@ -4147,7 +4153,7 @@ fn a_mid_batch_failure_keeps_every_surviving_scenes_identity_and_emits_its_row()
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
 
     // (a) SHORTER than the request, and self-naming. If the fixture ever stops refusing
     // that handle the length assert fails loudly rather than the test passing vacuously.
@@ -4435,7 +4441,7 @@ fn a_shared_base_scene_save_is_not_reported_lost() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
     let row = scene_row(&rows, Some(3))
         .unwrap_or_else(|| panic!("a Solo row: {rows:?}"))
         .clone();
@@ -4500,7 +4506,7 @@ fn a_batched_scene_run_persists_both_halves_of_a_landed_headroom_trade() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
     assert_eq!(
         rows.len(),
         2,
@@ -4740,7 +4746,7 @@ fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed()
         }),
     )
     .expect("a cancelled run that traded must return Ok, not an error");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
 
     assert!(
         fired.load(std::sync::atomic::Ordering::SeqCst),
@@ -4799,6 +4805,167 @@ fn a_cancel_after_a_landed_trade_returns_its_outcomes_with_the_trade_disclosed()
     );
 }
 
+/// 403's two lane amps — the backup scan's (and `list_level_blocks`') candidate pair.
+fn parallel_403_candidates() -> serde_json::Value {
+    serde_json::json!([
+        {"groupId": "G2", "nodeId": "ampA", "parameterId": "outputLevel", "value": 1.0},
+        {"groupId": "G3", "nodeId": "ampB", "parameterId": "outputLevel", "value": 1.0}
+    ])
+}
+
+/// BUG→GATE (2026-10-16): a STOP WITHOUT A TRADE RETURNS WHAT IT LEVELED,
+/// WITH THE SAVE'S VERDICT. The stopped path has always fired the batch's one save, but it
+/// came back as a bare cancel (an empty vec) and only LOGGED a failed save, so "the save
+/// didn't hold" could never reach the Summary after a Stop. Now the save is re-read on that
+/// path too and the scenes it covered come back carrying `persist_mismatch`.
+///
+/// Slot 403 (no base anchor, so no trade): the Stop fires on scene 0's own write and lands at
+/// scene 1's loop top, so scene 0 finishes and nothing after it starts.
+#[test]
+fn a_stop_without_a_trade_returns_the_saved_scenes_with_the_saves_verdict() {
+    let _serial = serial();
+    let _cancel_reset = SceneCancelReset;
+    scenario_env();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (sf, ff) = (sim.clone(), fired.clone());
+        crate::session::e2e_transport::set_factory(Box::new(move || {
+            Box::new(CancelAtSceneWrite {
+                sim: sf.clone(),
+                scene: 0,
+                fired: ff.clone(),
+            })
+        }));
+    }
+    let from = sim.events().len();
+    let (_app, webview) = batched_scene_app();
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403,
+            "jobs": (0..4).map(|s| serde_json::json!({"sceneSlot": s, "targetLufs": -23.0}))
+                .collect::<Vec<_>>(),
+            "candidates": parallel_403_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("a stopped run that saved returns Ok, not a cancel");
+    let rows = res["rows"].as_array().expect("results array").clone();
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "the gate is vacuous unless the stop actually fired: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        1,
+        "only scene 0 finished before the Stop: {rows:?}"
+    );
+    let row = scene_row(&rows, Some(0)).expect("scene 0 names itself");
+    assert!(row["trade"].is_null(), "no trade on this run: {row}");
+    assert_eq!(
+        row["persist_mismatch"],
+        serde_json::json!(false),
+        "the save after the Stop is re-read and its verdict reported: {row}"
+    );
+    assert_eq!(
+        sim.events()[from..]
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::Saved(403)))
+            .count(),
+        1,
+        "the stopped path still fires the batch's ONE save"
+    );
+}
+
+/// A failed row streams its typed `skipKind` beside the free-text `message`, so the
+/// Summary picks its words by kind. 403's scene 1 names a knob the classifier refuses (an
+/// amp's drive), which is `unsupported_knob`; the leveled rows carry no kind.
+#[test]
+fn a_refused_scene_row_streams_its_skip_kind() {
+    let _serial = serial();
+    let _cancel_reset = SceneCancelReset;
+    scenario_env();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let (_app, webview, captured) = batched_scene_app_capturing_channel();
+    let jobs = serde_json::json!([
+        {"sceneSlot": 0, "targetLufs": -23.0},
+        {"sceneSlot": 1, "targetLufs": -23.0,
+         "handle": {"groupId": "G2", "nodeId": "ampA", "parameterId": "drive"}}
+    ]);
+    invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403, "jobs": jobs, "candidates": parallel_403_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("level_scenes_apply_batched");
+    let items = captured.lock().unwrap().clone();
+    let error = items
+        .iter()
+        .find(|i| i["status"] == "error")
+        .unwrap_or_else(|| panic!("the refused row streams an error item: {items:?}"));
+    assert_eq!(error["sceneSlot"], 1, "{error}");
+    assert_eq!(error["skipKind"], "unsupported_knob", "{error}");
+    assert!(
+        error["message"].is_string(),
+        "the text stays for the log: {error}"
+    );
+    let done = items
+        .iter()
+        .find(|i| i["status"] == "done")
+        .unwrap_or_else(|| panic!("scene 0 levels: {items:?}"));
+    assert!(done["skipKind"].is_null(), "{done}");
+}
+
+/// A leveling command that fails as a whole rejects with the typed
+/// `{ kind, message, reampStillOn }` — the kind a refusal was raised with, never one picked
+/// from its text. A batch where no row names a knob and the preset offers no amp output
+/// level refuses before the unit is touched.
+#[test]
+fn a_leveling_command_rejects_with_a_typed_kind() {
+    let _serial = serial();
+    scenario_env();
+    let sim = crate::sim_device::SimDevice::new();
+    crate::sim_device::set_live(&sim);
+    let sf = sim.clone();
+    crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sf.clone())));
+    let from = sim.events().len();
+    let (_app, webview) = batched_scene_app();
+    let err = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403,
+            "jobs": [{"sceneSlot": 0, "targetLufs": -23.0}],
+            "candidates": [],
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect_err("no amp candidate and no named knob refuses");
+    assert_eq!(err["kind"], "no_active_amp", "{err}");
+    assert!(err["message"].is_string(), "{err}");
+    assert_eq!(err["reampStillOn"], false, "{err}");
+    assert_eq!(
+        sim.events().len(),
+        from,
+        "refused before the unit was touched"
+    );
+}
+
 // ───────────── A1/A9: the "base anchor" — the trade fires on a WIZARD-SHAPED run ─────────
 //
 // The wizard never sends a wire job for base itself (that lane is `level_preset`'s, run
@@ -4839,7 +5006,7 @@ fn a_wizard_shaped_run_trades_headroom_when_base_arrives_as_an_anchor() {
         }),
     )
     .expect("level_scenes_apply_batched");
-    let rows = res.as_array().expect("results array").clone();
+    let rows = res["rows"].as_array().expect("results array").clone();
 
     // Base's own `outputLevel` is never solved by THIS batch when it arrived only as an
     // anchor — that write belongs to the wizard's separate `level_preset` lane.
@@ -4989,7 +5156,7 @@ fn a_base_anchor_measures_the_isolated_base_and_never_persists_the_isolation() {
     )
     .expect("level_scenes_apply_batched");
     assert!(
-        res.as_array().is_some_and(|a| !a.is_empty()),
+        res["rows"].as_array().is_some_and(|a| !a.is_empty()),
         "the scene job must actually solve: {res:?}"
     );
 
@@ -5543,7 +5710,8 @@ fn events_and_channel_sends_reach_the_ui_ring() {
 }
 
 /// The run-end re-amp OFF is read back, and an OFF that never reads back OFF reaches the
-/// run result as `reamp_warning` (the Summary renders it). Gate for the stranded re-amp mute:
+/// run result as `reamp_still_on` (the typed signal the Summary reads) beside the
+/// `reamp_warning` text (log and bug report). Gate for the stranded re-amp mute:
 /// `reamp_off_guaranteed` used to send its OFF and log "sent" with no read.
 #[test]
 fn a_base_run_whose_final_off_never_lands_carries_the_reamp_warning() {
@@ -5552,10 +5720,141 @@ fn a_base_run_whose_final_off_never_lands_carries_the_reamp_warning() {
     sim.arm(crate::sim_device::Injection::ReampOffNeverLands);
     let (_app, webview) = level_preset_app();
     let r = run_base_level(&webview, FRIEDMAN, -23.0, false);
+    assert_eq!(r["reamp_still_on"], serde_json::json!(true), "{r}");
     assert_eq!(
         r["reamp_warning"],
         serde_json::json!(crate::leveller::REAMP_STILL_ON_WARNING),
         "{r}"
+    );
+}
+
+/// A scene batch stopped during its ceiling prepass returns no rows, and its run-end OFF
+/// verdict must still come back: the prepass engages re-amp once per scene, so an OFF that
+/// never reads back OFF there strands the unit input-muted exactly as after a full run. The
+/// Stop fires on the first prepass tick (the interceptor runs inside the channel send), so
+/// the first scene's capture runs and the stop lands at the next scene's loop top.
+#[test]
+fn a_scene_batch_stopped_in_its_prepass_returns_the_reamp_verdict_with_no_rows() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _serial = serial();
+    let _cancel_reset = SceneCancelReset;
+    let sim = hiwatt_sim();
+    sim.arm(crate::sim_device::Injection::ReampOffNeverLands);
+    let items: CapturedChannel = Default::default();
+    let sink = items.clone();
+    let app = tauri::test::mock_builder()
+        .manage(AppState::default())
+        .channel_interceptor(move |_wv, _cb, _id, body| {
+            if let tauri::ipc::InvokeResponseBody::Json(s) = body {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+                    if v["message"] == crate::leveller::PREPASS_ACTIVE_MSG {
+                        crate::commands::level_scenes::SCENE_LEVEL_CANCEL.store(true, SeqCst);
+                    }
+                    lock_ok(&sink).push(v);
+                }
+            }
+            true
+        })
+        .invoke_handler(tauri::generate_handler![level_scenes_apply_batched])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("app");
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default())
+        .build()
+        .expect("wv");
+    let res = invoke(
+        &webview,
+        "level_scenes_apply_batched",
+        serde_json::json!({
+            "slot": 403,
+            "jobs": (0..4).map(|s| serde_json::json!({"sceneSlot": s, "targetLufs": -23.0})).collect::<Vec<_>>(),
+            "candidates": parallel_403_candidates(),
+            "save": true, "rebalance": false,
+            "topologyId": serde_json::Value::Null, "calibrationLufs": null, "profileId": null,
+            "onResult": "__CHANNEL__:0"
+        }),
+    )
+    .expect("a Stop is not a failed run");
+    let seen = lock_ok(&items).clone();
+    assert!(
+        seen.iter().any(|v| v["status"] == "cancelled"),
+        "the gate is vacuous unless the Stop fired: {seen:?}"
+    );
+    assert!(
+        sim.events()
+            .iter()
+            .any(|e| matches!(e, crate::sim_device::SimEvent::ReAmp(true))),
+        "the prepass engaged re-amp before the Stop"
+    );
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([]),
+        "no scene was leveled: {res}"
+    );
+    assert_eq!(res["reampStillOn"], serde_json::json!(true), "{res}");
+    assert_eq!(
+        res["reampWarning"],
+        serde_json::json!(crate::leveller::REAMP_STILL_ON_WARNING),
+        "{res}"
+    );
+}
+
+/// A footswitch batch with no solved switch returns no rows, and its run-end OFF verdict must
+/// still come back beside them. The Stop fires once the ceiling prepass has engaged re-amp
+/// (fixture 405's four drive pedals), so no switch is solved and the OFF never reads back OFF.
+/// Through the shipped batch, as the command runs it.
+#[test]
+fn a_footswitch_batch_with_no_solved_switch_returns_the_reamp_verdict() {
+    let _serial = serial();
+    let sim = hiwatt_sim();
+    sim.arm(crate::sim_device::Injection::ReampOffNeverLands);
+    let jobs: Vec<crate::commands::level_footswitch::FootswitchLevelJob> =
+        [(5, "ACD_Plumes", "level"), (6, "ACD_BluesDriver", "level")]
+            .into_iter()
+            .map(
+                |(switch, node, param)| crate::commands::level_footswitch::FootswitchLevelJob {
+                    switch,
+                    lev_group_id: "G1".into(),
+                    lev_node_id: node.into(),
+                    lev_parameter_id: param.into(),
+                    target_lufs: -23.0,
+                    scene_context: None,
+                },
+            )
+            .collect();
+    let engaged = || {
+        sim.events()
+            .iter()
+            .any(|e| matches!(e, crate::sim_device::SimEvent::ReAmp(true)))
+    };
+    let mut progress = Vec::new();
+    let run = crate::commands::level_footswitch::run_footswitch_batch(
+        ListIndex(405),
+        &jobs,
+        true,
+        &test_stim(),
+        0.0,
+        &mut |item| progress.push(item.status),
+        &engaged,
+        crate::watcher::DetachWatch::start(),
+    )
+    .expect("a Stop is not a failed run");
+    assert!(engaged(), "the prepass engaged re-amp before the Stop");
+    assert!(
+        progress
+            .iter()
+            .any(|s| matches!(s, crate::commands::ProgressStatus::Cancelled)),
+        "the gate is vacuous unless the Stop fired"
+    );
+    assert!(run.rows.is_empty(), "nothing solved: {:?}", run.rows);
+    assert!(run.reamp_still_on, "the verdict rides beside the rows");
+    assert_eq!(
+        run.reamp_warning.as_deref(),
+        Some(crate::leveller::REAMP_STILL_ON_WARNING)
+    );
+    assert_eq!(
+        serde_json::to_value(&run).expect("serialize")["reampStillOn"],
+        serde_json::json!(true),
+        "the wire key the frontend reads"
     );
 }
 
@@ -5569,6 +5868,7 @@ fn a_base_run_with_a_dropped_off_ends_with_reamp_read_back_off() {
     let (_app, webview) = level_preset_app();
     let r = run_base_level(&webview, FRIEDMAN, -23.0, false);
     assert!(r.get("reamp_warning").is_none(), "{r}");
+    assert_eq!(r["reamp_still_on"], serde_json::json!(false), "{r}");
     let state = crate::session::Session::connect()
         .and_then(|mut s| s.read_reamp_state())
         .expect("read");

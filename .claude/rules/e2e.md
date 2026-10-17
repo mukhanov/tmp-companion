@@ -17,7 +17,7 @@ Tauri's `tauri-driver`/WebdriverIO cannot drive this app — macOS WKWebView has
 
 ## UI copy is e2e-load-bearing
 
-The specs **regex-match user-facing strings** (`doctor.spec.ts` matches `/presets? need a look|All clear/`). Before rewording any view label or heading — especially on a design handoff — **grep `e2e/specs/` for the old phrase first**.
+The specs **regex-match user-facing strings** (`doctor.spec.ts` matches `/sounds? needs? a look|^Nothing to change in|check couldn.t finish/`). Before rewording any view label or heading — especially on a design handoff — **grep `e2e/specs/` for the old phrase first**.
 
 ## Events and Channels reach the page (the UI bridge)
 
@@ -105,7 +105,7 @@ Runs the full Level + Copy happy paths against the real unit **non-destructively
 
 **Both probe emission seams resolve their stimulus through `probe_stimulus_path(topology_id)`** — the bundled topology WAV, consulting neither the profile's captured DI nor `TMP_LEVELLER_STIMULUS`, unlike the leveling arms that honour both. Unless both sides are pinned to one WAV, a run and its "independent" re-measure grade different waveforms, and the difference is large enough to move a verdict.
 
-Footswitch rows are externally validated through `probe --measure-footswitch <slot> <switch> <topology> [--lev g:n:p] [--target L] [--dump-wav D]`. The **`doctor_apply` path is NOT externally validated** (no expectation-emitting re-measure exists for it).
+Footswitch rows are externally validated through `probe --measure-footswitch <slot> <switch> <topology> [--lev g:n:p] [--target L] [--dump-wav D]`. Doctor writes nothing to the unit, so there is no Doctor write path to validate.
 
 **Env vars:**
 
@@ -139,3 +139,7 @@ Online and soak runs archive into dated run folders under the git common dir, an
 **The online lane has its own bands** — bridge `9400 + offset*8` (9400–10999) and Vite `1621 + offset` (1621–1820) — disjoint from offline's 7800–9399 / 1421–1620 and from the legacy 7600–7799. Each lane sweeps only its own band and starts and owns its own Vite, which is what lets `gates.sh` and an online `scripts/e2e.sh` run side by side in one worktree: an offline run that finishes first cannot take the online run's Vite down. `TMP_E2E_SWEEP_DRY_RUN=1` prints a lane's swept range and exits.
 
 Still a `% 200` hash with no occupied-port retry, so two worktree paths can collide — it reduces contention, it does not guarantee isolation. The one real device is serialized by a machine-global `mkdir` lock (`scripts/device-lock.sh`).
+
+## Each offline server has its own store, fresh every run
+
+The e2e_server builds on Tauri's mock context, whose empty identifier puts `profiles.json` (targets, instruments, the instrument chosen for each preset) straight in the user's config dir. So the offline config gives each server its own `HOME` and `XDG_CONFIG_HOME` under `TMP_E2E_CONFIG_ROOT`, which `scripts/e2e.sh` creates fresh for every offline run and removes when it ends (a bare `bunx playwright test` makes its own in the system temp dir). Without it the N workers shared one store with each other and with every earlier run, and Doctor's Instrument page silently stopped showing after a machine's first run. **A spec may count on an empty store at its server's start, never on one an earlier run left**: `doctor.spec.ts`'s first check requires the Instrument page (`runDoctorCheck(page, { expectInstrumentPage: true })`). Windows finds the config dir through a system call no environment variable moves, so a Windows run still shares one store, and from its second run on that check fails there, loudly, rather than skip the page. The online lane's single server, started by `cargo run`, keeps the shared store (a different `HOME` would hide cargo's own toolchain from it).

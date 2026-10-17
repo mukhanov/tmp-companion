@@ -8,11 +8,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 
-import type { LevelResult, SceneLevelProgressItem } from "../lib/types";
+import type {
+  BatchLevelRun,
+  LevelResult,
+  SceneLevelProgressItem,
+} from "../lib/types";
 import { useLevelingFlow } from "../views/level/useLevelingFlow";
 import type { SetupChoice } from "../views/level/leveling";
 import { isRunOver, resetLevelFlow } from "../views/level/levelRunStore";
 import {
+  makeBatchRun,
   makeLevelingFlowDeps,
   makeLevelResult,
   makeSceneOption,
@@ -44,14 +49,14 @@ const choices: SetupChoice[] = [
 function holdSceneBatch() {
   const held = {
     emit: (_item: SceneLevelProgressItem): void => undefined,
-    finish: (_rows: LevelResult[]): void => undefined,
+    finish: (_run: BatchLevelRun<LevelResult>): void => undefined,
   };
   mockCommands({
     level_scenes_apply_batched: ({ onResult }) => {
       held.emit = (item) => {
         onResult.onmessage(item);
       };
-      return new Promise<LevelResult[]>((resolve) => {
+      return new Promise<BatchLevelRun<LevelResult>>((resolve) => {
         held.finish = resolve;
       });
     },
@@ -82,6 +87,7 @@ describe("useLevelingFlow — batch tail caption (issue 6b)", () => {
         status: "active",
         result: null,
         message: null,
+        skipKind: null,
         tail: "Saving…",
       });
     });
@@ -127,6 +133,7 @@ describe("useLevelingFlow — batch tail caption (issue 6b)", () => {
           dynamic_spread_lu: null,
         }),
         message: null,
+        skipKind: null,
       });
     });
     expect(result.current.run.tailMessage).toBeNull();
@@ -137,6 +144,7 @@ describe("useLevelingFlow — batch tail caption (issue 6b)", () => {
         status: "active",
         result: null,
         message: null,
+        skipKind: null,
         tail: "Verifying…",
       });
     });
@@ -147,7 +155,7 @@ describe("useLevelingFlow — batch tail caption (issue 6b)", () => {
     // Let the batch call return, then wait out the microtask chain to the run's own
     // completion publish (sweep → `await refresh()` → final `publish(total, true, …)`).
     act(() => {
-      batch.finish([]);
+      batch.finish(makeBatchRun());
     });
     await waitFor(() => {
       expect(isRunOver(result.current.run.phase)).toBe(true);

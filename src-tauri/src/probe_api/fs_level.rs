@@ -928,7 +928,9 @@ fn run_one_footswitch_job(
             }
         },
         &|| false,
-    )?;
+        crate::watcher::DetachWatch::start(),
+    )?
+    .rows;
     rows.into_iter()
         .find(|r| r.switch == switch)
         .ok_or_else(|| {

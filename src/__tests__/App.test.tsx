@@ -1,8 +1,10 @@
-// App.tsx — the calibrate-nav wiring: the Level tab's "calibrate" cue (deep in
-// the leveling Set-up step) jumps to Settings → Instruments, and a manual
+// App.tsx — the calibrate-nav wiring: the Level tab's "Record yours in Settings"
+// link (on the leveling Set up page) jumps to Settings → Instruments, its "Add a target
+// in Settings" link to Settings → Loudness targets, and a manual
 // Settings-tab click clears that seed so a later ordinary visit lands back on
-// the default category. LevelView/SettingsView are shallow-mocked (their own
-// internals are covered by InstrumentNudge/SettingsView tests) so this test
+// the default category. Also: Settings' "Report a bug" opens the same dialog as
+// the native Help menu. LevelView/SettingsView are shallow-mocked (their own
+// internals are covered by SetupPage/SettingsView tests) so this test
 // isolates the App-level tab + initialCategory plumbing without driving the
 // whole device-connect → list → wizard chain.
 
@@ -15,14 +17,20 @@ import type { LevelViewProps } from "../views/level/LevelView";
 import type { SettingsViewProps } from "../views/settings/SettingsView";
 
 vi.mock("../views/level", () => ({
-  LevelView: ({ onCalibrate }: LevelViewProps) => (
-    <button onClick={onCalibrate}>fire-calibrate</button>
+  LevelView: ({ onCalibrate, onAddTarget }: LevelViewProps) => (
+    <>
+      <button onClick={onCalibrate}>fire-calibrate</button>
+      <button onClick={onAddTarget}>fire-add-target</button>
+    </>
   ),
 }));
 
 vi.mock("../views/settings", () => ({
-  SettingsView: ({ initialCategory }: SettingsViewProps) => (
-    <div data-testid="settings-pane">{initialCategory ?? "(default)"}</div>
+  SettingsView: ({ initialCategory, onReportBug }: SettingsViewProps) => (
+    <div>
+      <div data-testid="settings-pane">{initialCategory ?? "(default)"}</div>
+      <button onClick={onReportBug}>settings-report-bug</button>
+    </div>
   ),
 }));
 
@@ -57,6 +65,17 @@ describe("App — calibrate-nav wiring", () => {
     );
   });
 
+  it("onAddTarget jumps to Settings on the Loudness targets category", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(await screen.findByText("fire-add-target"));
+
+    expect(await screen.findByTestId("settings-pane")).toHaveTextContent(
+      "targets",
+    );
+  });
+
   it("a manual Settings tab click clears the seed (lands on the default category)", async () => {
     const user = userEvent.setup();
     renderApp();
@@ -74,5 +93,23 @@ describe("App — calibrate-nav wiring", () => {
     expect(await screen.findByTestId("settings-pane")).toHaveTextContent(
       "(default)",
     );
+  });
+});
+
+describe("App — Report a bug from Settings", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+  });
+
+  it("Settings' Report a bug opens the Report a bug dialog", async () => {
+    const user = userEvent.setup();
+    renderApp();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.queryByRole("dialog", { name: "Report a bug" })).toBeNull();
+    await user.click(await screen.findByText("settings-report-bug"));
+    expect(
+      screen.getByRole("dialog", { name: "Report a bug" }),
+    ).toBeInTheDocument();
   });
 });

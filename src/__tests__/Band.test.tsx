@@ -1,15 +1,15 @@
-// src/__tests__/Band.test.tsx — BandMeter/BandSpark render from the sound's own
-// band layout (bandLabels/bandCount), not a hardcoded six-band array. Covers the
-// bass-vi 7-band case ("Sub" first) alongside the standard 6-band guitar/bass case.
+// src/__tests__/Band.test.tsx — BandMeter renders from the sound's own band layout
+// (bandLabels), not a hardcoded six-band array. Covers the bass-vi 7-band case ("Sub"
+// first) alongside the standard 6-band guitar/bass case, its accessible name, and the
+// finding's bands drawn in the finding's tone.
 
 import { describe, it, expect } from "vitest";
 import { screen } from "@testing-library/react";
 
 import { BandMeter } from "../views/doctor/BandMeter";
-import { BandSpark } from "../views/doctor/BandSpark";
 import { renderWithTheme } from "./testKit";
 
-const GUITAR_LABELS = ["Lows", "Low-mids", "Mids", "High-mids", "Highs", "Air"];
+const GUITAR_LABELS = ["Lows", "Low mids", "Mids", "High mids", "Highs", "Air"];
 const BASSVI_LABELS = ["Sub", ...GUITAR_LABELS];
 
 describe("BandMeter", () => {
@@ -19,12 +19,45 @@ describe("BandMeter", () => {
         balanceDb={[-6, 4, -2, -8, -12, -18]}
         bandLabels={GUITAR_LABELS}
         bands={[1]}
-        sev="high"
+        direction="strong"
+        tone="danger"
       />,
     );
     for (const label of GUITAR_LABELS) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
+  });
+
+  it("names the finding's bands and which way they're off", () => {
+    renderWithTheme(
+      <BandMeter
+        balanceDb={[-6, 4, -2, -8, -12, -18]}
+        bandLabels={GUITAR_LABELS}
+        bands={[1]}
+        direction="strong"
+        tone="danger"
+      />,
+    );
+    expect(
+      screen.getByRole("img", { name: "Tone by band: Low mids too strong" }),
+    ).toBeInTheDocument();
+  });
+
+  it("says too weak, and lists several bands, for a finding that lacks them", () => {
+    renderWithTheme(
+      <BandMeter
+        balanceDb={[-6, 4, -2, -8, -12, -18]}
+        bandLabels={GUITAR_LABELS}
+        bands={[3, 4, 5]}
+        direction="weak"
+        tone="caution"
+      />,
+    );
+    expect(
+      screen.getByRole("img", {
+        name: "Tone by band: High mids, Highs and Air too weak",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("renders 7 labels for a bass-vi sound, with Sub first", () => {
@@ -33,43 +66,32 @@ describe("BandMeter", () => {
         balanceDb={[-10, -6, 4, -2, -8, -12, -18]}
         bandLabels={BASSVI_LABELS}
         bands={[0]}
-        sev="high"
+        direction="strong"
+        tone="danger"
       />,
     );
     const rendered = screen.getAllByText(
-      /^(Sub|Lows|Low-mids|Mids|High-mids|Highs|Air)$/,
+      /^(Sub|Lows|Low mids|Mids|High mids|Highs|Air)$/,
     );
     expect(rendered).toHaveLength(7);
     expect(rendered[0]).toHaveTextContent("Sub");
   });
 });
 
-describe("BandSpark", () => {
-  it("draws 6 bars for a 6-band sound", () => {
+describe("BandMeter — colours", () => {
+  it("draws the finding's bands in its tone and the others in the meter grey", () => {
     renderWithTheme(
-      <BandSpark
+      <BandMeter
         balanceDb={[-6, 4, -2, -8, -12, -18]}
-        bandCount={GUITAR_LABELS.length}
-        hotBands={[1]}
-        color="#d97757"
-        muted={false}
+        bandLabels={GUITAR_LABELS}
+        bands={[1]}
+        direction="strong"
+        tone="danger"
       />,
     );
-    const spark = screen.getByTitle("Band balance");
-    expect(spark.children).toHaveLength(6);
-  });
-
-  it("draws 7 bars with no index gaps for a bass-vi sound", () => {
-    renderWithTheme(
-      <BandSpark
-        balanceDb={[-10, -6, 4, -2, -8, -12, -18]}
-        bandCount={BASSVI_LABELS.length}
-        hotBands={[0, 6]}
-        color="#d97757"
-        muted={false}
-      />,
-    );
-    const spark = screen.getByTitle("Band balance");
-    expect(spark.children).toHaveLength(7);
+    const bar = (label: string) =>
+      document.querySelector<HTMLElement>(`[data-band-bar="${label}"]`);
+    expect(bar("Low mids")?.style.background).toBe("rgb(169, 50, 38)");
+    expect(bar("Lows")?.style.background).toBe("rgb(161, 161, 166)");
   });
 });

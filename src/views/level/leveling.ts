@@ -1,22 +1,20 @@
 // src/views/level/leveling.ts — types + helpers for the unified leveling flow.
 //
-// The unit of leveling is a SCENE. A preset's BASE scene carries cross-preset
-// loudness ("matches this preset’s loudness to your other presets" → preset
-// `presetLevel`); an FS scene is leveled within its preset ("matches this scene's
-// loudness to the preset’s base sound" → amp `outputLevel` in scene mode). The
-// mechanism is never exposed: no block /
-// parameter selector, the target is implicit and fixed.
+// The unit of leveling is a SOUND: a preset's main sound carries cross-preset loudness
+// (preset `presetLevel`); a scene is leveled with its amp's `outputLevel` in scene mode;
+// a footswitch with its block's level knob.
 //
 // SELECTION lives in the list (the scene tree): the source of truth is a flat set of
-// scene KEYS — Base = `p${slot}`, FS scene = `s${slot}:${idx}`. `chosenFrom` turns
-// that set into the SetupOption[] the setup dialog configures (instrument + target).
+// scene KEYS — main sound = `p${slot}`, scene = `s${slot}:${idx}`, footswitch =
+// `f${slot}:${i}`. `chosenFrom` turns that set into the SetupOption[] the Set up page
+// configures (instrument per preset; target, block and knob per sound).
 //
-// Flow (one persistent wizard, body swaps per stage): setup (set instrument + target
-// for everything picked in the list; its footer's backup acknowledgment gates the
-// commit) → run (steps the chosen scenes) → summary.
+// Flow (setup → run → summary): Set up (its footer's backup acknowledgment gates the
+// commit) → run (steps the chosen sounds) → summary.
 
 import type {
   BaseBoostSummary,
+  ClampKind,
   FootswitchInfo,
   FootswitchLevelJobWire,
   LevelJob,
@@ -26,8 +24,9 @@ import type {
   SceneHandlePick,
   SceneInfo,
   SilenceHint,
+  SkipKind,
 } from "../../lib/types";
-import type { PickOption } from "../overlays/Pick";
+import type { SelectOption } from "../../ui/selectValue";
 import { blockArtTile, shortFallback } from "../../models/blockArt";
 import { stripNameFor } from "../../models/catalog";
 
@@ -121,8 +120,8 @@ const CLASS_RANK: Record<ParamClass, number> = {
 };
 
 /** Friendly labels for the technical parameter ids (fallback: capitalize the id).
- *  Read through `paramLabel` by `FlatLevelPick` — the one "which block parameter"
- *  picker — for both its trigger label and its candidate rows. */
+ *  Read through `paramLabel` by Set up's Knob dropdown (`setupControls`), for both the
+ *  value it shows and its options. */
 const PARAM_LABELS: Partial<Record<string, string>> = {
   level: "Level",
   outputLevel: "Output level",
@@ -157,20 +156,6 @@ export function defaultParamIndex(params: LevelParamCandidate[]): number {
     }
   });
   return bestIdx;
-}
-
-/** The apply-to-all instrument's place on the good → better → best ladder that drives
- *  the Set up step's instrument nudge: `none` (no instrument → levels against the
- *  default reference) → `uncal` (instrument, no stored calibration) → `cal`
- *  (calibrated). An unknown / empty id is treated as `none`. */
-export function instCalState(
-  id: string,
-  options: PickOption[],
-): "none" | "uncal" | "cal" {
-  if (!hasInstrument(id)) return "none";
-  const o = options.find((x) => x.id === id);
-  if (!o) return "none";
-  return o.calibrated ? "cal" : "uncal";
 }
 
 /** Build a footswitch target from a specific candidate (the user's explicit pick, or the
@@ -216,41 +201,20 @@ const fsTagOf = (switchIndex: number): string => `FS${String(switchIndex + 1)}`;
  *  sentinel for it, in the pickers, the Set-up defaults and every run item. */
 export const NO_INSTRUMENT = "none";
 
-/** The instrument `Pick` options shared by the Level and Doctor setup steps:
- *  "None" (the no-instrument path — level/diagnose against the default reference)
- *  followed by each saved profile, calibrated ones flagged with their reference dB. */
+/** The one name of a preset's main sound (its base, `presetLevel`), with or without
+ *  scenes — the one word for it on the list, Set up, the run and Doctor alike. */
+export const MAIN_SOUND = "Main sound";
+
+/** The instrument choices shared by Level's Set up and Doctor's Instrument page: "None"
+ *  (the no-instrument path — level or diagnose against the default reference) followed by
+ *  each saved instrument. No loudness figures: those stay in Settings. */
 export function instrumentOptions(
   profiles: Profile[] | undefined,
-): PickOption[] {
+): SelectOption[] {
   return [
-    { id: NO_INSTRUMENT, label: "None" },
-    ...(profiles ?? []).map((p) => {
-      const cal = p.calibration_lufs;
-      return {
-        id: p.id,
-        label: p.name,
-        sub: cal != null ? `${cal.toFixed(1)} dB` : undefined,
-        calibrated: cal != null,
-      };
-    }),
+    { value: NO_INSTRUMENT, label: "None" },
+    ...(profiles ?? []).map((p) => ({ value: p.id, label: p.name })),
   ];
-}
-
-/** True when `id` names an instrument profile rather than the no-instrument choice. An
- *  empty id counts as no instrument too. */
-export function hasInstrument(id: string): boolean {
-  return id !== "" && id !== NO_INSTRUMENT;
-}
-
-/** Resolve an instrument profile id → its display name (the run-row chip): "No
- *  instrument" for the no-instrument choice, else the profile's name, falling back to the
- *  raw id for an unknown/removed profile. */
-export function instrumentName(
-  profiles: Profile[] | undefined,
-  id: string,
-): string {
-  if (!hasInstrument(id)) return "No instrument";
-  return (profiles ?? []).find((p) => p.id === id)?.name ?? id;
 }
 
 /** The row name for a footswitch: the player's own `customLabel` when set, else the
@@ -288,7 +252,7 @@ export function footswitchNameForCandidate(c: LevelParamCandidate): string {
  *
  *  Order: the device's own strip name (`name8`), else the Model Guide name, else the
  *  old de-camel-cased id so an uncatalogued or user block still gets something. */
-function blockStripName(fenderId: string): string {
+export function blockStripName(fenderId: string): string {
   return (
     stripNameFor(fenderId) ??
     blockArtTile(fenderId).fullName ??
@@ -339,11 +303,13 @@ export interface SetupOption {
   /** The `loadScene` / `level_scenes_apply_batched` wire slot (0-based scenes[] index);
    *  null for the Base/whole-preset row (which levels `presetLevel`). */
   sceneSlot: number | null;
-  /** Display name: "Base Preset" / "Whole preset" / the scene name. */
+  /** Display name: "Main sound" / the scene name / the footswitch's name. */
   sceneName: string;
-  /** Tag chip: "BASE" | `FS${n}` | null (em-dash for an untagged named scene). */
+  /** The sound's tag, sent with a Doctor check (the backend's scene-loudness rows carry
+   *  it): "BASE" | `FS${n}` | null (em-dash for an untagged named scene). No screen shows
+   *  it (a footswitch says "footswitch 3"). */
   tag: string | null;
-  /** False ⇒ a scene-less preset, whose Base row renders "Whole preset". */
+  /** False ⇒ a preset with no scenes and no footswitches. */
   hasScenes: boolean;
   /** Set ⇒ this row is a block-acting FOOTSWITCH (not Base/scene); carries the coords
    *  for `levelFootswitchesApply`. null/undefined for Base + scene rows. */
@@ -372,12 +338,6 @@ export interface SetupOption {
    *  the wire `scenes[]` slots — the scene-context picker's label source (D3). Undefined
    *  for Base/scene rows. */
   fsSceneNames?: string[];
-  /** Re-run rows only: the instrument profile id this sound was last leveled with, so
-   *  Set up seeds the row with it instead of the first profile. Undefined for a fresh row. */
-  instId?: string;
-  /** Re-run rows only: the target name this sound was last leveled at, so Set up seeds
-   *  the row with it instead of the first target. Undefined for a fresh row. */
-  targetName?: string;
 }
 
 /** A user-chosen BASE leveling control — the block param `level_preset` should drive
@@ -393,7 +353,8 @@ export interface BaseHandlePick {
   parameterId: string;
 }
 
-/** The e2e-hook identity for a setup row (`SetupPage`'s `data-setup-row`) —
+/** The e2e-hook identity for a setup row (`SetupPage`'s `data-setup-row`, and the
+ *  Summary's `data-summary-row` and footswitch scene dropdown) —
  *  DELIBERATELY DISTINCT from `SetupOption.key` (the SELECTION key: `sel`/`rows` Map
  *  lookups and the React list key, unchanged by this function). A footswitch's `key`
  *  is `fswKey`'s POSITION within the levelable-filtered footswitch list, so a fixture
@@ -407,7 +368,9 @@ export interface BaseHandlePick {
  *  the 0-based wire sceneSlot"), i.e. already an IDENTITY, not a filtered-list
  *  position, so it needs no translation. Base rows keep `p<slot>` (nothing to
  *  disambiguate). */
-export function setupRowHookKey(o: SetupOption): string {
+export function setupRowHookKey(
+  o: Pick<SetupOption, "slot" | "sceneSlot" | "footswitch">,
+): string {
   if (o.footswitch != null) {
     return `f${String(o.slot)}:sw${String(o.footswitch.switchIndex)}`;
   }
@@ -432,21 +395,21 @@ export interface SetupRowPick {
 }
 
 /** The Set up page's commit, pure: one `SetupChoice` per option, with each row's
- *  effective leveling handle folded into its option. `handleOf` resolves a row's
- *  handle (its pick, else the page's preselect); `suggestedSceneOf` a footswitch's
- *  suggested scene context (null while unread). A footswitch whose handle matches one
- *  of its level params is re-targeted at that param (and an unlabeled switch named
- *  after it); a Base row carries its pick as `baseHandle`; a Scene row as
- *  `sceneHandle`. */
+ *  effective leveling handle folded into its option. `rowOf` gives a row's resolved
+ *  instrument, target and scene pick (the caller resolves every one, so there is no
+ *  default to fall back on); `handleOf` resolves a row's handle (its pick, else the
+ *  page's preselect); `suggestedSceneOf` a footswitch's suggested scene context (null
+ *  while unread). A footswitch whose handle matches one of its level params is
+ *  re-targeted at that param (and an unlabeled switch named after it); a Base row carries
+ *  its pick as `baseHandle`; a Scene row as `sceneHandle`. */
 export function buildSetupChoices(
   options: SetupOption[],
-  rowOf: (key: string) => SetupRowPick | undefined,
+  rowOf: (o: SetupOption) => SetupRowPick,
   handleOf: (o: SetupOption) => SceneHandlePick | null,
   suggestedSceneOf: (o: SetupOption) => number | null,
-  defaults: { inst: string; target: string },
 ): SetupChoice[] {
   return options.map((o) => {
-    const row = rowOf(o.key);
+    const row = rowOf(o);
     let option = o;
     if (o.footswitch != null) {
       const chosenHandle = handleOf(o);
@@ -460,7 +423,7 @@ export function buildSetupChoices(
         : undefined;
       const suggested = suggestedSceneOf(o);
       const sceneContext =
-        row?.sceneContext !== undefined
+        row.sceneContext !== undefined
           ? row.sceneContext
           : (suggested ?? o.footswitch.sceneContext);
       const target: FootswitchTarget = candidate
@@ -486,11 +449,7 @@ export function buildSetupChoices(
     } else if (o.sceneSlot != null) {
       option = { ...o, sceneHandle: handleOf(o) };
     }
-    return {
-      option,
-      instId: row?.inst ?? defaults.inst,
-      targetName: row?.target ?? defaults.target,
-    };
+    return { option, instId: row.inst, targetName: row.target };
   });
 }
 
@@ -577,7 +536,8 @@ export function chosenFrom(
       const scenes = sceneInfo.get(r.slot) ?? [];
       const footswitches = footswitchInfo.get(r.slot) ?? [];
       // A footswitch row reads like a scene (the user picks "a sound"), so a preset with
-      // ONLY footswitches still shows "Base Preset" vs "Whole preset" as a true scene-less case.
+      // ONLY footswitches has children too. The main sound has ONE name everywhere,
+      // whether or not the preset has scenes ("Main sound").
       const hasChildren = scenes.length > 0 || footswitches.length > 0;
       if (sel.has(baseKey(r.slot))) {
         items.push({
@@ -586,7 +546,7 @@ export function chosenFrom(
           presetName: r.name,
           isBase: true,
           sceneSlot: null,
-          sceneName: hasChildren ? "Base Preset" : "Whole preset",
+          sceneName: MAIN_SOUND,
           tag: hasChildren ? "BASE" : null,
           hasScenes: hasChildren,
         });
@@ -649,20 +609,14 @@ export function chosenFrom(
 export type Outcome =
   "done" | "clamped" | "unconverged" | "offbranch" | "skipped";
 
-/** The theme colour role each outcome renders in — ONE mapping for the Run page's result
- *  text and the Summary's problem rows, so the two pages can't drift. `notrun` is a
- *  sound a stopped run never reached (no outcome). */
-export const OUTCOME_TONE: Record<
-  Outcome | "notrun",
-  "good" | "sevWarn" | "warn" | "mutedInk"
-> = {
-  done: "good",
-  clamped: "sevWarn",
-  unconverged: "sevWarn",
-  offbranch: "warn",
-  skipped: "mutedInk",
-  notrun: "mutedInk",
-};
+/** Resolve a target NAME to its loudness (LUFS), or `null` when no configured target has
+ *  that name: an empty name, a target deleted in Settings, or a store not loaded yet.
+ *  There is no fallback loudness — the run refuses such a sound (`no_target`). */
+export type TargetLufsOf = (name: string | null) => number | null;
+
+/** WHY a run row was skipped: a backend `SkipKind`, or `no_target`, the run's own refusal
+ *  of a sound whose target name matches no configured target (it never reaches the unit). */
+export type RunSkipKind = SkipKind | "no_target";
 
 export interface RunItem {
   key: string;
@@ -673,7 +627,6 @@ export interface RunItem {
   /** 0-based scenes[] wire slot, or null for the Base/whole-preset step. */
   sceneSlot: number | null;
   sceneName: string;
-  tag: string | null;
   /** Set ⇒ a block-acting FOOTSWITCH step (dispatched to `levelFootswitchesApply`);
    *  null/undefined ⇒ Base (`level_preset`) or FS scene (`level_scenes_apply_batched`). */
   footswitch?: FootswitchTarget | null;
@@ -681,27 +634,33 @@ export interface RunItem {
   instId: string;
   /** Chosen target name. */
   targetName: string;
+  /** The loudness the run leveled this row to: its target's, resolved by name when the
+   *  row's batch began. Absent on a row no run has reached, and on one the run refused
+   *  because no configured target has its name (`no_target`). */
+  targetLufs?: number;
   // live + final:
   status: "queued" | "active" | "result";
-  /** Backend-supplied caption for an active row, rendered two ways by `RunPage`'s
-   *  `rowStatus` depending on whether a capture is streaming:
-   *   - streaming -> it is the VERB before the live number. The ceiling prepass sends
-   *     "measuring", giving `measuring · −18.9`; a message-less solve row reads `leveling · …`.
-   *   - not streaming -> it is a NOTE, shown verbatim; absent one the row reads
-   *     "connecting…".
-   *  A message sent while a capture streams is therefore a verb by construction — that is the
-   *  contract the backend's `leveller::PREPASS_ACTIVE_MSG` documents on its side. Scene/
-   *  footswitch channel items only; cleared when the row resolves or a cancelled sweep
-   *  reverts it, so a later re-run's default is never shadowed by a stale caption. */
-  activeMessage?: string | null;
   outcome?: Outcome;
   /** The write landed but its check capture failed, so the row's number is a prediction —
    *  shown as `unconverged` ("run it again") with its own copy. */
   unverified?: boolean;
-  /** WHY a row was skipped — the backend's own per-sound message (the planner's
-   *  "no active amp" / a capture error / a refused scene write), shown verbatim.
-   *  Null when the skip happened client-side with no message. */
+  /** WHY a row was skipped — the backend's own per-sound text (the planner's
+   *  "no active amp" / a capture error / a refused scene write), for the log and the bug
+   *  report. Null when the skip happened client-side with no message. The screen picks
+   *  its words by `skipKind`, never by this text. */
   skipReason?: string | null;
+  /** WHY a row was skipped, typed (`RunSkipKind`): from the row's `error` progress item,
+   *  the failed command's own `CommandError.kind`, or the run's own `no_target` refusal.
+   *  `"other"` when nothing says more. Set exactly when `outcome === "skipped"`. */
+  skipKind?: RunSkipKind;
+  /** The clamp's CAUSE (`ClampKind`, from the result's `clamp_kind`) — tells "at full
+   *  volume" from the effect's mix floor and the trade's floors without reading text.
+   *  Null on a row that did not clamp. */
+  clampKind?: ClampKind | null;
+  /** `true`: the run's save did not hold this row's leveled value (`persist_mismatch:
+   *  true` — read back after the save, or the save itself failed), on a stopped run's
+   *  save too. `false` or absent: no such report (held, or not checked). */
+  persistMismatch?: boolean;
   /** Measured (predicted) loudness, or null. */
   value?: number | null;
   /** Scene rows only: this row's handle pick, carried from Set up into the dispatch
@@ -722,28 +681,32 @@ export interface RunItem {
    *  cause when the RunItem is built. */
   verifyByEar?: "envelope" | "wet_floor" | "rebalance";
   /** The preset's backup-scan silence hint, stamped at item build — refines the
-   *  offbranch row status (see `offbranchStatus`). */
+   *  offbranch row's message on the Summary (`summaryModel.ts`). */
   silenceHint?: SilenceHint;
   /** Base rows only: this row's base-pair BOOST disclosure, carried verbatim from the
    *  result's `base_boost` — see `BaseBoostSummary`'s own doc. `null`/undefined on every
    *  row whose base pair never entered the `Boost` regime (the common case) and on every
    *  non-base row. */
   baseBoost?: BaseBoostSummary | null;
-  /** The run-end re-amp warning its command returned (`LevelResult.reamp_warning`): the
-   *  OFF could not be read back, so the unit may still be input-muted. The Summary shows
-   *  one banner when any row carries it. */
+  /** The run-end re-amp warning TEXT its command returned (`LevelResult.reamp_warning`),
+   *  the backend's own words for the log. Whether re-amp may still be on is
+   *  `reampStillOn`, never this text. */
   reampWarning?: string | null;
+  /** Re-amp may still be on after this row's command (`reamp_still_on`, or a failed
+   *  command's `CommandError.reampStillOn`): the unit's guitar input may still be muted
+   *  until it is restarted. */
+  reampStillOn?: boolean;
 }
 
-/** One preset row of the wizard lists: its slot, its name and its nested items. */
+/** One preset of the run list: its slot, its name and its sounds. */
 export interface PresetGroup<T> {
   slot: number;
   name: string;
   items: T[];
 }
 
-/** Group run items by preset slot, ascending — the shape both Run and Summary render
- *  (one `PresetGroupRow` per preset, its items nested inside). */
+/** Group run items by preset slot, ascending — the run page's list (a header per preset,
+ *  its sounds under it). */
 export function groupItemsBySlot(items: RunItem[]): PresetGroup<RunItem>[] {
   const by = new Map<number, PresetGroup<RunItem>>();
   items.forEach((it) => {
@@ -755,15 +718,6 @@ export function groupItemsBySlot(items: RunItem[]): PresetGroup<RunItem>[] {
     g.items.push(it);
   });
   return [...by.values()].sort((a, b) => a.slot - b.slot);
-}
-
-/** The offbranch ("silent capture") row status, refined by the preset's JSON-visible
- *  cause when the backup scan found one. Rendered verbatim in RunPage; used only to
- *  branch copy in SummaryPage. */
-export function offbranchStatus(hint: SilenceHint | undefined): string {
-  if (hint === "amp_zero") return "amp output at zero";
-  if (hint === "exp_mute") return "exp pedal may mute";
-  return "not on USB 1/2";
 }
 
 /** Turn a checked setup row into a run item with its resolved instrument + target. */
@@ -779,36 +733,12 @@ export function optionToRunItem(
     isBase: o.isBase,
     sceneSlot: o.sceneSlot,
     sceneName: o.sceneName,
-    tag: o.tag,
     footswitch: o.footswitch ?? null,
     instId,
     targetName,
     status: "queued",
     handle: o.sceneHandle,
     baseHandle: o.baseHandle,
-  };
-}
-
-/** Rebuild a setup row from a (clamped) run item — for "Re-level clamped…", which
- *  reopens setup pre-loaded with just the clamped scenes, all checked, no scan.
- *  ponytail: the RunItem doesn't carry `levelParams`, so a re-leveled footswitch keeps
- *  its already-chosen param but can't be re-picked (the param column renders empty).
- *  Add `levelParams` to RunItem if re-pick-on-relevel is ever wanted. */
-export function runItemToOption(it: RunItem): SetupOption {
-  return {
-    key: it.key,
-    slot: it.slot,
-    presetName: it.presetName,
-    isBase: it.isBase,
-    sceneSlot: it.sceneSlot,
-    sceneName: it.sceneName,
-    tag: it.tag,
-    hasScenes: !it.isBase || it.tag != null,
-    footswitch: it.footswitch ?? null,
-    sceneHandle: it.handle,
-    baseHandle: it.baseHandle,
-    instId: it.instId,
-    targetName: it.targetName,
   };
 }
 

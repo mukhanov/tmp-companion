@@ -20,6 +20,7 @@ export const ICONS = [
   "cmd",
   "arrow-right",
   "arrow-down",
+  "arrow-up",
   "check",
   "chev-right",
   "chev-down",
@@ -46,6 +47,14 @@ export const ICONS = [
   "pause",
   "download",
   "link",
+  "chev-updown",
+  "minus",
+  "alert",
+  "usb",
+  "stop",
+  "headphones",
+  "speaker",
+  "pulse",
 ] as const;
 
 export type IconName = (typeof ICONS)[number];

@@ -15,12 +15,13 @@
 // progress readouts subscribe to the percent.
 //
 // A failed scan is not an empty library: it settles `ready` (so nothing waits on it
-// forever) with `error` set, and `retryLibraryScan` runs it again.
+// forever) with `error` set, and `retryLibraryScan` runs it again. `error` is the
+// failure's text for the log and a bug report only; the app-wide notice never shows it.
 
 import { useSyncExternalStore } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-import { readLibraryViaBackup } from "../lib/invoke";
+import { logUnlessCommandError, readLibraryViaBackup } from "../lib/invoke";
 import { errMsg } from "../lib/format";
 import { onLive } from "../lib/liveEvents";
 import type {
@@ -29,6 +30,7 @@ import type {
   FootswitchInfo,
   FsSceneContext,
   NodeOverride,
+  SceneDrive,
   SceneHandleCandidate,
   SceneHandleRow,
   SceneInfo,
@@ -99,6 +101,16 @@ export interface LibraryScan {
    *  sourcing and map-presence discriminator as `sceneHandlesByIndex`, for
    *  `useFootswitchSceneContexts`'s instant-first path. */
   fsSceneContextsByIndex: Map<number, FsSceneContext[]>;
+  /** Per-preset, per-scene "what a run drives" keyed by 0-based LIST INDEX — the amp(s)
+   *  whose output level a scene row's DEFAULT control turns, or why it turns none
+   *  (`BackupPresetRow.scene_drives`, from the run's own planner), so Set up's Block shows
+   *  exactly what will be used with no device read. Every scanned preset gets an entry
+   *  (`[]` for a scene-less or unparseable one). */
+  sceneDrivesByIndex: Map<number, SceneDrive[]>;
+  /** The 0-based LIST INDICES of the presets the rebalance flow ("Balance its two amps
+   *  first") can act on: a scene drives two or more lane amps that re-merge into one
+   *  output (`BackupPresetRow.rebalanceable`). */
+  rebalanceableIndices: Set<number>;
   /** The unit's presets — `{ slot: 0-based LIST INDEX, name }` — for the Songs tab's
    *  Presets axis rail. Read from the same backup, so the axis needs no device call. */
   presets: { slot: number; name: string }[];
@@ -136,6 +148,8 @@ const emptyScan = (): LibraryScan => ({
   baseHandlesByIndex: new Map(),
   sceneOverridesByIndex: new Map(),
   fsSceneContextsByIndex: new Map(),
+  sceneDrivesByIndex: new Map(),
+  rebalanceableIndices: new Set(),
   presets: [],
   songPresetSlots: new Map(),
   songs: [],
@@ -249,6 +263,8 @@ export async function ensureLibraryScan(): Promise<void> {
     const baseHandles = new Map<number, SceneHandleCandidate[]>();
     const sceneOverrides = new Map<number, NodeOverride[][]>();
     const fsContexts = new Map<number, FsSceneContext[]>();
+    const sceneDrives = new Map<number, SceneDrive[]>();
+    const rebalanceable = new Set<number>();
     // backup slot is the 1-based device slot; the list is 0-based → −1.
     const presets: { slot: number; name: string }[] = [];
     res.presets.forEach((p) => {
@@ -271,6 +287,8 @@ export async function ensureLibraryScan(): Promise<void> {
       baseHandles.set(p.slot - 1, p.base_handles);
       sceneOverrides.set(p.slot - 1, p.scene_overrides);
       fsContexts.set(p.slot - 1, p.fs_scene_contexts);
+      sceneDrives.set(p.slot - 1, p.scene_drives);
+      if (p.rebalanceable) rebalanceable.add(p.slot - 1);
       presets.push({ slot: p.slot - 1, name: p.name });
     });
     // Song slot → preset LIST INDICES (preset device slot − 1), deduped per song.
@@ -310,6 +328,8 @@ export async function ensureLibraryScan(): Promise<void> {
       baseHandlesByIndex: baseHandles,
       sceneOverridesByIndex: sceneOverrides,
       fsSceneContextsByIndex: fsContexts,
+      sceneDrivesByIndex: sceneDrives,
+      rebalanceableIndices: rebalanceable,
       presets,
       songPresetSlots: pendingJoinUnknown ? null : songPresetSlots,
       ...(pendingSongs ?? { songs, setlists, setlistSongs }),
@@ -318,8 +338,11 @@ export async function ensureLibraryScan(): Promise<void> {
     pendingJoinUnknown = false;
   } catch (e) {
     // Scene details stay unknown and whole-preset ticks degrade to Base-only, but
-    // say so: `error` keeps this from reading as an empty library. Already on disk
-    // via the central invoke-failure logger.
+    // say so: `error` keeps this from reading as an empty library. The screen says it
+    // in plain words only, so the text must reach the log: a backup-read rejection is
+    // already there (the central invoke-failure logger), a throw from the processing
+    // above is logged here.
+    logUnlessCommandError("library scan", e);
     failure = errMsg(e);
   } finally {
     // Only the CURRENT scan settles. A reset (detach) already cleared state + the

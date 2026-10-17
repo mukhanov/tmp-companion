@@ -1,80 +1,106 @@
-// src/views/overlays/LevelingWizard.tsx — routes props → the right full-page stage
-// (design handoff 1a: full window for all three stages, replacing the old
-// setup-is-full-page/run+summary-are-a-centered-modal split — `WizardShell`/
-// `Dialog size="lg"` are no longer used by leveling; `WizardShell` itself stays for
-// Doctor). Purely presentational: levelRunStore (bound through useLevelingFlow) owns
-// the state machine and the device run.
+// src/views/overlays/LevelingWizard.tsx — the leveling flow's stage switch. Purely
+// presentational: levelRunStore (bound through useLevelingFlow) owns the state machine
+// and the device run.
 //
-// Stage → step: setup 0 (Set up) · run 1 (Level) · summary 2. Every stage is a
-// full-bleed page over the Level tab's body (`LevelPage`, `zIndex:40`) with no
-// backdrop at all — so Run can never be dismissed by a stray click mid-device-write,
-// and Summary's primary Accept/Done button is the unconditional way out.
+// Every stage is a look B page in the Level tab's content area, under the toolbar
+// (`FlowPage`): Set up (`SetupPage`), the run (`RunPage`, whose Stop asks first in a
+// dialog that a stray click can't dismiss) and the Summary (`SummaryPage`).
 
 import type { Stage } from "./wizardContext";
 import { SetupPage } from "../level/SetupPage";
 import { RunPage } from "../level/RunPage";
 import { SummaryPage } from "../level/SummaryPage";
-import type { PickOption } from "./Pick";
-import type { SetupOption, SetupChoice, RunItem } from "../level/leveling";
-import type { RunState } from "../level/levelRunStore";
+import type { SelectOption } from "../../ui/selectValue";
+import type {
+  SetupOption,
+  SetupChoice,
+  RunItem,
+  TargetLufsOf,
+} from "../level/leveling";
+import type { RunState, SummaryScenes } from "../level/levelRunStore";
 
 export interface LevelingWizardProps {
   stage: Exclude<Stage, "closed">;
   // setup inputs
   chosen: SetupOption[];
-  isRelevel: boolean;
-  instrumentOptions: PickOption[];
-  targetOptions: PickOption[];
+  /** "None" + each instrument (`value` = profile id). */
+  instrumentOptions: SelectOption[];
+  /** The instruments with a recording. */
+  recordedInstruments: ReadonlySet<string>;
+  /** The configured targets' names, in their order. */
+  targetNames: string[];
+  /** The instrument saved for each preset (0-based list index → id). */
+  savedInstruments: Partial<Record<number, string>>;
   defaultInst: string;
-  defaultTarget: string;
-  instrumentName: (id: string) => string;
-  /** Resolve a target name to its LUFS (the run table's Target column). */
-  targetLufsByName: (name: string | null) => number;
-  /** The run's published state (the live meter is RunPage's own store read). */
+  /** Resolve a target name to its LUFS (the run's meter, the Summary's clamp side). */
+  targetLufsByName: TargetLufsOf;
+  /** The run on screen (the live meter is RunPage's own store read). */
   run: RunState;
+  /** Every sound the flow ran, with its latest result (the Summary's rows). */
+  results: RunItem[];
+  /** Footswitch scenes changed on the Summary. */
+  summaryScenes: SummaryScenes;
+  /** Re-amp may still be on, by the flow's latest reading (the Summary's Notice). */
+  reampStillOn: boolean;
   // callbacks
   onCancel: () => void;
-  /** Set up's commit: the configured rows and its opt-in rebalance toggle. */
-  onStart: (choices: SetupChoice[], rebalance: boolean) => void;
+  /** Set up's commit: the configured sounds and the presets balanced first. */
+  onStart: (choices: SetupChoice[], rebalance: number[]) => void;
+  /** Remember a preset's instrument choice. */
+  onInstrumentChange?: (slot: number, id: string) => void;
   onRunCancel: () => void;
   onRunComplete: () => void;
-  onAccept: () => void;
-  onRelevel: (subset: RunItem[]) => void;
-  /** Jump to Settings → Instruments (the Set-up step's "calibrate" cue). */
+  onSummaryScene: (key: string, scene: number | null | undefined) => void;
+  onTryAgain: (keys: readonly string[]) => void;
+  onDone: () => void;
+  /** Jump to Settings → Instruments ("Record yours in Settings"). */
   onCalibrate?: () => void;
+  /** Jump to Settings → Loudness targets ("Add a target in Settings"). */
+  onAddTarget?: () => void;
+  /** The app's store is still loading (Set up waits for its targets). */
+  storeLoading?: boolean;
 }
 
 export function LevelingWizard({
   stage,
   chosen,
-  isRelevel,
   instrumentOptions,
-  targetOptions,
+  recordedInstruments,
+  targetNames,
+  savedInstruments,
   defaultInst,
-  defaultTarget,
-  instrumentName,
   targetLufsByName,
   run,
+  results,
+  summaryScenes,
+  reampStillOn,
   onCancel,
   onStart,
+  onInstrumentChange,
   onRunCancel,
   onRunComplete,
-  onAccept,
-  onRelevel,
+  onSummaryScene,
+  onTryAgain,
+  onDone,
   onCalibrate,
+  onAddTarget,
+  storeLoading,
 }: LevelingWizardProps) {
   if (stage === "setup") {
     return (
       <SetupPage
         options={chosen}
-        isRelevel={isRelevel}
         instrumentOptions={instrumentOptions}
-        targetOptions={targetOptions}
+        recordedInstruments={recordedInstruments}
+        targetNames={targetNames}
+        savedInstruments={savedInstruments}
         defaultInst={defaultInst}
-        defaultTarget={defaultTarget}
         onCancel={onCancel}
         onStart={onStart}
+        onInstrumentChange={onInstrumentChange}
         onCalibrate={onCalibrate}
+        onAddTarget={onAddTarget}
+        storeLoading={storeLoading}
       />
     );
   }
@@ -87,9 +113,8 @@ export function LevelingWizard({
         total={run.total}
         phase={run.phase}
         tailMessage={run.tailMessage}
-        instrumentName={instrumentName}
         targetLufsByName={targetLufsByName}
-        onCancel={onRunCancel}
+        onStop={onRunCancel}
         onComplete={onRunComplete}
       />
     );
@@ -97,10 +122,14 @@ export function LevelingWizard({
 
   return (
     <SummaryPage
-      items={run.items}
+      items={results}
       stopped={run.phase === "stopped"}
-      onAccept={onAccept}
-      onRelevel={onRelevel}
+      reampStillOn={reampStillOn}
+      targetLufsByName={targetLufsByName}
+      sceneOverrides={summaryScenes}
+      onSceneChange={onSummaryScene}
+      onTryAgain={onTryAgain}
+      onDone={onDone}
     />
   );
 }

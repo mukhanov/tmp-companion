@@ -236,7 +236,7 @@ pub(crate) fn e2e_offline_fake() -> bool {
 /// set by a successful seed (in-process `e2e_seed_scenario`, or the runner's fresh-process
 /// `probe --seed-scenario` via its `e2e_mark_seeded` POST) and invalidated only through
 /// [`invalidate_scenario`]: by a scenario slot clear, or by [`note_structural_save`] — a
-/// same-run STRUCTURAL save (copy, doctor-save) over a resident fixture slot changes what's
+/// same-run STRUCTURAL save (a copy) over a resident fixture slot changes what's
 /// on the device without going through a clear. Lets every `ensureScenario` call after the
 /// first skip the in-process re-verify (11 field-8 reads plus a re-import of every fixture a
 /// spec leveled). A stray sweep never touches it: a stray sits at a non-scenario slot, so
@@ -257,7 +257,7 @@ static SCENARIO_VERIFIED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// nothing else invalidates the fast path for it. Pinned by
 /// `e2e_server_tests::note_structural_save_flags_structural_saves_only`.
 #[cfg(feature = "e2e")]
-const STRUCTURAL_SAVE_CMDS: [&str; 2] = ["copy_apply", "doctor_save"];
+const STRUCTURAL_SAVE_CMDS: [&str; 1] = ["copy_apply"];
 
 #[cfg(feature = "e2e")]
 /// The origin Tauri treats as the app's OWN webview for ACL purposes. It is

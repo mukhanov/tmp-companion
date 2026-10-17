@@ -104,8 +104,7 @@ export async function listPresets(page: Page): Promise<Preset[]> {
  *  presence-only check that a structurally mutilated preset trivially passes, so
  *  `e2e_seed_scenario` (and its re-verify) was never even invoked online
  *  (2026-08-01 incident, third and final link — see the registry in
- *  `notes/user-journeys.md`; `doctor-apply.online.spec.ts`'s own comment records the
- *  first occurrence of this class). */
+ *  `notes/user-journeys.md`, which also records the first occurrence of this class). */
 export async function ensureScenario(page: Page): Promise<void> {
   if (!(await isOnline(page))) {
     const list = await listPresets(page);
@@ -126,71 +125,103 @@ export async function openLevel(page: Page): Promise<void> {
   await page.goto("/");
   const disclaimer = page.getByRole("button", { name: /backed up/i });
   if (await disclaimer.isVisible().catch(() => false)) await disclaimer.click();
-  await expect(page.getByText(/connected · \d+\.\d+/)).toBeVisible({
+  await expect(page.getByText(/Connected · firmware \d+\.\d+/)).toBeVisible({
     timeout: 20_000,
   });
 }
 
-/** The Base row's stable identity, mirroring `setupRowHookKey`'s `baseKey(slot)`
- *  (`leveling.ts`) — the `Pick`'s `tid` for a Base row's target picker is
+/** The main sound row's stable identity, mirroring `setupRowHookKey`'s `baseKey(slot)`
+ *  (`leveling.ts`) — the `Select`'s `tid` for that row's Target dropdown is
  *  `target:${baseRowKey(slot)}`, unique per preset regardless of how many other
  *  rows (scenes/footswitches) that preset also has selected. */
 export const baseRowKey = (slot: number): string => `p${String(slot)}`;
 
-/** Select ONLY a preset's Base row (never its scenes/footswitches) — expand the caret, then
- *  tick the "Base Preset" child row alone. Kept even though the target picker no longer
- *  collides across a preset's other rows (each row now has its own `target:<rowKey>`
- *  selector) — this still isolates a base-clamp test to exactly the one row it means to
- *  drive. */
+/** Open a preset on the Level (or Doctor) list with its caret ("Open <name>"). The caret
+ *  is there only once the backup scan has read the preset's scenes and footswitches, so
+ *  this also waits for the scan. */
+export async function openPreset(page: Page, name: string): Promise<void> {
+  await page
+    .getByRole("button", { name: `Open ${name}`, exact: true })
+    .click({ timeout: 60_000 });
+}
+
+/** The list's checkbox for one sound of a preset ("Choose Rhythm in E2E Rig"). */
+export const soundBox = (page: Page, sound: string, preset: string) =>
+  page.getByRole("checkbox", {
+    name: `Choose ${sound} in ${preset}`,
+    exact: true,
+  });
+
+/** The list's checkbox for a whole preset ("Choose E2E Rig"). */
+export const presetBox = (page: Page, preset: string) =>
+  page.getByRole("checkbox", { name: `Choose ${preset}`, exact: true });
+
+/** The Level list's main action once something is chosen: "Level N sounds" (it counts
+ *  SOUNDS — the main sound, each scene, each footswitch). */
+export const levelButton = (page: Page, sounds: number | "any") =>
+  page.getByRole("button", {
+    name:
+      sounds === "any"
+        ? /^Level \d+ sounds?$/
+        : new RegExp(`^Level ${String(sounds)} sounds?$`),
+  });
+
+/** Select ONLY a preset's main sound (never its scenes/footswitches) — open it with the
+ *  caret, then tick the "Main sound" sub-row alone. Kept even though each Set up row has
+ *  its own `target:<rowKey>` dropdown — this still isolates a base-clamp test to exactly
+ *  the one row it means to drive. */
 export async function selectBaseOnly(page: Page, name: string): Promise<void> {
   const filter = page.getByPlaceholder(/Filter by name or slot/i);
   await filter.fill(name);
-  await page
-    .getByTitle(/Show Base/)
-    .first()
-    .click();
-  await page.getByText("Base Preset", { exact: true }).click();
+  await openPreset(page, name);
+  await soundBox(page, "Main sound", name).click();
   await filter.fill("");
 }
 
-/** Design 1a auto-opens only the LOWEST-slot preset group in Set up (`useGroupOpen`,
- *  `SetupPage.tsx`'s `groups[0]`) — every other selected preset's row starts collapsed,
- *  so its sound rows (and their `data-pick="target:<rowKey>"` triggers) aren't in the DOM
- *  yet. Click the group header (`data-preset-group={slot}`, `PresetGroupRow.tsx`) to
- *  expand it before targeting a row inside. A no-op if the group is already open. */
-export async function ensurePresetGroupOpen(
+/** Pick a Set up dropdown's option by the e2e hooks `Select` carries:
+ *  `data-select="<tid>"` on the trigger, `data-select-option="<tid>:<value>"` on each
+ *  option (`ui/Select.tsx`; row tids are keyed by `setupRowHookKey`, `leveling.ts`). An
+ *  attribute selector rather than the option's TEXT: two rows' lists can show the same
+ *  words ("Lead"), and the attribute is unique per (dropdown, option) pair by
+ *  construction, so there is never more than one match. */
+export async function chooseOption(
   page: Page,
-  slot: number,
+  tid: string,
+  value: string,
 ): Promise<void> {
-  const trigger = page.locator(`[data-pick="target:${baseRowKey(slot)}"]`);
-  if (!(await trigger.isVisible().catch(() => false))) {
-    await page.locator(`[data-preset-group="${String(slot)}"]`).click();
-  }
+  await page.locator(`[data-select="${tid}"]`).click();
+  await page.locator(`[data-select-option="${tid}:${value}"]`).click();
 }
 
-/** Pick a Base row's target by its option id ("Rhythm"/"Crunch"/"Lead"). Uses
- *  `data-pick-option="target:<rowKey>:<id>"` (`Pick.tsx`, keyed by `setupRowHookKey` —
- *  `leveling.ts`) rather than the option's TEXT — a text-based
- *  `getByText(label,{exact:true}).last()` proved unreliable once a SECOND preset's picker
- *  opens while an earlier preset is already bound to the same label: Playwright's own
- *  actionability wait ("visible, enabled, stable" all pass) still hung on click, retried
- *  hundreds of times, and eventually timed out with "<div></div> subtree intercepts pointer
- *  events" — `.last()`'s re-resolved match apparently isn't a stable target across retries.
- *  The attribute selector is unique per (row, option) pair by construction, so there is
- *  never more than one match to begin with. */
+/** Pick a main sound row's target by name ("Rhythm"/"Crunch"/"Lead"). Every Set up row
+ *  shows at once (no preset collapses), so no row needs opening first. */
 export async function pickBaseTarget(
   page: Page,
   slot: number,
   label: string,
 ): Promise<void> {
-  const key = baseRowKey(slot);
-  await page.locator(`[data-pick="target:${key}"]`).click();
-  await page.locator(`[data-pick-option="target:${key}:${label}"]`).click();
+  await chooseOption(page, `target:${baseRowKey(slot)}`, label);
 }
 
-/** Drive the Level wizard's Base flow end to end for one or more presets: select each
- *  preset's Base row, submit, pick and confirm each target label, submit, and wait for
- *  Done/Accept. */
+/** Set up's one main action. It keeps its words whatever it waits for. */
+export const startLeveling = (page: Page) =>
+  page.getByRole("button", { name: "Start leveling", exact: true });
+
+/** The Summary's main action — always "Done", whatever the outcome (everything is
+ *  already saved). Its appearance is how a spec knows the run reached the Summary. */
+export const summaryDone = (page: Page) =>
+  page.getByRole("button", { name: "Done", exact: true });
+
+/** The Summary's "Try again (N)", for any N or exactly `n`. */
+export const tryAgainButton = (page: Page, n: number | "any" = "any") =>
+  page.getByRole("button", {
+    name: n === "any" ? /^Try again \(\d+\)$/ : `Try again (${String(n)})`,
+    exact: true,
+  });
+
+/** Drive the Level flow's main-sound path end to end for one or more presets: select
+ *  each preset's main sound, submit, pick and confirm each target, start, and wait for
+ *  the Summary. */
 export async function runBaseLevel(
   page: Page,
   targets: { preset: Preset; label: string }[],
@@ -199,34 +230,26 @@ export async function runBaseLevel(
   for (const { preset } of targets) {
     await selectBaseOnly(page, preset.name);
   }
-  const n = String(targets.length);
-  await page
-    .getByRole("button", { name: new RegExp(`Level ${n} preset`) })
-    .click();
+  await levelButton(page, targets.length).click();
   await page.getByText(/I.ve backed up with Pro Control/i).click();
   for (const { preset, label } of targets) {
-    await ensurePresetGroupOpen(page, preset.slot);
     await pickBaseTarget(page, preset.slot, label);
   }
-  // The picks must actually BIND — assert each row's trigger now reads its target (guards
+  // The picks must actually BIND — assert each row's dropdown now reads its target (guards
   // a silent display-vs-value no-op an always-solving fake re-amp would otherwise hide).
   for (const { preset, label } of targets) {
     await expect(
-      page.locator(`[data-pick="target:${baseRowKey(preset.slot)}"]`),
+      page.locator(`[data-select="target:${baseRowKey(preset.slot)}"]`),
     ).toContainText(label);
   }
-  await page
-    .getByRole("button", { name: new RegExp(`Start.*${n} sound`) })
-    .click();
-  await expect(
-    page.getByRole("button", { name: /^(Done|Accept)$/ }),
-  ).toBeVisible({
+  await startLeveling(page).click();
+  await expect(summaryDone(page)).toBeVisible({
     timeout: 240_000,
   });
 }
 
-/** Select each preset in `presets` on the Level tab by name (filter → "Select preset to
- *  level" → clear filter) — the Level twin of `selectPresetsForCheck`. */
+/** Choose each preset in `presets` WHOLE on the Level tab by name (filter → its
+ *  "Choose <name>" checkbox → clear filter) — the Level twin of `selectPresetsForCheck`. */
 export async function selectPresetsForLevel(
   page: Page,
   presets: Preset[],
@@ -234,34 +257,72 @@ export async function selectPresetsForLevel(
   const filter = page.getByPlaceholder(/Filter by name or slot/i);
   for (const p of presets) {
     await filter.fill(p.name);
-    await page.getByTitle("Select preset to level").first().click();
+    await presetBox(page, p.name).click();
   }
   await filter.fill("");
 }
 
-/** Open Doctor and select each preset in `presets` by name (filter → click "Select preset
- *  to check" → clear filter). Shared by every doctor spec's selection step (was a
+/** Open Doctor and select each preset in `presets` by name (filter → its "Choose <name>"
+ *  checkbox → clear filter). Shared by every doctor spec's selection step (was a
  *  byte-identical loop in doctor.spec.ts and doctor.online.spec.ts). */
 export async function selectPresetsForCheck(
   page: Page,
   presets: Preset[],
 ): Promise<void> {
-  // `exact`: the Level list's per-preset "<name> sounds" disclosure (E2E Doctor Oracle)
-  // also contains the word.
+  // `exact`: the Level list's "E2E Doctor Oracle" name button also contains the word.
   await page.getByRole("button", { name: "Doctor", exact: true }).click();
   const filter = page.getByPlaceholder(/Filter by name or slot/i);
   for (const p of presets) {
     await filter.fill(p.name);
-    await page.getByTitle("Select preset to check").first().click();
+    await presetBox(page, p.name).click();
   }
   await filter.fill("");
 }
 
-/** Click "Check N sounds" then "Run check on N sounds" — the two-step Doctor run trigger,
- *  always immediately after `selectPresetsForCheck`. */
-export async function runDoctorCheck(page: Page): Promise<void> {
-  await page.getByRole("button", { name: /Check \d+ sounds/ }).click();
-  await page.getByRole("button", { name: /Run check on \d+ sounds/ }).click();
+/** Click "Check N sounds" — always immediately after `selectPresetsForCheck`. When Doctor
+ *  asks which instrument plays the chosen presets (one has none saved yet), choose None
+ *  for all of them (the instrument a check uses when none is chosen — the same stimulus
+ *  as before Doctor asked) and click "Check N sounds" again. Doctor remembers the choice
+ *  for each preset, so a later check of the same presets on the same server skips the
+ *  question.
+ *
+ *  `expectInstrumentPage` makes the question required: use it for a check of presets
+ *  this server has never been asked about. Every e2e_server starts each run from its own
+ *  empty store (`e2e/playwright.config.ts`), so the page must show, and a store left over
+ *  from an earlier run fails here instead of quietly skipping the page. */
+export async function runDoctorCheck(
+  page: Page,
+  { expectInstrumentPage = false }: { expectInstrumentPage?: boolean } = {},
+): Promise<void> {
+  const check = page.getByRole("button", { name: /^Check \d+ sounds?$/ });
+  await check.click();
+  // Every page after the list carries Doctor's Steps; the Instrument page is the one
+  // that asks.
+  const ask = page.getByRole("heading", {
+    name: "Which instrument plays these?",
+  });
+  if (expectInstrumentPage) {
+    await expect(
+      ask,
+      "Doctor skipped its Instrument page: this server's store already holds an instrument for these presets",
+    ).toBeVisible();
+  } else {
+    await expect(
+      ask.or(page.getByRole("list", { name: "Steps" })),
+    ).toBeVisible();
+    if (!(await ask.isVisible())) return;
+  }
+  const forAll = page.locator('[data-select="inst-all"]');
+  if (await forAll.isVisible()) {
+    await forAll.click();
+    await page.locator('[data-select-option="inst-all:none"]').click();
+  } else {
+    const one = page.locator('[data-select^="inst:"]').first();
+    const tid = await one.getAttribute("data-select");
+    await one.click();
+    await page.locator(`[data-select-option="${tid ?? ""}:none"]`).click();
+  }
+  await check.click();
 }
 
 /** Best-effort invoke: swallow errors (offline lacks some commands; online a teardown
@@ -543,9 +604,11 @@ function cardAttrValues(
 export const tileLabels = (page: Page, cardName: string): Promise<string[]> =>
   cardAttrValues(page, cardName, "data-block-tile");
 
-/** The candidate block labels offered in an OPEN BlockEditor (the reference preset's
- *  distinct blocks) — for same/different-model picks. */
-export const candidateLabels = (
-  page: Page,
-  cardName: string,
-): Promise<string[]> => cardAttrValues(page, cardName, "data-candidate");
+/** The block models on Copy's source strip (the `data-block-tile` values in the "Copy
+ *  from" card), in signal order — for same/different-model picks. */
+export const sourceLabels = (page: Page): Promise<string[]> =>
+  page
+    .locator("[data-source-card] [data-block-tile]")
+    .evaluateAll((els) =>
+      els.map((e) => e.getAttribute("data-block-tile") ?? "").filter(Boolean),
+    );

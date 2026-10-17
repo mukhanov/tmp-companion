@@ -8,7 +8,7 @@ Discovery-only artifact (no implementation). **Currency rule:** the operational
 instructions (runner invocations, preconditions, recovery) are kept current; the
 scenario inventory and automation backlog are a snapshot as of the date above — check
 `notes/user-journeys.md` + `ls e2e/specs/` for today's coverage. Maps **every** interactive surface, state
-machine, edge state, and chaos sequence across the tabs (5 at snapshot time; Doctor landed after — its journeys are tracked in `notes/user-journeys.md` and gated by `doctor.spec.ts` + `doctor-apply.online.spec.ts`), consolidates them into a runnable
+machine, edge state, and chaos sequence across the tabs (5 at snapshot time; Doctor landed after — its journeys are tracked in `notes/user-journeys.md` and gated by `doctor.spec.ts` + `doctor.online.spec.ts`; Doctor never writes, so no spec reads a Doctor save back), consolidates them into a runnable
 scenario set, and tags each scenario with a regression-automation recommendation.
 
 Sources: a full read of `src/views/**`, `src/App.tsx`, `src/ui/{DeviceStatus,ErrorBoundary}`,
@@ -60,14 +60,14 @@ single rollback at the end.
 
 ## 1. Test matrix at a glance
 
-| Area                 | Functional scenarios | Monkey/chaos scenarios | Existing auto-coverage                            | Biggest gap                                                         |
-| -------------------- | -------------------- | ---------------------- | ------------------------------------------------- | ------------------------------------------------------------------- |
-| Connection lifecycle | C1–C7                | M-C1–M-C3              | unit (`connectError`, `DeviceStatus`, `firmware`) | mid-op disconnect; Pro-Control-grab red banner live                 |
-| Level + wizard       | L1–L14               | M-L1–M-L8              | e2e happy paths + many vitest                     | **cancel mid-run**, partial failure, clamp/offbranch live           |
-| Copy                 | P1–P10               | M-P1–M-P5              | e2e + vitest happy paths                          | physical unplug mid-save (partial failure + Back gated in Vitest)   |
-| Songs                | S1–S13               | M-S1–M-S4              | e2e CRUD + vitest                                 | **add-to-setlist + reorder e2e**, BPM-didn't-stick warn             |
-| Catalog              | T1–T7                | M-T1–M-T2              | model-wall + `CatalogView` interaction unit tests | scroll/DnD only (filters/sort/facets now in `CatalogView.test.tsx`) |
-| Settings             | E1–E10               | M-E1–M-E3              | vitest only                                       | **calibration flow live**, slider/drag, no e2e at all               |
+| Area                 | Functional scenarios | Monkey/chaos scenarios | Existing auto-coverage                            | Biggest gap                                                       |
+| -------------------- | -------------------- | ---------------------- | ------------------------------------------------- | ----------------------------------------------------------------- |
+| Connection lifecycle | C1–C7                | M-C1–M-C3              | unit (`connectError`, `DeviceStatus`, `firmware`) | mid-op disconnect; Pro-Control-grab busy page live                |
+| Level + wizard       | L1–L14               | M-L1–M-L8              | e2e happy paths + many vitest                     | **cancel mid-run**, partial failure, clamp/offbranch live         |
+| Copy                 | P1–P10               | M-P1–M-P5              | e2e + vitest happy paths                          | physical unplug mid-save (partial failure + Back gated in Vitest) |
+| Songs                | S1–S13               | M-S1–M-S4              | e2e CRUD + vitest                                 | **add-to-setlist + reorder e2e**, BPM-didn't-stick warn           |
+| Catalog              | T1–T7                | M-T1–M-T2              | model-wall + `CatalogView` interaction unit tests | scroll only (filters/sort/details now in `CatalogView.test.tsx`)  |
+| Settings             | E1–E10               | M-E1–M-E3              | vitest only                                       | **calibration flow live**, slider/drag, no e2e at all             |
 
 ---
 
@@ -76,22 +76,26 @@ single rollback at the end.
 Preconditions reset between runs by clearing `localStorage`/`sessionStorage` (the disclaimer +
 gate keys live there — `gates.ts`).
 
-- **C1 — Cold launch, device present.** Launch app → expect Disclaimer gate first (storage clear),
-  then after accept: DeviceStatus goes hollow→amber "reading firmware…" (≥900 ms floor)→green
-  "connected · <fw>". Level tab paints list + hero together.
-- **C2 — Disclaimer gate.** Both paths: "I've backed up — continue" with and without "Don't show
-  again". Verify the perm checkbox writes `localStorage tmp_disclaimer_perm=1` (survives relaunch);
+- **C1 — Cold launch, device present.** Launch app → expect the first-run page first (storage
+  clear), then after accept: DeviceStatus shows "Connecting…" (≥900 ms floor) → green dot
+  "Connected · firmware <fw>". Level tab paints list + hero together.
+- **C2 — First-run gate.** Both paths: "I've backed up, continue" with and without "Don't show
+  this again". Verify the tick writes `localStorage tmp_disclaimer_perm=1` (survives relaunch);
   without it, only `sessionStorage` (re-prompts next cold launch).
-- **C3 — Launch with no device.** Unplug → launch → friendly "Please connect your Tone Master Pro…"
-  banner (NOT red), DeviceStatus hollow, 3 s retry loop armed. Plug in → auto-connects within ~3 s,
-  no "Try again" needed.
-- **C4 — Pro Control holding the device.** Open Pro Control, launch app → **red** AlertBanner with
-  the "close Fender Pro Control" hint (the one actionable-error case). Close PC → retry/auto-recovers.
-- **C5 — Firmware gate.** (Hard to force without old fw.) If fw < 1.7: Level/Copy/Songs show
-  FirmwareGate full-page ("Use it anyway"); Catalog/Settings stay reachable;
-  DeviceStatus shows persistent "untested ⚠". "Use it anyway" unlocks per-mount.
-- **C6 — Hot-plug detach.** While connected on Level, unplug → DeviceStatus→hollow, body→EmptyState,
-  firmware/graph cleared, retry loop stays armed. Replug → auto-reconnects, body repopulates.
+- **C3 — Launch with no device.** Unplug → launch → "Connecting to your Tone Master Pro…", then the
+  "Plug in your Tone Master Pro" page, DeviceStatus hollow "Not connected", 3 s retry loop armed.
+  Plug in → auto-connects within ~3 s, nothing to click.
+- **C4 — Pro Control holding the device.** Open Pro Control, launch app → the "Another app is
+  using your Tone Master Pro" page (kind `busy`, no button) and "In use by another app" in the
+  toolbar; the backend's "close Fender Pro Control" text goes to the log only. Close PC →
+  auto-recovers on the next retry.
+- **C5 — Firmware gate.** (Hard to force without old fw.) If fw < 1.7: Level/Doctor/Copy/Songs
+  show the "This firmware hasn't been tested" page ("Use it anyway"); Catalog/Settings stay
+  reachable; DeviceStatus keeps "Untested firmware <fw>" in caution. "Use it anyway" unlocks
+  per-mount.
+- **C6 — Hot-plug detach.** While connected on Level, unplug → DeviceStatus "Not connected", body →
+  the "Plug in your Tone Master Pro" page (DeviceState), firmware/graph cleared, retry loop stays
+  armed. Replug → auto-reconnects, body repopulates.
 - **C7 — Tab routing.** Click through all 6 tabs (incl. Doctor, post-snapshot); each body wrapped in `ErrorBoundary key={tab}` —
   a crash in one tab shows its fallback ("Try again"/"Reload") without killing the tab bar or
   connection. Catalog/Settings render disconnected (deviceIndependent).
@@ -111,58 +115,77 @@ gate keys live there — `gates.ts`).
 ## 3. Level tab + leveling wizard
 
 The wizard is **3 stages** — `setup → run → summary` (no separate Disclaimer/Backup stage; the
-backup ack is an inline checkbox in the Setup footer, see §8). Most monkey-value is concentrated here.
+backup ack is an inline checkbox in the Setup footer, see §8). Set up is a page in the Level tab:
+the list stays mounted, hidden, underneath it, so a text query that is not scoped to Set up's rows
+(`[data-setup-row]`) can match the hidden list first. Most monkey-value is concentrated here.
 
 ### Functional
 
 - **L1 — Hero diagram.** Active preset renders in ActiveSignalChainView; scene tag + slot badge
   correct. Skeleton on load; "Scene recalled — signal view didn't refresh" + Retry on the watchdog.
 - **L2 — Preset list paint.** List populates on connect rising-edge (plug in after launch still
-  populates). Backup-scan strip shows determinate %; carets inert until `ready`.
-- **L3 — Selection model.** Whole-preset checkbox selects ALL children (Base + FS scenes +
-  footswitches). Indeterminate when 0<sel<total. Select-all header checkbox + indeterminate.
-- **L4 — Scene tree.** Expand caret reveals Base / FS-scene / footswitch child rows; "N scenes ·
-  M footswitches" breakdown collapsed; toggle individual child keys; empty slot = inert "— empty —".
+  populates). While the backup scan reads, the filter bar shows "Reading preset details" + bar +
+  %, every row says "Reading…", there are no carets, and Level waits busy ("You can start when
+  reading finishes").
+- **L3 — Selection model.** Whole-preset checkbox ("Choose <name>") selects ALL children (main
+  sound + scenes + footswitches); mixed when 0<sel<total ("2 of 6 chosen"). "Select all N shown"
+  acts on the presets the filter shows only, and its mixed state is computed over them.
+  The footer's Level button is always there: greyed with its reason, else "Level N sounds".
+- **L4 — Scene tree.** The caret ("Open <name>") and the NAME of a preset with scenes open its
+  sub-rows (main sound / scenes / footswitches, each "Choose <sound> in <preset>"); the name of a
+  preset without scenes chooses it. Collapsed caption "3 scenes, 1 footswitch"; toggle
+  individual sounds; empty slot = inert "Empty".
 - **L5 — Filter** ⌨️ — type a name; selection persists across filter changes; input disabled while
-  loading.
-- **L6 — "How leveling works" sheet** — opens, Got it / X / backdrop / Escape all close it.
-- **L7 — Setup: apply-to-all** — bulk Instrument + Target pickers brush all ticked rows; "Clear
-  ticks"; per-row overrides (Instrument / Target / FsParamPick).
-- **L8 — Setup: backup ack gating** — "Level N sounds" disabled until backup checkbox ticked (fresh
-  run only; re-level hides it). Disabled at total=0.
-- **L9 — "Even out parallel amps" toggle** — default off; on → ByEarChip + rebalance footnote band.
+  loading; "X of N shown"; matching nothing shows `No presets match "…"` with Clear filter.
+- **L6 — "How leveling works" dialog** — opens from "How it works"; Done or the scrim closes it
+  (no × button, no key handling).
+- **L7 — Setup: for all** — "Target for all" ("By name" / a target / "Mixed") and, with 2+
+  presets, "Instrument for all"; one instrument per preset, saved for the preset; per-row Target,
+  Block, Knob and "Level it in scene" dropdowns.
+- **L8 — Setup: backup ack gating** — "Start leveling" disabled until the backup checkbox is
+  ticked. The Summary's "Try again" re-runs without Set up, so it never asks again. Disabled at
+  total=0.
+- **L9 — "Balance its two amps first"** — per preset, shown only where the backend can rebalance;
+  default off; on → a rebalanced sound's Summary row says "Check by ear" with the two-amp reason.
 - **L10 — Run: whole preset** — fires `level_preset` + `level_scenes_apply_batched` +
-  `level_footswitches_apply`; live LUFS strip; auto-advance to Summary 650 ms after natural finish.
+  `level_footswitches_apply`; the now line and the LoudnessMeter (no numbers) follow the sound in
+  progress; auto-advance to Summary 650 ms after natural finish.
 - **L11 — Run: Base-only / scene-only / footswitch-only** — verify only the relevant command(s)
   fire (footswitch-only dispatches `level_footswitches_apply`, not `level_preset`).
-- **L12 — Summary: all-good** — "All N sounds leveled", green, "Done" (clears selection).
-- **L13 — Summary: clamped** — clamped group + amber "lower the target" banner + **Re-level clamped
-  subset** (→ Setup, re-level mode, backup ack hidden). Off-branch → "Needs routing", never offered
-  re-level.
-- **L14 — By-ear footnotes** — dynamic (spread ≥6 LU) and rebalance reasons; one chip per row;
-  closing line spells out only the causes present.
+- **L12 — Summary: all-good** — "All N sounds leveled.", "Everything is saved on your Tone Master
+  Pro.", only "Done" (clears selection).
+- **L13 — Summary: needs you** — a full-volume clamp says "Already at full volume, so it can't reach
+  <target>. Choose a quieter target for it." with no button and outside "Try again (N)"; the way
+  to a quieter target is Done → the list → Set up (the clamp loop, `level-defaults.spec.ts`).
+  Off-target, not confirmed, unread and not-reached sounds, and a save that didn't hold, are in
+  "Try again (N)", which runs them straight away (no Set up, no backup tick) and updates the same
+  Summary. Off-branch → the routing sentence, never tried again.
+- **L14 — Check by ear / Loud peaks** — envelope, wet-floor and rebalance causes; at most one badge
+  per row (Loud peaks wins); a cause or loud peaks shared by two or more sounds becomes one Notice.
 
 ### Monkey/chaos (the high-value gaps — near-zero existing coverage)
 
-- **M-L1 — Stop mid-run, then Continue.** Stop during scene 2 of 3 → all three cancel lanes fire,
-  in-flight ~6 s capture finishes, "Stopping…"→"Leveling stopped", remaining items "Not leveled",
-  **already-written levels stay saved**, Continue → Summary. **Verify the unit is NOT left
-  input-muted** (the reason `clearScenario` calls `e2e_reamp_off`). _No UI test exists for this._
-- **M-L2 — Stop then Re-level the partial.** After a stopped run, re-level the clamped/leftover set.
+- **M-L1 — Stop mid-run → Summary.** Stop (confirmed in "Stop leveling?") during scene 2 of 3 →
+  all three cancel lanes fire, the in-flight capture winds down, "Stopping after <sound> in
+  <preset>" → the Summary on its own, remaining sounds "Not reached", **already-written levels
+  stay saved**. **Verify the unit is NOT left input-muted** (the reason `clearScenario` calls
+  `e2e_reamp_off`). _No hardware UI test exists for this._
+- **M-L2 — Stop, then Try again.** After a stopped run, "Try again (N)" runs the not-reached set
+  straight away and the same Summary comes back updated (offline: `level-defaults.spec.ts`
+  scenario 4).
 - **M-L3 — Cancel → reopen → run again.** Re-issues commands fresh (no stale cross-run cache —
   vitest covers the assertion, but verify live).
-- **M-L4 — Backdrop/Escape probing per stage.** Setup: no backdrop/Escape (full-page) — confirm
-  clicking outside does nothing. Run: backdrop/Escape **blocked**. Summary: backdrop = Cancel
-  (closes, does NOT clear selection — asymmetry vs Done). Verify each.
-- **M-L5 — Double-click the primary.** Double-click "Level N sounds" / "Done" / "Re-level" — must
-  fire once, not start two runs.
+- **M-L4 — Backdrop/Escape probing per stage.** Set up, the run and the Summary are pages (no
+  backdrop); the run's "Stop leveling?" dialog ignores a backdrop click and Escape. Verify each.
+- **M-L5 — Double-click the primary.** Double-click "Level N sounds" / "Start leveling" / "Try
+  again (N)" / "Done" — must fire once, not start two runs.
 - **M-L6 — Tab-switch mid-run / mid-scan.** Switch away during an active run and during the backup
   scan; return. Hero must survive remount (module-scoped store); run state and shared `libraryScan`
   must not corrupt. _Only single remount-with-push is covered._
 - **M-L7 — Partial failure.** A preset/scene that errors mid-run → item "skipped", run continues,
   never aborts; Summary shows it. _No test injects a `status:"error"` item._
-- **M-L8 — Empty / no-scene / no-footswitch presets** in setup — Base row labeled "Whole preset";
-  no caret; FsParamPick column empty for re-leveled footswitches.
+- **M-L8 — Empty / no-scene / no-footswitch presets** in setup — the main sound is "Main sound"
+  like any other; no caret; a re-leveled footswitch takes its knobs from the backup scan.
 
 ---
 
@@ -173,43 +196,50 @@ device write is `copy_apply` on Save.
 
 ### Functional
 
-- **P1 — Gating order** — disconnected ("Copy lives on the Tone Master Pro") > error ("Try again") >
-  steps. Reference auto-defaults to on-unit preset (or `presets[0]`) on late list arrival.
-- **P2 — Step 1 reference pick** ⌨️(filter) — single-select radio; picking a from-slot that's in the
-  target set auto-removes it from targets.
-- **P3 — Step 1 targets** ⌨️(filter) — multi-select; "Select all" / "Select these N" (filtered) /
-  "Clear" (disabled at 0); to-list excludes the current from-slot.
-- **P4 — "Place the blocks" gating** — disabled until ≥1 target AND a from-slot; shows
-  "Reading presets… %" ReadingPill until backup scan `ready`.
-- **P5 — Step 2 per-target edit** — tap a tile → inline BlockEditor; 3-way Replace / Insert before /
-  Insert after; origin chips (distinct reference blocks, with +cpu); Remove; close ×. Only ONE
-  editor open app-wide. + / ⟲ badges; "edited" chip; CpuMeter per card.
-- **P6 — CPU budget** — push a target over budget → amber card border + "over budget" chip + Save
-  blocked with the right hint ("{name} is over {budget}% — remove a block"); over-budget filter chip.
-- **P7 — Undo / redo** — toolbar buttons; disabled at history ends; a new edit truncates the redo
+- **P1 — Gating order** — disconnected (the shared no-unit page) > error ("Try again") > steps.
+  The source auto-defaults to the loaded preset (or `presets[0]`) on late list arrival.
+- **P2 — Step 1 "Copy from"** ⌨️(search) — one Radio per row (the whole row is its label); picking
+  a source that's in the target set auto-removes it from targets; "Loaded" badge on the loaded one.
+- **P3 — Step 1 "Copy into"** ⌨️(search) — a Checkbox per row; "Select all N shown" ticks the rows
+  the search shows, or clears them when all are ticked (mixed in between); the list excludes the
+  source. A search with no match shows "No presets match …" + "Clear search".
+- **P4 — "Choose blocks" gating** — disabled until ≥1 target AND a source ("Choose at least one
+  preset to copy into"); busy with "Reading presets N%" until the backup scan is `ready`.
+- **P5 — Step 2 placing** — choose a block on the source strip ("… is ready to copy.", "Adds N%
+  CPU"); a "+" in every gap of every target strip inserts it (before the block right of the gap,
+  or after a row's last block; named "Add here in <preset>, before <block>" / "… at the end");
+  the chosen block stays chosen; a target block's menu holds "Replace with <block>" and "Remove".
+  - / ⟲ badges; "Changed" badge; CPU readout per card.
+- **P6 — Firmware limits** — a placement that would break one greys that target's gaps (or leaves
+  Replace out of the menu) with the reason under its strip; a target already over one gets a
+  danger edge + the reason; Save waits with the reason beside it (one preset named, or "N presets
+  can't be saved yet" + a "Show only these" filter).
+- **P7 — Undo / redo** — footer buttons; disabled at history ends; a new edit truncates the redo
   branch.
-- **P8 — Save gate** — "Save to the unit" disabled unless ≥1 edited target + nothing over budget +
-  backup ack ticked.
-- **P9 — Save run** — SaveOverlay streams per-slot status (active spinner / queued / done "updated"
-  or "no change" / error); ProgressBar; Done medallion + Pro-Control restore note → resets to Step 1 when every target saved; a partial or total failure shows a warn medallion and returns to Step 2 with the unsaved edits (#291).
+- **P8 — Save gate** — "Save to your Tone Master Pro" disabled unless ≥1 changed target + nothing
+  over a limit + the backup tick.
+- **P9 — Save run** — the save dialog streams per-slot status (Waiting / Saving / Saved / No change
+  / Couldn't save), a ProgressBar and the line naming unchanged presets; done: "Saved to your Tone
+  Master Pro" → resets to Step 1 when every target saved; "Some presets weren't saved" / "Nothing
+  was saved" return to Step 2 with the unsaved edits (#291). Backend text goes to the log only.
 - **P10 — Multi-preset save** — two targets, different edits each; both written; re-open shows edits
   carried via optimistic cache patch (no second 22 s scan; `read_library_via_backup` called once).
 
 ### Monkey/chaos
 
-- **M-P1 — Back keeps staged edits.** Edit blocks in Step 2 → Back → "Place the blocks" again →
+- **M-P1 — Back keeps staged edits.** Edit blocks in Step 2 → Back → "Choose blocks" again →
   the edits and their undo steps are still there for every target still selected; a newly picked
   target starts fresh, a deselected one drops out (`retargetHistory`). Fixed for #292; gated by
   `CopyStagedEdits.test.tsx`.
 - **M-P2 — Save-abort / disconnect mid-save.** Pull device during a 2-preset save → partial results.
-  The done screen derives all / partial / none from the per-preset results (no green success unless
+  The done dialog derives all / partial / none from the per-preset results (never "Saved" unless
   every target saved); the cache is patched only for the presets that saved, including those the
   channel reported before a rejection; Done keeps the unsaved presets' edits on Step 2 (#291,
   `CopyStagedEdits.test.tsx`). The physical unplug is still untested.
-- **M-P3 — Partial save failure** — one of N presets returns `error` → row shows warn-tri, others
-  "updated", only updated items patch the cache. Gated by `CopyStagedEdits.test.tsx` (#291).
+- **M-P3 — Partial save failure** — one of N presets returns `error` → its row says "Couldn't save",
+  the others "Saved", only updated items patch the cache. Gated by `CopyStagedEdits.test.tsx` (#291).
 - **M-P4 — Double-click Save** — must fire `copy_apply` once.
-- **M-P5 — Rapid tab-switch during the backup scan** that gates "Place the blocks" (shared
+- **M-P5 — Rapid tab-switch during the backup scan** that gates "Choose blocks" (shared
   `libraryScan` with Level/Songs).
 
 ---
@@ -226,23 +256,27 @@ in-flight, `busy` gates all buttons). The **Presets axis is read-only** (from th
 - **S2 — Rail pivot** — Seg "Setlists ⇄ Presets" toggles `railAxis` and resets view to "all".
 - **S3 — Create song** ⌨️ — New song → SongForm (name/BPM/notes); read-back returns fresh list.
 - **S4 — Edit song** ⌨️ — diffs changed fields only; **no-change edit issues no device op**.
-- **S5 — Delete song** — confirm Modal ("DESTRUCTIVE · WRITES TO THE TONE MASTER PRO"); Cancel vs
-  Delete; removes from unit + every setlist.
+- **S5 — Delete song** — row ⋯ → Delete song → confirm Modal ("Delete {name}?", backdrop inert);
+  Cancel vs "Delete song"; removes from unit + every setlist.
 - **S6 — BPM validation** ⌨️ — strips non-digits, clamps 20–400; blank → null.
 - **S7 — Create setlist** ⌨️ — inline name input (Enter commit / Esc / check / ×); empty name no-ops.
-- **S8 — Rename setlist** ⌨️ — click title → inline input; commits on blur AND Enter; empty/unchanged
-  → no op.
-- **S9 — Delete setlist** — ⋯ menu or detail; confirm Modal; keeps songs, drops the membership entry.
-- **S10 — Add songs to setlist** — AddSongs popover ⌨️(filter); multi-select; "Add {n}" (disabled at
-  0); batched multi-add; read-back members. _(e2e currently only creates/deletes an EMPTY setlist —
+- **S8 — Rename setlist** ⌨️ — click title (or ⋯ → Rename setlist) → inline input with ✓ / ✕;
+  commits on Enter or ✓ (not on blur); empty/unchanged → no op.
+- **S9 — Delete setlist** — setlist ⋯ → Delete setlist; confirm Modal (backdrop inert); keeps songs,
+  drops the membership entry.
+- **S10 — Add songs to setlist** — AddSongs popover ⌨️(filter); multi-select; "Add {n}" ("Add",
+  disabled, at 0); stays open on an outside click, closes on Add or Cancel; batched multi-add;
+  read-back members. _(e2e currently only creates/deletes an EMPTY setlist —
   add-to-setlist is uncovered.)_
 - **S11 — Create-and-add** ⌨️ — from AddSongs footer; create + add in one batched txn; duplicate-name
-  edge returns `members=null` → cache cleared, re-read on next select.
+  edge returns `duplicate_name: true` and `members=null` → "You already have a song called {name}.",
+  cache cleared, re-read on next select.
 - **S12 — Reorder setlist songs** 🖱️drag — grip drag-reorder (1-based positions); no-op on same pos.
   _Needs DnD events (not plain clicks); e2e-uncovered._
-- **S13 — Remove from setlist** — × on member row; 1-based position.
-- **S14 — Presets axis (read-only)** — songs-per-preset counts; PresetDetail non-interactive;
-  "managed on the unit in Pro Control" note. Counts show `—` until first read.
+- **S13 — Remove from setlist** — the member row's ⋯ (with Move up / Move down); 1-based position.
+- **S14 — Presets axis (read-only)** — songs-per-preset counts; PresetDetail non-interactive (no ⋯);
+  "Which songs use a preset is set on your Tone Master Pro." caption. Counts show `—` until first
+  read.
 
 ### Monkey/chaos
 
@@ -251,9 +285,9 @@ in-flight, `busy` gates all buttons). The **Presets axis is read-only** (from th
 - **M-S2 — Write-failure Toast** — induce a failed write (e.g. disconnect mid-op) → err Toast,
   **state NOT mutated** (read-back failed, UI keeps prior authoritative list). _vitest covers the
   mock; verify live._
-- **M-S3 — BPM "didn't stick" warn** — the non-fatal warn Toast path ("Saved, but BPM didn't
-  stick"); `bpm_warning` is always null in tests → entirely unexercised. Try a BPM the firmware
-  rejects.
+- **M-S3 — Tempo didn't save warn** — the non-fatal warn Toast path ("Song saved, but its tempo
+  didn't. Set it again."; the warning text goes to the log); Vitest covers it with a mocked
+  `bpm_warning`, the e2e never triggers it. Try a BPM the firmware rejects.
 - **M-S4 — Delete the currently-viewed setlist** — view drops to "all" cleanly; no dangling
   membership read.
 
@@ -263,24 +297,27 @@ in-flight, `busy` gates all buttons). The **Presets axis is read-only** (from th
 
 ### Functional
 
-- **T1 — Search** ⌨️ — matches model / real-unit / brand; clear X; count readout updates; empty
-  "No models match" / "…these filters".
-- **T2 — Category rail** — All models + per-category + Effects disclosure (caret opens subcategories;
-  note: no collapse path once opened — see §8); counts per row; scroll the rail.
-- **T3 — Effect-type chips** — appear inside an Effects subcategory with >1 type; "All {sub}" +
-  per-type toggle.
-- **T4 — Facets** — Mono / Stereo (disabled when no stereo in scope — can disable mid-session as
-  scope changes) / Convolution (only in Reverb/Effects scope).
-- **T5 — Sort** — Type / CPU (label cycles CPU → CPU ↓ → CPU ↑; grouping changes to ranked wall).
-- **T6 — Model card select** — click → detail bar populates (type path, real unit, cpu\*, routing,
-  since); hover styling; sticky group headers; scroll the wall.
+- **T1 — Search** ⌨️ — matches model / real-unit / brand; clear X; the count reads "{n} models",
+  or "{n} of {models in the chosen category}" once a filter is on; no match shows
+  `No models match "{query}"` with "Clear search", or "No models match these filters".
+- **T2 — Category sidebar** — All models + per-category (sentence case) + the nine Effects
+  subcategories, always listed and indented; counts per row; scroll the sidebar.
+- **T3 — Effect type** — a dropdown inside an Effects subcategory with >1 type: "All {sub}" first,
+  then each type.
+- **T4 — Sound and Convolution** — All / Mono / Stereo (Stereo greyed when no stereo in scope, but
+  never while it is on) / "Convolution only" checkbox (only in Reverb/Effects scope).
+- **T5 — Sort** — Type / CPU; under CPU a "Highest first" / "Lowest first" button flips the order,
+  the wall is one ranked section and tiles show their CPU cost (only then).
+- **T6 — Model tile select** — click → the details open under the wall (beside it from 1280 wide):
+  type, "Models the …", CPU of budget, sound, engine (reverbs), since; the × closes them; scroll the
+  wall.
 - **T7 — Block art correctness** — combo vs head vs half-stack tiles; null-bid mics resolve by name
   (regression-prone — `models-catalog.test.tsx` is the guard).
 
 ### Monkey/chaos
 
-- **M-T1 — Rapid facet toggling while Stereo self-disables** — toggle routing=stereo then narrow
-  scope so `hasStereo` flips; button greys mid-interaction; list still filters correctly.
+- **M-T1 — Rapid Sound toggling while Stereo self-disables** — choose Stereo then narrow scope so
+  `hasStereo` flips; the segment greys only once it is off; list still filters correctly.
 - **M-T2 — Search + filter + sort combinations** — search while CPU-sorted; clear into a filtered
   category; scope changes drop `convOnly`/`et` appropriately.
 
@@ -290,28 +327,36 @@ in-flight, `busy` gates all buttons). The **Presets axis is read-only** (from th
 
 ### Functional
 
-- **E1 — Loudness targets render** from store; empty "No targets yet".
-- **E2 — Add target** — appends "New target" @ −22, opens in rename mode ⌨️.
-- **E3 — Rename target** ⌨️ — double-click name → input; Enter/blur commit, Esc cancel;
-  empty/whitespace reverts to old.
-- **E4 — Target slider** 🖱️drag — pointer drag, bounds TMIN −32 / TMAX −16, 0.1 steps, commits once
-  on pointerup; no upper ceiling beyond track domain. _Needs pointer events._
-- **E5 — Reorder targets** 🖱️drag — HTML5 DnD grip; disabled while name-editing; no-op on self.
-- **E6 — Target ⋯ menu** — Rename / Delete; delete-last → empty state.
-- **E7 — Playback level** — SegmentedControl Quiet/Rehearsal/Stage; persists; comp caption (bass
-  +1.5 / +0.5 / no-comp).
-- **E8 — Add instrument** ⌨️ — disabled if topologies empty; InstrumentForm (name ⌨️ + type chips +
-  pickup chips); Save disabled until name+topology valid; type change re-defaults pickup.
-- **E9 — Edit / move / delete instrument** — ⋯ menu Edit / Move up / Move down (no-op at bounds) /
-  Delete.
-- **E10 — Tier-2 calibration** (device) — Calibrate → countdown 3→2→1 (~850 ms) → recording
-  "{rec}/8s" + determinate bar; backend result wins the phase; re-reads `calibration_lufs`. Disconnected
-  → "Needs device" pill. _No UI flow test anywhere._
+- **E1 — Loudness targets render** from store as Group rows (grip · name · "Quieter" slider
+  "Louder" · "−23.0 dB" · ⋯); empty → "No targets yet" / "Leveling needs at least one target.".
+- **E2 — Add target** (page head) — appends "New target" @ −19, opens in rename mode ⌨️.
+- **E3 — Rename target** ⌨️ — ⋯ Rename or double-click the name → input; Enter/blur commit, Esc
+  cancel; empty/whitespace reverts to old.
+- **E4 — Target slider** 🖱️drag — pointer drag, bounds TMIN −29 / TMAX −13, 0.1 steps, commits once
+  on pointerup; a pointercancel restores the start value; no upper ceiling beyond the track domain.
+  _Needs pointer events._
+- **E5 — Reorder targets** 🖱️drag — HTML5 DnD grip (role img, "Move {name}"); disabled while
+  name-editing; no-op on self. The click path is E6.
+- **E6 — Target ⋯ menu** ("More for {name}") — Rename / Move up / Move down (hidden at the ends) /
+  Delete target; delete-last → empty state.
+- **E7 — Playback** — two Groups: "How loud you play" (Quiet/Rehearsal/Stage, one fixed body line
+  naming the bass offsets) and "How your speakers are connected" (Stereo/Mono (both outputs)/Left
+  output only, a body line per choice); each persists on click.
+- **E8 — Add instrument** ⌨️ — disabled if topologies are empty; InstrumentForm (Name ⌨️ + Type
+  segmented Guitar/Bass/Bass VI + Pickup Select); Save disabled until name + pickup; a type change
+  moves to that type's first pickup; a saved pickup no longer offered shows the empty attention
+  Select and a note, never `options[0]`.
+- **E9 — Edit / move / delete instrument** — ⋯ menu Edit instrument / Move up / Move down (hidden
+  at the ends) / Delete instrument.
+- **E10 — Tier-2 calibration ("Record")** (device) — Record → "Start playing in 3…1" (~850 ms) →
+  "Recording {secs} of 8 s" + determinate bar; backend result wins the phase; re-reads
+  `calibration_lufs` (Badge "Recorded"). Disconnected → Record disabled + one page Notice. A failed
+  take → "Couldn't record it…" + Try again (no backend text). _No UI flow test anywhere._
 
 ### Monkey/chaos
 
-- **M-E1 — Cancel calibration** at countdown vs recording (✕) — `abortedRef` ignores a late backend
-  result; timers cleared.
+- **M-E1 — Cancel recording** at countdown vs recording (Cancel) — the per-attempt token ignores a
+  late backend result; timers cleared.
 - **M-E2 — Tab-switch away mid-recording** — mounted guard + clearTimers on unmount; no late setState.
 - **M-E3 — Drag a target onto itself / delete a target mid-rename / rename to whitespace** — all
   no-op safely.
@@ -321,15 +366,14 @@ in-flight, `busy` gates all buttons). The **Presets axis is read-only** (from th
 ## 8. CLAUDE.md corrections found during discovery
 
 1. ✅ resolved (2026-07-05): **No "Disclaimer/Backup" wizard stage.** CLAUDE.md and
-   `overlays/StepRail.tsx` (then in `WizardShell.tsx`) now both describe the 3-step rail (Set up · Level · Summary) —
-   the doc/code mismatch is gone.
+   the flow's Steps (`LEVEL_STEPS`, shown by `FlowPage`; the wizard rail it replaced is gone) both
+   describe the 3 steps (Set up · Level · Summary) — the doc/code mismatch is gone.
 2. ✅ resolved (2026-07-05): **Row click does not recall the preset.** `LevelView.tsx` and
    `PresetRow.tsx` comments now agree with the code (click only selects; recall is owned by
    Pro Control / the footswitches).
-3. ⚠️ still open (2026-07-05): **Catalog Effects disclosure has no collapse path** — `fxOpen` is
-   only ever set `true`; once opened, the subcategory rows can't be hidden again. Minor, but a real
-   one-way toggle. Confirmed via grep (`src/views/CatalogView.tsx`): `setFxOpen` is called exactly
-   once, with `true` — the behavior described is unchanged.
+3. ✅ resolved (2026-10-16, look B): **Catalog Effects disclosure had no collapse path** — the
+   disclosure is gone: the Effects subcategories are always listed in the sidebar, so there is
+   nothing to collapse.
 4. ✅ resolved (2026-10-12, #292): **Copy "Back" no longer discards staged edits.** Re-entering
    Step 2 re-targets the history (`retargetHistory` in `copyModel.ts`): targets still selected keep
    their edits and undo steps, and only new targets start from their library graph.
@@ -345,7 +389,7 @@ Mapping the scenarios above to the cheapest durable layer. "Have" = already cove
 | **Rust unit** (have: proto/session/leveller/lufs/monitor/library/variants)              | `bpm_warning` propagation path; a `copy_apply` partial-failure (one slot `error`) shaping the streamed items.                                                                                                                                                                                                                                                       |
 | **Vitest component** (have: most happy paths)                                           | **Cancel-mid-run RunBody → Summary "Not leveled" + levels-kept** (inject cancel); **partial-failure item** (`status:"error"`) in Level streaming (Copy: done, #291); **double-click guard** on Level/Copy/Songs primaries; BPM-warn Toast render; Copy Back keeps edits (done, #292); Settings calibration phase machine (countdown→recording→abort, `abortedRef`). |
 | **Playwright offline** (have: copy/level/songs happy paths + `CatalogView` interaction) | **Add-song-to-setlist + reorder + remove** (current songs spec only makes an empty setlist); empty-library Copy/Level UX; backup-scan-failure rendering; tab-switch-during-scan. Settings spec (none exists); a Catalog Playwright spec is optional (the vitest one covers filters/sort/facets).                                                                    |
-| **Playwright online** (have: all 3 specs GREEN online, attended)                        | The genuinely hardware-only ones: **Stop-mid-run leaves unit un-muted**; clamp/off-branch on a real hard target; cold-boot SetReport window; Pro-Control-grab red banner; ~22 s backup latency. Most overlap with the manual run order in §10.                                                                                                                      |
+| **Playwright online** (have: all 3 specs GREEN online, attended)                        | The genuinely hardware-only ones: **Stop-mid-run leaves unit un-muted**; clamp/off-branch on a real hard target; cold-boot SetReport window; Pro-Control-grab busy page; ~22 s backup latency. Most overlap with the manual run order in §10.                                                                                                                       |
 | **Manual / Claude-driven only** (cannot reasonably automate)                            | Real LUFS convergence accuracy; native-window chrome (Dock icon, focus, OS dialogs); `cliclick` left-display caveat; physical replug timing.                                                                                                                                                                                                                        |
 
 ---

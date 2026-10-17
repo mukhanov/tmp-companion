@@ -132,6 +132,9 @@ export interface SceneLevelProgressItem {
   status: "active" | "done" | "error" | "cancelled";
   result: LevelResult | null;
   message: string | null;
+  /** WHY an `error` row was not leveled (`error::SkipKind`) — pick the row's message by
+   *  this, never by `message`, whose text is for the log only. Null on every other status. */
+  skipKind: SkipKind | null;
   /** A batch-wide caption ("Saving…" / "Verifying…") emitted at the deferred-save and
    *  persist-verify starts, AFTER every scene in the group already resolved — this item
    *  carries no valid `sceneSlot`/row identity of its own (never key against it), only
@@ -165,6 +168,8 @@ export interface FootswitchLevelProgressItem {
   status: "active" | "done" | "error" | "cancelled";
   result: FootswitchLevelResult | null;
   message: string | null;
+  /** WHY an `error` row was not leveled — see `SceneLevelProgressItem.skipKind`. */
+  skipKind: SkipKind | null;
 }
 
 /** One `level_footswitches_apply` job: a switch + the block param to solve. */
@@ -252,10 +257,28 @@ export interface LevelResult {
    * entered the `Boost` regime, and on every lane that isn't the base row (block,
    * footswitch, scene). */
   base_boost: BaseBoostSummary | null;
-  /** "Re-amp may still be on. Unplug and replug the unit." when the run-end re-amp OFF
-   * could not be read back OFF (`leveller::REAMP_STILL_ON_WARNING`). A fact about the
-   * RUN, stamped on every row it returns; absent when the OFF read back. */
+  /** "Re-amp may still be on. Restart your Tone Master Pro." when the run-end re-amp OFF
+   * could not be read back OFF (`leveller::REAMP_STILL_ON_WARNING`) — text for the log and
+   * the bug report only. A fact about the RUN, stamped on every row it returns; absent when
+   * the OFF read back. Read `reamp_still_on`, never this text. */
   reamp_warning?: string | null;
+  /** Re-amp may still be on (the unit's guitar input stays muted until it is restarted):
+   * the typed twin of `reamp_warning`, stamped on every row of the run. */
+  reamp_still_on: boolean;
+}
+
+/** What a BATCHED leveling command resolves with (`level_scenes_apply_batched`,
+ * `level_footswitches_apply`; mirrors `leveller::BatchLevelRun`, camelCase): the rows it
+ * leveled and the run-end re-amp verdict BESIDE them. The verdict is a fact about the run, and
+ * a batch can return no rows at all — a Stop during the ceiling prepass, or a batch whose every
+ * row failed — so it is read from here, never from the rows. */
+export interface BatchLevelRun<R> {
+  /** The leveled rows; a row that failed or never ran is absent (its streamed item said why). */
+  rows: R[];
+  /** Re-amp may still be on: what the Summary reads. */
+  reampStillOn: boolean;
+  /** Its text twin, for the log only; absent when the OFF read back. */
+  reampWarning?: string | null;
 }
 
 /** WHICH sound a trade row / clamp error describes (mirrors `headroom_trade::SoundId`,
@@ -389,6 +412,8 @@ export interface FootswitchLevelResult {
   clamp_kind: ClampKind | null;
   /** The run-end re-amp warning — see `LevelResult.reamp_warning`. */
   reamp_warning?: string | null;
+  /** Re-amp may still be on — see `LevelResult.reamp_still_on`. */
+  reamp_still_on: boolean;
 }
 
 /** One control a scene row could be leveled on (mirrors `commands::SceneHandleCandidate`,
@@ -575,12 +600,17 @@ export interface SetlistRecord {
 
 /** Result of a batched song transaction (create_song_full / update_song_full):
  * the fresh authoritative song list, the fresh membership of the requested
- * setlist (create with add-to-setlist only), and the best-effort BPM warning
- * (BPM is the unit's active-song tap tempo and can fail to settle — the song
- * itself is kept). */
+ * setlist (create with add-to-setlist only), whether a create landed on a name
+ * another song already had, and the best-effort BPM warning (BPM is the unit's
+ * active-song tap tempo and can fail to settle — the song itself is kept). The UI
+ * picks its message from these fields, never from the warning's text. */
 export interface SongSaveOutcome {
   songs: SongRecord[];
   members: number[] | null;
+  /** A create whose name was already taken: the unit keeps both songs, and the new
+   *  one's notes, tempo and setlist were skipped. */
+  duplicate_name: boolean;
+  /** Free text for the log only (the tempo didn't land). */
   bpm_warning: string | null;
 }
 
@@ -662,8 +692,50 @@ export interface ActiveGraph {
 /** The kind of a typed command error (mirrors `error::AppError`'s `kind`). A command
  * migrated to the typed error rejects with `{ kind, message }`; every other command
  * still rejects with a bare string, which `invoke`'s `CommandError` reads as `"other"`.
- * Today only `connect_device` sends a typed error. */
-export type CommandErrorKind = "not_connected" | "busy" | "not_ready" | "other";
+ * `connect_device` sends the first three (and `other`); the three leveling commands
+ * (`level_preset`, `level_scenes_apply_batched`, `level_footswitches_apply`) send a
+ * `SkipKind`, plus `reampStillOn` (`CommandError.reampStillOn`). */
+export type CommandErrorKind =
+  "not_connected" | "busy" | "not_ready" | SkipKind;
+
+/** WHY a sound was not leveled (mirrors `error::SkipKind`, snake_case). A failed row of a
+ * leveling run carries it (`skipKind` on its progress item), and so does a leveling
+ * command's own error (`CommandError.kind`), so the Summary picks its message — and whether
+ * Try again can help — by kind, never by the backend's text.
+ *
+ * - `preset_unreadable` — the preset couldn't be read from the unit.
+ * - `footswitches_unreadable` — its footswitch assignments couldn't be read.
+ * - `no_active_amp` — no amp is on in the scene (or the preset has none).
+ * - `level_manually` — a routing the leveler doesn't drive on its own; a chosen block and
+ *   knob still level it.
+ * - `scene_write_refused` — the scene shares the knob with the main sound, or the saved
+ *   preset can't say where the write would land.
+ * - `unsupported_knob` — the chosen knob isn't a volume or mix control.
+ * - `knob_missing` — the chosen knob is no longer in the preset.
+ * - `block_off` — the chosen knob's block is off in this sound.
+ * - `scene_change_discards` — the unit's Scene Change Behavior discards changes.
+ * - `no_stimulus` — the test tone never reached the unit.
+ * - `clipped_capture` — the capture clipped, so its loudness couldn't be read.
+ * - `no_signal` — nothing came back from the unit.
+ * - `connection_lost` — the unit was unplugged during the run.
+ * - `cancelled` — the run was stopped before this sound finished.
+ * - `other` — anything else. */
+export type SkipKind =
+  | "preset_unreadable"
+  | "footswitches_unreadable"
+  | "no_active_amp"
+  | "level_manually"
+  | "scene_write_refused"
+  | "unsupported_knob"
+  | "knob_missing"
+  | "block_off"
+  | "scene_change_discards"
+  | "no_stimulus"
+  | "clipped_capture"
+  | "no_signal"
+  | "connection_lost"
+  | "cancelled"
+  | "other";
 
 /** Combined connect result: firmware + active graph in one handshake (mirrors
  * lib.rs ConnectResult). The graph is null when no preset is loaded or the
@@ -832,6 +904,39 @@ export interface BackupPresetRow {
    * `list_footswitch_scene_contexts` reads live. The Set-up step resolves every footswitch
    * row's default scene context from this up front. Empty for an unparseable row. */
   fs_scene_contexts: FsSceneContext[];
+  /** Per scene (wire index), what a leveling run drives when the scene's row keeps its
+   * default control — the amp(s) whose output level it turns, or why it turns none
+   * (`scene_jobs::scene_drives`, the SAME planner the run's job builder uses). Set up's
+   * Block shows exactly this ("Both amps" only where `amps` has two or more). Empty for a
+   * scene-less or unparseable row. */
+  scene_drives: SceneDrive[];
+  /** The rebalance flow ("Balance its two amps first") can act on this preset: at least
+   * one scene drives two or more lane amps that re-merge into one output. */
+  rebalanceable: boolean;
+}
+
+/** What a leveling run drives in one scene (mirrors `scene_jobs::SceneDrive`, camelCase). */
+export interface SceneDrive {
+  /** 0-based `scenes[]` wire index. */
+  sceneSlot: number;
+  /** The amp blocks whose `outputLevel` the run turns, in signal-flow order: the last
+   * active amp of a series chain, or one per lane of a parallel or split scene (driven
+   * together). Empty when `skip` is set. */
+  amps: DrivenAmp[];
+  /** How the amps relate: `single` (one), `merged` (lanes summing into one output — the
+   * only shape rebalance acts on) or `split_output` (lanes on separate outputs). `single`
+   * when `skip` is set. */
+  routing: "single" | "merged" | "split_output";
+  /** Why the run turns no amp here (the same kind its row would report), else null. */
+  skip: SkipKind | null;
+}
+
+/** One amp block a run turns in a scene (mirrors `scene_jobs::DrivenAmp`). */
+export interface DrivenAmp {
+  groupId: string;
+  nodeId: string;
+  /** The block's model id (FenderId) for its display name; "" when the graph has none. */
+  fenderId: string;
 }
 
 /** One node's state change for one diagnosed sound, relative to the saved base graph
@@ -978,7 +1083,12 @@ export interface DoctorInputArg {
   /** 0-based `ftsw` array index for a block-acting footswitch sound; null for
    *  Base/scene sounds. */
   footswitch: number | null;
+  /** The wire label ("Tweed Warm · Lead"): the results carry it back, and each sound is
+   *  found by it. It also names the preset, so no sentence on screen uses it. */
   label: string;
+  /** The sound's name inside a sentence ("Lead", "footswitch 3", "Main sound"), which the
+   *  backend writes into the steps for a volume jump between scenes. */
+  soundName: string;
   tag: string | null;
   topologyId: string | null;
   calibrationLufs: number | null;
@@ -1024,22 +1134,22 @@ export type DoctorOp =
       params: [string, number][];
     };
 
-/** Chain-preview DTO on a `chain`-kind prescription: the resulting block list
- * by model id (the UI resolves art through its existing strip engine). */
-export interface DoctorChainPreview {
-  template: string;
-  blocks: { model: string; added?: boolean }[];
-}
-
 /** One prescription (`doctor::Rx`). `ops` is empty for advisory cards. */
 export interface DoctorRx {
   kind: DoctorRxKind;
+  /** The step, as the player makes it on the unit ("Turn the amp's Bass down
+   *  1 or 2."). Fixes come simplest first; every later one starts with "Or". */
   title: string;
+  /** The exact settings behind the step (Hz, dB, Q), for the log. Empty when
+   *  the title says everything. */
   detail: string;
   cpuNote: string;
   ops: DoctorOp[];
-  chain?: DoctorChainPreview;
 }
+
+/** Which way a finding's bands are off (`doctor::BandDirection`): the band
+ * meter's "too strong" or "too weak". */
+export type DoctorBandDirection = "strong" | "weak";
 
 /** One diagnosis (`doctor::LeveledDiag` — a flattened `Diag` plus `fromLevel`).
  * `bands` indexes the sound's band layout (`DoctorSoundResult.bandLabels` — 6
@@ -1049,6 +1159,7 @@ export interface DoctorRx {
  * `"rehearsal"`/`"stage"` = only appears at that volume and louder. */
 export interface DoctorDiag {
   key: string;
+  /** The finding's name ("Muddy", "Boxy", "Ringing"), never with a frequency. */
   label: string;
   sev: DoctorSev;
   /** Magnitude past the fire threshold in the rule's natural unit (dB, or
@@ -1059,7 +1170,11 @@ export interface DoctorDiag {
    *  muted; cards sort by it. */
   z: number;
   bands: number[];
+  /** Whether `bands` are too strong or too weak. */
+  direction: DoctorBandDirection;
+  /** The Hz/dB reading behind the finding, for the log. */
   detail: string;
+  /** What the finding sounds like, in one plain sentence. */
   explain: string;
   rx: DoctorRx[];
   fromLevel: PlaybackLevel;
@@ -1085,9 +1200,6 @@ export interface DoctorSoundResult {
   /** 0-based `ftsw` array index for a block-acting footswitch sound; null for
    *  Base/scene sounds. */
   footswitch: number | null;
-  /** The scene sound's saved overlay, echoed from its input like `scene` — sent back
-   *  on `DoctorApplyJob.sceneOverrides` so the A/B captures in the diagnosed graph. */
-  sceneOverrides: NodeOverride[];
   label: string;
   tag: string | null;
   diags: DoctorDiag[];
@@ -1097,15 +1209,21 @@ export interface DoctorSoundResult {
   integratedLufs: number | null;
   tailRatioDb: number | null;
   balanceDb: number[];
-  /** Display labels for this sound's band layout — 6 for guitar/bass ("Lows" …
-   *  "Air") or 7 for bass-vi ("Sub" + the same six). `balanceDb.length` and
+  /** Display labels for this sound's band layout — 6 for guitar/bass ("Lows",
+   *  "Low mids", "Mids", "High mids", "Highs", "Air") or 7 for bass-vi ("Sub" +
+   *  the same six). `balanceDb.length` and
    *  `DoctorDiag.bands` indices both index this same layout. */
   bandLabels: string[];
   /** Null when this sound's capture failed or the ratio was degenerate (e.g.
    *  a silent capture). */
   cutThrough: CutThrough | null;
-  /** Set when this sound's capture failed (no diags then); the run continued. */
+  /** Set when this sound's capture failed (no diags then); the run continued. For the
+   *  log only: the screen words the failure by `errorKind`. */
   error: string | null;
+  /** Why the capture failed (set exactly when `error` is) — the typed kind the
+   *  Results page picks its message by (`no_signal` is refined by the preset's
+   *  backup-scan silence hint). */
+  errorKind: SkipKind | null;
   /** How many bands the SNR gate dropped as too quiet to trust — some checks
    *  were silently skipped for lack of signal, not because the tone measured
    *  clean. `> 0` IS "gated"; no separate bool rides alongside this. Required
@@ -1159,75 +1277,4 @@ export interface DoctorPresetResult {
 export interface DoctorCheckResult {
   presets: DoctorPresetResult[];
   stopped: boolean;
-}
-
-/** One prescription's apply job (`lib::DoctorApplyJob`, camelCase wire).
- * `name` is the identity guard — apply refuses if the loaded slot's name
- * doesn't match. Scene-trim ops are NOT accepted here (the frontend routes
- * them through the existing scene-leveling command). */
-export interface DoctorApplyJob {
-  listIndex: number;
-  name: string;
-  ops: DoctorOp[];
-  topologyId: string | null;
-  calibrationLufs: number | null;
-  /** The diagnosed sound's instrument-profile id (null when "none") — a profile
-   *  with a stored Tier-2 DI capture auditions the A/B on that same capture,
-   *  mirroring `doctor_check`'s stimulus resolution. */
-  profileId: string | null;
-  /** The diagnosed sound's own scene (0-based `scenes[]` wire index) — null
-   *  for Base/footswitch. The A/B captures recall this scene so the player
-   *  auditions the fix in the state that was actually diagnosed. */
-  scene: number | null;
-  /** The diagnosed sound's own block-acting footswitch (0-based `ftsw`
-   *  index) — null for Base/scene. */
-  footswitch: number | null;
-  /** The preset's chain (same data threaded into `DoctorInputArg.nodes`) —
-   *  drives the backend's OFFLINE force-bypass isolation derivation for the
-   *  A/B captures, mirroring `doctor_check`'s isolation exactly. */
-  nodes: GraphNode[];
-  /** The preset's block-acting footswitches, paired with `nodes` for the
-   *  same isolation derivation. */
-  footswitches: FootswitchInfo[];
-  /** The diagnosed scene's saved overlay (`DoctorSoundResult.sceneOverrides`). */
-  sceneOverrides: NodeOverride[];
-  /** The finding this prescription treats (null for the Match-reference card)
-   *  — the A/B re-measures it on both clips. */
-  diag?: DoctorDiagRef | null;
-}
-
-/** Result of a live (unsaved) prescription apply: before/after audition clips
- * as `data:audio/wav;base64,…` URLs, rendered in the same command so the A/B
- * compares the stored state against the applied-but-unsaved edit buffer. */
-/** Both A/B clips' integrated loudness (LUFS) — `doctor_apply`'s `AbLevels`. */
-export interface AbLevels {
-  beforeLufs: number;
-  afterLufs: number;
-}
-
-/** The treated finding re-measured on both A/B clips — `doctor_apply`'s
- *  `FindingCheck`. `before`/`after` are its severity (dB past its limit) when it
- *  fires, `null` when it doesn't. */
-export interface FindingCheck {
-  key: string;
-  before: number | null;
-  after: number | null;
-}
-
-/** The finding a prescription treats (`DoctorApplyJob.diag`). */
-export interface DoctorDiagRef {
-  key: string;
-  level: PlaybackLevel;
-}
-
-export interface DoctorApplyResult {
-  /** The processed stereo pair, as captured. */
-  beforeClip: string;
-  afterClip: string;
-  /** Null when either clip's loudness couldn't be measured. */
-  levels?: AbLevels | null;
-  /** Null without `DoctorApplyJob.diag`, or when a clip couldn't be profiled. */
-  finding?: FindingCheck | null;
-  /** The run-end re-amp warning — see `LevelResult.reamp_warning`. */
-  reampWarning?: string | null;
 }

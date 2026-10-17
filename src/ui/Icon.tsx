@@ -3,7 +3,9 @@
 // 24×24 viewBox, Lucide-aligned. Implemented ONCE here; import everywhere.
 // Light-only app — no sun/moon (the dark toggle was removed). Adds the prototype
 // page icons: gauge · cable · music · spinner · warn-tri · info · refresh · grip ·
-// trash · lock.
+// trash · lock, and look B's chev-updown (Select) · minus (a mixed Checkbox) · alert
+// (danger Notice and PageState) · stop (the leveling run's Stop) · headphones, speaker
+// and pulse (Doctor's Quiet, Rehearsal and Stage volumes).
 
 import type { IconName } from "./iconNames";
 
@@ -140,6 +142,12 @@ export function Icon({
       return (
         <svg {...props}>
           <path d="M12 5v14M5 13l7 7 7-7" />
+        </svg>
+      );
+    case "arrow-up":
+      return (
+        <svg {...props}>
+          <path d="M12 19V5M5 11l7-7 7 7" />
         </svg>
       );
     case "check":
@@ -337,6 +345,59 @@ export function Icon({
         <svg {...props}>
           <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
           <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </svg>
+      );
+    case "chev-updown":
+      return (
+        <svg {...props}>
+          <path d="M8 9.5l4-4 4 4M8 14.5l4 4 4-4" />
+        </svg>
+      );
+    case "minus":
+      return (
+        <svg {...props}>
+          <path d="M6 12h12" />
+        </svg>
+      );
+    case "alert":
+      return (
+        <svg {...props}>
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M12 7.5v5.5M12 16.5h.01" />
+        </svg>
+      );
+    case "usb":
+      return (
+        <svg {...props}>
+          <path d="M12 3v14M8 7l4-4 4 4M7 13v2l5 3 5-3v-2" />
+          <circle cx="12" cy="20" r="1.5" />
+        </svg>
+      );
+    case "stop":
+      return (
+        <svg {...props}>
+          <rect x="7" y="7" width="10" height="10" rx="1.5" />
+        </svg>
+      );
+    case "headphones":
+      return (
+        <svg {...props}>
+          <path d="M4.5 15v-3a7.5 7.5 0 0 1 15 0v3" />
+          <rect x="4" y="14" width="4" height="6" rx="1.5" />
+          <rect x="16" y="14" width="4" height="6" rx="1.5" />
+        </svg>
+      );
+    case "speaker":
+      return (
+        <svg {...props}>
+          <path d="M5 9.5h3.5L13 6v12l-4.5-3.5H5z" />
+          <path d="M16.5 9a4.5 4.5 0 0 1 0 6" />
+        </svg>
+      );
+    case "pulse":
+      return (
+        <svg {...props}>
+          <path d="M3 12h3l2-6 4 12 3-9 2 3h4" />
         </svg>
       );
     default:

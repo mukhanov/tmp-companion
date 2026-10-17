@@ -4,9 +4,14 @@
 
 use super::*;
 
-/// What the user is told when [`reamp_off_guaranteed`] cannot read the Mixer store back OFF.
+/// The run-result text when [`reamp_off_guaranteed`] cannot read the Mixer store back OFF —
+/// for the log and the bug report; the frontend reads the typed flag
+/// ([`ReampOffOutcome::still_on`], `reamp_still_on` on the wire), never this text. Re-amp
+/// replaces Inputs 1 and 2, so the guitar goes unheard until it is off. A USB unplug/replug
+/// does NOT clear it (nothing resets re-amp when a connection closes); a restart does (the
+/// firmware forces it off at boot) — static evidence, fw 1.8.58: `notes/gotchas.md`.
 pub(crate) const REAMP_STILL_ON_WARNING: &str =
-    "Re-amp may still be on. Unplug and replug the unit.";
+    "Re-amp may still be on. Restart your Tone Master Pro.";
 
 /// How a [`reamp_off_guaranteed`] run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,9 +22,15 @@ pub(crate) struct ReampOffOutcome {
 }
 
 impl ReampOffOutcome {
+    /// Re-amp may still be on: the OFF never read back OFF. The typed signal every leveling
+    /// result carries (`reamp_still_on`), beside the [`Self::warning`] text.
+    pub(crate) fn still_on(self) -> bool {
+        !self.verified
+    }
+
     /// The run-result warning: [`REAMP_STILL_ON_WARNING`] unless the OFF was verified.
     pub(crate) fn warning(self) -> Option<String> {
-        (!self.verified).then(|| REAMP_STILL_ON_WARNING.to_string())
+        self.still_on().then(|| REAMP_STILL_ON_WARNING.to_string())
     }
 
     /// `e` with the warning appended, for a run that failed AND left re-amp unverified. A
@@ -31,19 +42,78 @@ impl ReampOffOutcome {
         }
     }
 
-    /// Stamp the warning on every row of a run's result, or append it to the run's error.
-    /// The run-end step of a command, so it hands back the command's `String` error.
-    pub(crate) fn stamp<T, E: Into<LevelError>>(
+    /// The run-end step of a leveling command, with a TYPED error: `rows` gets this outcome
+    /// (each row records [`Self::still_on`] and the warning), and a failure becomes an
+    /// [`AppError::Leveling`] carrying the failure's own [`SkipKind`] — or
+    /// [`SkipKind::ConnectionLost`] when the unit was unplugged since `watch` started — the
+    /// text with the warning appended, and the typed `reamp_still_on`.
+    pub(crate) fn stamp_leveling<T, E: Into<LevelError>>(
         self,
         result: Result<T, E>,
-        rows: impl FnOnce(&mut T, Option<String>),
-    ) -> Result<T, String> {
+        watch: crate::watcher::DetachWatch,
+        rows: impl FnOnce(&mut T, ReampOffOutcome),
+    ) -> Result<T, AppError> {
         match result {
             Ok(mut r) => {
-                rows(&mut r, self.warning());
+                rows(&mut r, self);
                 Ok(r)
             }
-            Err(e) => Err(self.annotate_err(e.into()).to_string()),
+            Err(e) => {
+                let e = e.into();
+                let kind = watch.refine(e.skip_kind());
+                Err(AppError::Leveling {
+                    kind,
+                    message: self.annotate_err(e).to_string(),
+                    reamp_still_on: self.still_on(),
+                })
+            }
+        }
+    }
+
+    /// [`Self::stamp_leveling`] for a BATCHED command: the rows come back inside a
+    /// [`BatchLevelRun`] that carries this outcome whatever the row count — none at all after
+    /// a Stop in the ceiling prepass or when every row failed — and each row is stamped too
+    /// (`stamp_row`).
+    pub(crate) fn stamp_batch<R, E: Into<LevelError>>(
+        self,
+        result: Result<Vec<R>, E>,
+        watch: crate::watcher::DetachWatch,
+        stamp_row: impl Fn(&mut R, ReampOffOutcome),
+    ) -> Result<BatchLevelRun<R>, AppError> {
+        self.stamp_leveling(result.map(BatchLevelRun::new), watch, |run, out| {
+            run.rows.iter_mut().for_each(|r| stamp_row(r, out));
+            run.reamp_still_on = out.still_on();
+            run.reamp_warning = out.warning();
+        })
+    }
+}
+
+/// What a batched leveling command returns (`level_scenes_apply_batched`,
+/// `level_footswitches_apply`): the rows it leveled, and the run-end re-amp verdict BESIDE
+/// them. The verdict is a fact about the run, not about a row, and a batch can end with no
+/// rows at all — a Stop during the ceiling prepass (which engages re-amp once per sound), or a
+/// batch whose every row failed — so it must not ride the rows alone: an OFF that never read
+/// back OFF reaches the Summary on every path (`danger.md`). Each row carries it as well.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BatchLevelRun<T> {
+    /// The leveled rows; a row that failed or never ran is not here (its streamed item said
+    /// why).
+    pub(crate) rows: Vec<T>,
+    /// Re-amp may still be on ([`ReampOffOutcome::still_on`]): what the Summary reads.
+    pub(crate) reamp_still_on: bool,
+    /// Its text twin ([`ReampOffOutcome::warning`]), for the log. Omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reamp_warning: Option<String>,
+}
+
+impl<T> BatchLevelRun<T> {
+    /// `rows`, with no verdict stamped yet ([`ReampOffOutcome::stamp_batch`] stamps it).
+    pub(crate) fn new(rows: Vec<T>) -> Self {
+        Self {
+            rows,
+            reamp_still_on: false,
+            reamp_warning: None,
         }
     }
 }
@@ -54,9 +124,10 @@ impl ReampOffOutcome {
 /// than ~1 s of idle was silently dropped (HW-bisected: 300 ms lands, 1 s+ drops), and on
 /// fw 1.8.58 an OFF to a lapsed session draws ConnectionError(0) and is discarded
 /// (device-confirmed). `TrackedHid` reopens a client after 600 ms of silence, which
-/// covers the known lapse shapes. A unit stranded re-amp-ON is input-muted; it recovers
-/// with `probe --reamp-off`, not a power-cycle (`danger.md`). `tag` names the calling
-/// lane in the log lines.
+/// covers the known lapse shapes. A unit stranded re-amp-ON is input-muted; a developer
+/// recovers it with `probe --reamp-off`, a user by restarting the unit — a USB
+/// unplug/replug does not clear it (`danger.md`, `notes/gotchas.md`). `tag` names the
+/// calling lane in the log lines.
 ///
 /// The OFF is read back: after it, the Mixer store is read on the same session
 /// ([`Session::read_reamp_state`]), and a store still ON (or silent) climbs a ladder —
@@ -331,10 +402,129 @@ mod reamp_off_ladder_tests {
         );
         let restore_failed = LevelError::Cancelled.with_restore(Err("HID gone".into()));
         assert_eq!(out.annotate_err(restore_failed.clone()), restore_failed);
+        assert!(out.still_on(), "the typed signal the frontend reads");
+    }
+
+    /// The typed half of the run-end verdict (the screen reads the flag, never the warning
+    /// text): every returned row records `reamp_still_on`, and a failed leveling command's
+    /// typed error carries it beside its skip kind — the kind of the failure itself, decided
+    /// before the warning text is appended, so the frontend never reads the text for either.
+    #[test]
+    fn a_leveling_command_carries_the_reamp_verdict_typed_on_rows_and_errors() {
+        let stuck = ReampOffOutcome { verified: false };
+        let clean = ReampOffOutcome { verified: true };
+        let watch = crate::watcher::DetachWatch::start();
+
+        let mut seen = None;
+        let rows = stuck.stamp_leveling(Ok::<_, LevelError>(vec![1, 2]), watch, |_, out| {
+            seen = Some(out)
+        });
+        assert_eq!(rows.expect("rows"), [1, 2]);
+        assert_eq!(seen, Some(stuck), "the rows get the outcome itself");
+
+        let err = stuck
+            .stamp_leveling(
+                Err::<(), _>(LevelError::refused(SkipKind::PresetUnreadable, "no read")),
+                watch,
+                |_, _| {},
+            )
+            .expect_err("a failed run");
         assert_eq!(
-            out.stamp(Err::<(), _>(LevelError::Cancelled), |_, _| {}),
-            Err("cancelled".to_string())
+            err,
+            AppError::Leveling {
+                kind: SkipKind::PresetUnreadable,
+                message: format!("no read — {REAMP_STILL_ON_WARNING}"),
+                reamp_still_on: true,
+            }
         );
+        let err = clean
+            .stamp_leveling(Err::<(), _>(LevelError::NoSignal), watch, |_, _| {})
+            .expect_err("a failed run");
+        assert_eq!(
+            err,
+            AppError::Leveling {
+                kind: SkipKind::NoSignal,
+                message: "no signal captured".into(),
+                reamp_still_on: false,
+            }
+        );
+        // A Stop stays a Stop, with its own text, and still reports the flag.
+        let err = stuck
+            .stamp_leveling(Err::<(), _>(LevelError::Cancelled), watch, |_, _| {})
+            .expect_err("a stopped run");
+        assert_eq!(err.kind(), "cancelled");
+        assert_eq!(err.message(), "cancelled");
+        assert!(matches!(
+            err,
+            AppError::Leveling {
+                reamp_still_on: true,
+                ..
+            }
+        ));
+    }
+
+    /// A batched command's verdict rides BESIDE its rows, so a batch that returns no rows (a
+    /// Stop in the ceiling prepass, or every row failed) still says re-amp may be on.
+    #[test]
+    fn a_batch_carries_the_reamp_verdict_whatever_its_row_count() {
+        let stuck = ReampOffOutcome { verified: false };
+        let clean = ReampOffOutcome { verified: true };
+        let watch = crate::watcher::DetachWatch::start();
+
+        let none = stuck
+            .stamp_batch(Ok::<Vec<u32>, LevelError>(Vec::new()), watch, |_, _| {
+                unreachable!("there is no row to stamp")
+            })
+            .expect("an empty batch is still Ok");
+        assert_eq!(
+            none,
+            BatchLevelRun {
+                rows: Vec::new(),
+                reamp_still_on: true,
+                reamp_warning: Some(REAMP_STILL_ON_WARNING.to_string()),
+            }
+        );
+        let wire = serde_json::to_value(&none).expect("serialize");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "rows": [],
+                "reampStillOn": true,
+                "reampWarning": REAMP_STILL_ON_WARNING,
+            })
+        );
+
+        let stamped = std::cell::Cell::new(0);
+        let some = stuck
+            .stamp_batch(Ok::<_, LevelError>(vec![1u32, 2]), watch, |_, out| {
+                assert_eq!(out, stuck);
+                stamped.set(stamped.get() + 1);
+            })
+            .expect("rows");
+        assert_eq!(
+            (some.rows.len(), stamped.get()),
+            (2, 2),
+            "every row stamped"
+        );
+        assert!(some.reamp_still_on);
+
+        let ok = clean
+            .stamp_batch(Ok::<Vec<u32>, LevelError>(Vec::new()), watch, |_, _| {})
+            .expect("rows");
+        assert!(!ok.reamp_still_on);
+        assert_eq!(
+            serde_json::to_value(&ok).expect("serialize"),
+            serde_json::json!({ "rows": [], "reampStillOn": false }),
+            "no warning key when the OFF read back"
+        );
+    }
+
+    /// The user's recovery is a restart of the unit: a USB unplug/replug does not clear a
+    /// stuck re-amp (static evidence, fw 1.8.58 — `notes/gotchas.md`).
+    #[test]
+    fn the_stuck_reamp_warning_says_restart_never_replug() {
+        assert!(REAMP_STILL_ON_WARNING.contains("Restart your Tone Master Pro"));
+        assert!(!REAMP_STILL_ON_WARNING.to_lowercase().contains("plug"));
     }
 
     /// #261: a panic after an engage unwinds through the guard, which sends the OFF ladder

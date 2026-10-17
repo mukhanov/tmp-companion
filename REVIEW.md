@@ -25,7 +25,7 @@ from the changed one:
 Reading a hunk in isolation cannot catch any of these. So when a diff touches one
 stage, branch, or case, name its siblings and compare. The sets that keep drifting:
 
-- `src/views/level/{SetupPage,RunPage,SummaryPage}` — the wizard stages
+- `src/views/level/{SetupPage,RunPage,SummaryPage}` — the Level flow's stages
 - `src/views/doctor/DoctorRun` vs `src/views/level/RunPage` — two run screens, one contract
 - any `useXxxFlow` state machine — a flag added to one case must be consumed by all
 - `leveller.rs`'s device write/measure entry points (`capture_full_at`/`set_knob`/`set_knobs`/`write_footswitch_values`) vs `commands/doctor.rs::apply_ops_under_scene` — each must hoist an explicit scene recall before its first write; the omission is silent (no `presetError`, just the wrong scene)
@@ -40,12 +40,11 @@ report nothing; an empty result is correct.
 nothing about the NONE and PARTIAL rows, so changes touching them deserve
 disproportionate scrutiny:
 
-- Stop mid-run, then Continue (Vitest-mocked only)
+- Stop mid-run → Summary on hardware (offline e2e and Vitest only)
 - Detach mid-run; relaunch or webview reload mid-operation (no gate)
 - Copy: Back discards staged edits; partial save failure across N targets (no gate)
-- Doctor apply/save → Level sees the post-write graph (no gate)
 - Settings target reorder / slider commit (no gate)
-- "Even out parallel amps" joint-k rebalance (online-only class, no gate)
+- "Balance its two amps first" joint-k rebalance (online-only class, no gate)
 
 Consult that table rather than trusting CI.
 

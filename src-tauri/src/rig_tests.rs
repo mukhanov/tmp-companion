@@ -266,6 +266,10 @@ fn the_scene_batch_levels_each_scene_and_saves_once_on_a_private_rig() {
 /// 0.45), which reads off target, so the correction capture is cancelled. The cancel path's ONE
 /// save must persist scene 0's solve and scene 1 as the
 /// player left it, not the probe.
+///
+/// A stopped run that saved returns the scenes it leveled, with the save's verdict on them
+/// (the Summary must hear when the save after a Stop did not hold) — never a
+/// bare cancel, whose outcomes the command used to drop.
 #[test]
 fn a_stopped_scene_is_rolled_back_before_the_batch_save() {
     let dev = SimDevice::new().with_saved_preset_json(&rig_preset_json());
@@ -325,7 +329,19 @@ fn a_stopped_scene_is_rolled_back_before_the_batch_save() {
         )
         .map_err(|e| e.to_string())
     });
-    assert!(r.is_err(), "a Stop ends the batch as a cancel: {r:?}");
+    let outcomes = r.expect("a stopped run that saved returns what it leveled");
+    assert_eq!(
+        outcomes.iter().map(|o| o.scene_slot).collect::<Vec<_>>(),
+        [0],
+        "only the scene that finished before the Stop: {outcomes:?}"
+    );
+    // The rig's stored document is static (`with_saved_preset_json`), so the re-read's
+    // verdict says nothing here about the save itself — only that the verify RAN on the
+    // stopped path and its verdict rides the outcome.
+    assert!(
+        outcomes[0].persist_mismatch.is_some(),
+        "the stopped path's save is verified and reported: {outcomes:?}"
+    );
     let twin = dev
         .param_write(1, "G1", AMPS[1], "outputLevel")
         .expect("scene 1's Twin was written");
@@ -343,6 +359,59 @@ fn a_stopped_scene_is_rolled_back_before_the_batch_save() {
         "the stopped batch still persists with ONE save"
     );
     assert_run_ended_clean(&dev);
+}
+
+/// A preset the unit gives no saved document for is THE PRESET not being read, on both lanes
+/// that read it for its footswitches: the footswitch batch's first read and the main sound's
+/// isolation read. Only a cut or missing `ftsw` section is the footswitches.
+#[test]
+fn a_preset_read_that_fails_is_the_preset_not_its_footswitches() {
+    // No saved body: the field-8 read answers nothing ("no preset data for slot").
+    let dev = SimDevice::new();
+    let rig = Rc::new(SimRig::new(dev.clone(), model));
+    let jobs = [FootswitchLevelJob {
+        switch: 2,
+        lev_group_id: "G1".into(),
+        lev_node_id: "ACD_Boost".into(),
+        lev_parameter_id: "gain".into(),
+        target_lufs: -25.0,
+        scene_context: None,
+    }];
+    let stim = stim();
+    let (fs, base) = rig::scoped(rig, || {
+        let fs = run_footswitch_batch(
+            SLOT,
+            &jobs,
+            false,
+            &stim,
+            0.0,
+            &mut |_| {},
+            &|| false,
+            crate::watcher::DetachWatch::start(),
+        );
+        (fs, crate::commands::doctor::read_base_isolation(SLOT))
+    });
+    match fs.expect_err("an unread preset refuses the batch") {
+        crate::error::AppError::Leveling {
+            kind,
+            reamp_still_on,
+            ..
+        } => {
+            assert_eq!(kind, crate::error::SkipKind::PresetUnreadable);
+            assert!(!reamp_still_on, "nothing engaged before the read");
+        }
+        other => panic!("a typed leveling error: {other:?}"),
+    }
+    let base = base.expect_err("an unread preset refuses the main sound");
+    assert_eq!(
+        base.kind,
+        crate::error::SkipKind::PresetUnreadable,
+        "{base}"
+    );
+    assert!(
+        !dev.events().contains(&SimEvent::ReAmp(true)),
+        "a refused read engages nothing"
+    );
 }
 
 /// The footswitch batch reads the saved document, reads the row's ceiling, solves the Boost's
@@ -370,9 +439,11 @@ fn the_footswitch_batch_solves_its_row_on_a_private_rig() {
             0.0,
             &mut |item| progress.push(item),
             &|| false,
+            crate::watcher::DetachWatch::start(),
         )
     })
-    .expect("footswitch batch");
+    .expect("footswitch batch")
+    .rows;
 
     assert_eq!(rows.len(), 1, "{rows:?}");
     let r = &rows[0];
@@ -420,15 +491,16 @@ fn live_chain() -> Vec<String> {
         .collect()
 }
 
-/// BUG→GATE (online e2e `doctor-apply.online.spec.ts`, the post-discard read; HW 2026-10-14,
-/// fw 1.8.58, 3/3 at a 100 ms settle): a Doctor discard read back the block it had just
-/// thrown away. The unit keeps sending a session's queued replies after the host closes it
-/// and hands what is left to the next session inside the 0.75 s drop, ahead of that
-/// session's own; the restore's lean session closed before its handshake copy of the DIRTY
-/// working copy was sent, so the next read got it first and longest-wins kept it. Both
-/// fixes are pinned: every restore and isolated load now ends with a lapse, so the unit
-/// discards that queue (`queued_flood_reports` is empty), and the read takes the latest
-/// copy (`latest_json_payload_reads_past_a_longer_inherited_copy`).
+/// BUG→GATE (online e2e `doctor-apply.online.spec.ts`, since removed with the Doctor write
+/// path; the post-discard read; HW 2026-10-14, fw 1.8.58, 3/3 at a 100 ms settle): a Doctor
+/// discard read back the block it had just thrown away. The unit keeps sending a session's
+/// queued replies after the host closes it and hands what is left to the next session
+/// inside the 0.75 s drop, ahead of that session's own; the restore's lean session closed
+/// before its handshake copy of the DIRTY working copy was sent, so the next read got it
+/// first and longest-wins kept it. Both fixes are pinned: every restore and isolated load
+/// now ends with a lapse, so the unit discards that queue (`queued_flood_reports` is
+/// empty), and the read takes the latest copy
+/// (`latest_json_payload_reads_past_a_longer_inherited_copy`).
 #[test]
 fn a_discarded_edit_never_reads_back_from_the_queued_handshake_copy() {
     let (dev, rig) = rig();

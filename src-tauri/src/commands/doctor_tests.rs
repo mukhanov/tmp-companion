@@ -1,6 +1,7 @@
 //! Unit tests for the Doctor command layer (moved from lib.rs `audition_tests`).
 use super::*;
 use crate::doctor;
+use crate::error::SkipKind;
 
 /// BUG→GATE (the silent-wrong-diagnosis class): a large preset's field-8 read is cut
 /// before its `ftsw` section, so the isolation fallback has no footswitch assignments.
@@ -40,45 +41,6 @@ fn an_unreadable_ftsw_skips_a_footswitch_sound_but_not_a_base_sound() {
             .unresolved
             .is_none()
     );
-}
-
-/// The exact camelCase JSON the Doctor apply frontend sends deserializes into
-/// [`DoctorApplyJob`] — a `param` op and an `insert_node` op (the DoctorOp tag
-/// values + field renames pinned by doctor.rs's `doctor_op_serializes_camel_case`).
-#[test]
-fn doctor_apply_job_round_trips_from_frontend_json() {
-    let json = r#"{
-            "listIndex": 4,
-            "name": "Lead Tone",
-            "ops": [
-                { "kind": "param", "groupId": "G1", "nodeId": "ACD_CabSimTMS",
-                  "param": "lpf", "value": 8000.0 },
-                { "kind": "insert_node", "groupId": "G1", "beforeNodeId": null,
-                  "fenderId": "ACD_TenBandEQStereo", "params": [["gain250hz", -3.0]] }
-            ],
-            "topologyId": "guitar-humbucker",
-            "calibrationLufs": -18.0
-        }"#;
-    let job: DoctorApplyJob = serde_json::from_str(json).expect("DoctorApplyJob deserializes");
-    assert_eq!(job.list_index, ListIndex(4));
-    assert_eq!(job.name, "Lead Tone");
-    assert_eq!(job.topology_id.as_deref(), Some("guitar-humbucker"));
-    assert_eq!(job.calibration_lufs, Some(-18.0));
-    assert_eq!(job.ops.len(), 2);
-    assert!(matches!(job.ops[0], doctor::DoctorOp::Param { .. }));
-    match &job.ops[1] {
-        doctor::DoctorOp::InsertNode {
-            fender_id,
-            before_node_id,
-            params,
-            ..
-        } => {
-            assert_eq!(fender_id, "ACD_TenBandEQStereo");
-            assert!(before_node_id.is_none());
-            assert_eq!(params[0], ("gain250hz".to_string(), -3.0));
-        }
-        other => panic!("expected InsertNode, got {other:?}"),
-    }
 }
 
 /// A DoctorInput node payload WITHOUT `params` (pre-params frontend) and one
@@ -142,42 +104,46 @@ fn doctor_sound_result_cut_through_serializes_camel_case() {
     assert_eq!(v["cutThrough"]["advisory"], false);
 }
 
+/// A failed sound carries its failure's typed kind beside the text, so the screen words it
+/// by kind (a silent capture is refined by the preset's silence hint) and never reads the
+/// text. A measured or unrun sound has neither.
 #[test]
-fn doctor_apply_result_serializes_camel_case() {
-    let r = DoctorApplyResult {
-        before_clip: "data:audio/wav;base64,AAA".into(),
-        after_clip: "data:audio/wav;base64,BBB".into(),
-        levels: Some(AbLevels {
-            before_lufs: -18.0,
-            after_lufs: -19.5,
-        }),
-        finding: Some(FindingCheck {
-            key: "muddy".into(),
-            before: Some(2.5),
-            after: None,
-        }),
-        reamp_warning: None,
-    };
-    let v = serde_json::to_value(&r).unwrap();
-    assert_eq!(v["beforeClip"], "data:audio/wav;base64,AAA");
-    assert_eq!(v["afterClip"], "data:audio/wav;base64,BBB");
-    assert_eq!(v["levels"]["beforeLufs"], -18.0);
-    assert_eq!(v["levels"]["afterLufs"], -19.5);
-    assert_eq!(v["finding"]["key"], "muddy");
-    assert_eq!(v["finding"]["before"], 2.5);
-    assert!(v["finding"]["after"].is_null());
-    assert!(
-        v.get("reampWarning").is_none(),
-        "omitted when the OFF read back: {v}"
+fn a_failed_sound_carries_its_typed_kind_on_the_wire() {
+    let base: DoctorInput =
+        serde_json::from_str(r#"{ "key": "p4", "listIndex": 4, "label": "Base" }"#).unwrap();
+    let failed = sound_result(
+        &base,
+        doctor::StimulusKind::Synthetic,
+        &SoundOutcome::Failed(
+            LevelError::NoSignal.to_string(),
+            LevelError::NoSignal.skip_kind(),
+        ),
     );
-    let warned = DoctorApplyResult {
-        reamp_warning: Some(crate::leveller::REAMP_STILL_ON_WARNING.into()),
-        ..r
-    };
-    assert_eq!(
-        serde_json::to_value(&warned).unwrap()["reampWarning"],
-        crate::leveller::REAMP_STILL_ON_WARNING
-    );
+    let v = serde_json::to_value(&failed).unwrap();
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["errorKind"], "no_signal");
+    assert_eq!(v["error"], "no signal captured");
+    let unrun = sound_result(&base, doctor::StimulusKind::Synthetic, &SoundOutcome::Unrun);
+    let v = serde_json::to_value(&unrun).unwrap();
+    assert_eq!(v["errorKind"], serde_json::Value::Null);
+}
+
+/// A silent capture (a footswitch that routes to OUT2, an amp at zero) reaches Results as
+/// the typed no-signal kind, so the row says why from the preset's silence hint. Before,
+/// the analysis refused it with untyped text and the row could only say "Couldn't check
+/// this sound."
+#[test]
+fn a_silent_capture_is_the_typed_no_signal_kind() {
+    let silent = crate::lufs::measure_mono(&vec![0.0_f32; 48_000 * 2], 48_000).unwrap();
+    assert!(!silent.integrated_lufs.is_finite());
+    let err = audible_or_no_signal(&silent).unwrap_err();
+    assert_eq!(err.skip_kind(), crate::error::SkipKind::NoSignal);
+
+    let tone: Vec<f32> = (0..48_000 * 2)
+        .map(|i| 0.25 * (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin())
+        .collect();
+    let audible = crate::lufs::measure_mono(&tone, 48_000).unwrap();
+    assert!(audible_or_no_signal(&audible).is_ok());
 }
 
 // ── doctor_force_bypass: isolation force-list per sound (base / footswitch) ──
@@ -290,25 +256,61 @@ fn base_isolation_or_refuse_refuses_on_a_truncated_ftsw_read_exactly_like_produc
     // way `an_unreadable_ftsw_skips_a_footswitch_sound_but_not_a_base_sound` stands in a
     // synthetic cache entry for an unreadable body.
     let err = base_isolation_or_refuse(
-        Err(
-            "slot 27: the preset is too large to read over USB — its ftsw section(s) were \
-             cut off the field-8 read, and the preset list did not answer with the slot's \
-             name, so a backup re-read cannot be addressed safely. Refusing rather than \
-             acting on a partial preset"
+        Err(SlotReadError::SectionsCut {
+            sections: vec!["ftsw".into()],
+            message: "slot 27: the preset is too large to read over USB — its ftsw section(s) \
+                      were cut off the field-8 read, and the preset list did not answer with \
+                      the slot's name, so a backup re-read cannot be addressed safely. \
+                      Refusing rather than acting on a partial preset"
                 .to_string(),
-        ),
+        }),
         ListIndex(26),
     )
     .expect_err("an unreadable ftsw must refuse, never guess a force list");
     assert!(
-        err.contains("could not read preset 27's footswitch assignments"),
+        err.reason
+            .contains("could not read preset 27's footswitch assignments"),
         "the wrapped refusal must name the 1-based slot and the footswitch read: {err}"
     );
     assert!(
-        err.contains("leveling without them would save a level solved for the wrong sound"),
+        err.reason
+            .contains("leveling without them would save a level solved for the wrong sound"),
         "the refusal must explain WHY, matching production's long-standing base-arm message: \
          {err}"
     );
+    assert_eq!(
+        err.kind,
+        SkipKind::FootswitchesUnreadable,
+        "a cut `ftsw` is the preset's footswitches not being read"
+    );
+}
+
+/// A base read that failed outright — no preset data, a body that did not parse — is the
+/// PRESET not being read, the kind the scene lane gives the same read, never its footswitches.
+#[test]
+fn base_isolation_or_refuse_names_a_failed_read_as_the_preset_not_its_footswitches() {
+    for message in ["no preset data for slot 27", "preset JSON did not parse"] {
+        let err = base_isolation_or_refuse(
+            Err(SlotReadError::Unreadable(message.to_string())),
+            ListIndex(26),
+        )
+        .expect_err("a failed read must refuse");
+        assert_eq!(err.kind, SkipKind::PresetUnreadable, "{message}: {err}");
+        assert!(
+            err.reason.contains(message),
+            "the cause stays in the text: {err}"
+        );
+    }
+    // A cut that took more than `ftsw` is more than the footswitches.
+    let err = base_isolation_or_refuse(
+        Err(SlotReadError::SectionsCut {
+            sections: vec!["audioGraph".into(), "ftsw".into()],
+            message: "cut".into(),
+        }),
+        ListIndex(26),
+    )
+    .expect_err("a cut read must refuse");
+    assert_eq!(err.kind, SkipKind::PresetUnreadable, "{err}");
 }
 
 // ── derived_force_bypass: OFFLINE isolation, oracle-equivalent to doctor_force_bypass ──
@@ -599,190 +601,6 @@ fn resolve_sound_isolation_carries_param_writes_for_a_param_only_switch() {
     let _ = preset; // fixture kept alive alongside its enumerated infos
 }
 
-// --- bypass_only_conflict: fix P3-2, refuse a scene-context write that would leak to base ---
-
-/// A minimal preset carrying one node (`ampA`/`ACD_TwinReverb`, group G1) with
-/// scene 0's overlay set to `overlay_params` — the ONE fixture shape
-/// `scene_overlay` itself is pinned against, shared from its own test module.
-use crate::scene_jobs::scene_jobs_tests::with_scene0_overlay as preset_with_scene0_overlay;
-use crate::scene_jobs::scene_jobs_tests::{hbe_boost_preset, HBE_NODE, HBE_PARAM};
-
-fn param_op(node_id: &str) -> doctor::DoctorOp {
-    doctor::DoctorOp::Param {
-        group_id: "G1".to_string(),
-        node_id: node_id.to_string(),
-        param: "outputLevel".to_string(),
-        value: 0.6,
-    }
-}
-
-#[test]
-fn bypass_only_conflict_refuses_on_a_bypass_only_overlay() {
-    // scene 0's overlay carries ONLY the bypass family — Scene Edit is OFF, the
-    // node's knobs are shared with base (`SceneWriteVerdict::Refuse`).
-    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
-    let ops = vec![param_op("ampA")];
-    let reason = bypass_only_conflict(&preset, 0, &ops).expect("BypassOnly refuses");
-    assert!(reason.contains("ampA"));
-}
-
-#[test]
-fn bypass_only_conflict_allows_a_full_overlay() {
-    // scene 0's overlay carries a real knob alongside bypass — Scene Edit is ON,
-    // the write lands in the overlay, not base (`SceneWriteVerdict::WriteDirect`).
-    let preset =
-        preset_with_scene0_overlay(serde_json::json!({ "bypass": false, "outputLevel": 0.2 }));
-    let ops = vec![param_op("ampA")];
-    assert_eq!(bypass_only_conflict(&preset, 0, &ops), None);
-}
-
-#[test]
-fn bypass_only_conflict_ignores_insert_node_ops() {
-    // InsertNode is never scene-scoped (block topology is shared across every
-    // scene) — a BypassOnly overlay on an unrelated node must not block it.
-    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
-    let ops = vec![doctor::DoctorOp::InsertNode {
-        group_id: "G1".to_string(),
-        before_node_id: None,
-        fender_id: "ACD_TenBandEQStereo".to_string(),
-        params: Vec::new(),
-    }];
-    assert_eq!(bypass_only_conflict(&preset, 0, &ops), None);
-}
-
-#[test]
-fn bypass_only_conflict_refuses_on_an_absent_overlay_too() {
-    // Fix P3-2 widening: scene 1 of the fixture carries NO overlay for "ampA" at
-    // all (`SceneOverlay::Absent` → `SceneWriteVerdict::NeedsEnable`) — Doctor has
-    // no enable/repair pass, so this now refuses too instead of leaking to base
-    // (previously a prose-only, unenforced limitation).
-    let preset = preset_with_scene0_overlay(serde_json::json!({ "bypass": false }));
-    let ops = vec![param_op("ampA")];
-    let reason = bypass_only_conflict(&preset, 1, &ops).expect("Absent overlay refuses");
-    assert!(reason.contains("ampA"));
-}
-
-#[test]
-fn bypass_only_conflict_refuses_on_an_unknown_overlay() {
-    // No `scenes` array at all (mirrors a truncated field-8 read — 22/25 real
-    // presets read "scenes unknown") — `scene_write_verdict_for_param` can't tell Absent
-    // from a cut, so it refuses rather than risk either write shape.
-    let preset = serde_json::json!({});
-    let ops = vec![param_op("ampA")];
-    let reason = bypass_only_conflict(&preset, 0, &ops).expect("Unknown overlay refuses");
-    assert!(reason.contains("ampA"));
-}
-
-/// BUG→GATE (widened policy's second consumer, "Friedman HBE" preset 28):
-/// `bypass_only_conflict` calls the SAME `scene_write_verdict_for_param` the scene-leveling
-/// lane does, so its own audibility-cleared allow arm (`WriteDirect`) must reach Doctor
-/// too, not just the leveller. `hbe_boost_preset()` (shared from
-/// `scene_jobs_tests`) is the exact anatomy: `boost`/`ACD_Boost` bypassed in base, a
-/// bypass-only un-bypass overlay in ONLY scene 2 "Solo", no footswitch/EXP assign targeting
-/// it, and every other scene either pins its own `gain` (Full) or stays bypassed
-/// (bypass-only) — Solo is the sole scene the shared write is audible in. Doctor's prescribe
-/// for Solo must NOT report a conflict here.
-#[test]
-fn bypass_only_conflict_allows_the_audibility_cleared_shared_write() {
-    let preset = hbe_boost_preset();
-    let ops = vec![doctor::DoctorOp::Param {
-        group_id: "G1".to_string(),
-        node_id: HBE_NODE.to_string(),
-        param: HBE_PARAM.to_string(),
-        value: 4.0,
-    }];
-    assert_eq!(
-        bypass_only_conflict(&preset, 2, &ops),
-        None,
-        "Solo (scene 2): the shared write is audible only here, so Doctor must be allowed \
-         through, not refused as shared_with_base"
-    );
-}
-
-// --- doctor_apply BEFORE-clip cache ---
-//
-// BEFORE_CACHE is a process-global static; cargo runs tests in parallel, so the
-// tests that mutate it must serialize on this lock or they stomp each other's
-// entries (a hard-to-spot cross-contamination — same pattern as
-// `e2e_server_tests::SERIAL`).
-static BEFORE_CACHE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[test]
-fn before_cache_hits_only_the_exact_sound_and_stimulus() {
-    let _guard = crate::lock_ok(&BEFORE_CACHE_SERIAL);
-    clear_doctor_before_cache();
-    let key: BeforeKey = (
-        ListIndex(7),
-        "Lead".into(),
-        "/stim/tele.wav".into(),
-        Some(0xC196_0000),
-        None,
-        None,
-    );
-    before_cache_put(key.clone(), ab_side_of(None, None).with_clip("clip-a"));
-    assert_eq!(cached_clip(&key), Some("clip-a".to_string()));
-    // Any identity change misses: renamed preset, different stimulus, different cal.
-    assert_eq!(
-        cached_clip(&(
-            ListIndex(7),
-            "Lead 2".into(),
-            "/stim/tele.wav".into(),
-            key.3,
-            key.4,
-            key.5
-        )),
-        None
-    );
-    assert_eq!(
-        cached_clip(&(
-            ListIndex(7),
-            "Lead".into(),
-            "/stim/strat.wav".into(),
-            key.3,
-            key.4,
-            key.5
-        )),
-        None
-    );
-    assert_eq!(
-        cached_clip(&(
-            ListIndex(7),
-            "Lead".into(),
-            "/stim/tele.wav".into(),
-            None,
-            key.4,
-            key.5
-        )),
-        None
-    );
-    // ...or a different scene/footswitch of the SAME preset.
-    assert_eq!(
-        cached_clip(&(
-            ListIndex(7),
-            "Lead".into(),
-            "/stim/tele.wav".into(),
-            key.3,
-            Some(1),
-            key.5
-        )),
-        None
-    );
-    assert_eq!(
-        cached_clip(&(
-            ListIndex(7),
-            "Lead".into(),
-            "/stim/tele.wav".into(),
-            key.3,
-            key.4,
-            Some(2)
-        )),
-        None
-    );
-    // A save invalidates (clear_doctor_before_cache is what doctor_save calls).
-    clear_doctor_before_cache();
-    assert_eq!(cached_clip(&key), None);
-}
-
 /// One `hpf` param op — the fixture both `apply_ops_under_scene` tests apply.
 fn hpf_op() -> Vec<doctor::DoctorOp> {
     vec![doctor::DoctorOp::Param {
@@ -959,6 +777,7 @@ fn item(
         scene,
         footswitch,
         label: key.to_string(),
+        sound_name: String::new(),
         tag: None,
         topology_id: None,
         calibration_lufs: None,
@@ -1049,7 +868,10 @@ fn consistency_compares_only_measured_sounds() {
     let outcomes = vec![
         measured(-20.0, -40.0, Vec::new()),
         measured(-12.0, -40.0, Vec::new()),
-        SoundOutcome::Failed("no signal captured".to_string()),
+        SoundOutcome::Failed(
+            "no signal captured".to_string(),
+            crate::error::SkipKind::NoSignal,
+        ),
     ];
     let p = &assemble_results(&items, &outcomes)[0];
     assert_eq!(p.sounds[2].status, SoundStatus::Error);
@@ -1064,6 +886,53 @@ fn consistency_compares_only_measured_sounds() {
         "the failed scene stays out: {rows:?}"
     );
     assert!(rows.iter().any(|r| r.name == "s0"));
+}
+
+/// The steps a volume jump writes name the sound as the screen does ("Lead", "footswitch 3"),
+/// never by its wire label, which also names the preset. The rows and `worst_name` keep the
+/// label, because the frontend finds each sound by it.
+#[test]
+fn consistency_steps_use_the_on_screen_name_and_rows_keep_the_label() {
+    let named = |key: &str, scene, footswitch, label: &str, name: &str| {
+        let (mut input, url, kind) = item(key, scene, footswitch);
+        input.label = label.to_string();
+        input.sound_name = name.to_string();
+        (input, url, kind)
+    };
+    // (louder sound, its label, its on-screen name)
+    let cases = [
+        (Some(1), None, "Tweed Warm · Lead", "Lead"),
+        (Some(0), None, "Tweed Warm · Intro", "Intro"),
+        (None, Some(2), "Tweed Warm · Boost", "footswitch 3"),
+    ];
+    for (scene, footswitch, label, name) in cases {
+        let items = vec![
+            named("base", None, None, "Tweed Warm · Base", "Main sound"),
+            named("other", scene, footswitch, label, name),
+        ];
+        let outcomes = vec![
+            measured(-20.0, -40.0, Vec::new()),
+            measured(-14.0, -40.0, Vec::new()),
+        ];
+        let p = &assemble_results(&items, &outcomes)[0];
+        let sc = p
+            .scene_consistency
+            .as_ref()
+            .expect("a 6 dB jump is flagged");
+        assert_eq!(sc.worst_name, label);
+        assert_eq!(
+            sc.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["Tweed Warm · Base", label]
+        );
+        assert!(!sc.rx.is_empty());
+        for r in &sc.rx {
+            for text in [&r.title, &r.detail] {
+                assert!(!text.contains(" · "), "{text:?}");
+                assert!(!text.contains("Tweed Warm"), "{text:?}");
+            }
+        }
+        assert!(sc.rx[0].title.contains(name), "{:?}", sc.rx[0].title);
+    }
 }
 
 // --- #191: one effective graph per sound ---
@@ -1297,169 +1166,4 @@ fn a_doctor_scene_the_stored_preset_cannot_back_is_refused() {
         doctor_scene_refusal(&two, 2, false).is_none(),
         "a cut list proves nothing about a high index"
     );
-}
-
-// --- the apply A/B's level match and before → after finding check (#256, #257) ---
-
-/// A guitar profile on the shipped target with Low-mids raised `bump` dB.
-fn low_mid_profile(bump: f64) -> doctor::SoundProfile {
-    let mut bdb = doctor::target_curve(doctor::Instrument::Guitar).to_vec();
-    bdb[1] += bump;
-    doctor::SoundProfile {
-        bands: bdb.iter().map(|d| 10f64.powf(d / 10.0)).collect(),
-        integrated_lufs: -20.0,
-        spread_lu: 0.0,
-        momentary_spread_lu: 6.0,
-        tail_ratio_db: -40.0,
-        air_flatness: 0.5,
-        peaks: Vec::new(),
-        stim_bands: None,
-    }
-}
-
-fn ab_side_of(lufs: Option<f64>, profile: Option<doctor::SoundProfile>) -> AbSide {
-    AbSide {
-        clip: String::new(),
-        lufs,
-        measured: profile.map(|p| (p, vec![true; 6])),
-    }
-}
-
-fn apply_job(diag: Option<(&str, &str)>) -> DoctorApplyJob {
-    let mut v = serde_json::json!({
-        "listIndex": 0, "name": "P", "ops": [], "topologyId": null, "calibrationLufs": null,
-    });
-    if let Some((key, level)) = diag {
-        v["diag"] = serde_json::json!({ "key": key, "level": level });
-    }
-    serde_json::from_value(v).expect("apply job")
-}
-
-#[test]
-fn ab_report_carries_both_clip_loudnesses() {
-    let (levels, finding) = ab_report(
-        &apply_job(None),
-        &[],
-        doctor::Instrument::Guitar,
-        doctor::StimulusKind::Synthetic,
-        &ab_side_of(Some(-18.0), None),
-        &ab_side_of(Some(-21.0), None),
-    );
-    let levels = levels.expect("both measured");
-    assert_eq!((levels.before_lufs, levels.after_lufs), (-18.0, -21.0));
-    assert!(finding.is_none(), "no diag on the job → no finding check");
-    // A silent side has no loudness → no level match, never a bogus number.
-    let (levels, _) = ab_report(
-        &apply_job(None),
-        &[],
-        doctor::Instrument::Guitar,
-        doctor::StimulusKind::Synthetic,
-        &ab_side_of(Some(-18.0), None),
-        &ab_side_of(None, None),
-    );
-    assert!(levels.is_none());
-}
-
-#[test]
-fn ab_report_measures_the_treated_finding_before_and_after() {
-    let t = doctor::Instrument::Guitar.thresholds();
-    let gate = t.muddy_db.max(t.muddy_centered_db);
-    let job = apply_job(Some(("muddy", "rehearsal")));
-    // The fix cleared it.
-    let (_, finding) = ab_report(
-        &job,
-        &[],
-        doctor::Instrument::Guitar,
-        doctor::StimulusKind::Synthetic,
-        &ab_side_of(Some(-18.0), Some(low_mid_profile(gate + 3.0))),
-        &ab_side_of(Some(-19.0), Some(low_mid_profile(0.0))),
-    );
-    let finding = finding.expect("both sides profiled");
-    assert_eq!(finding.key, "muddy");
-    assert!(finding.before.expect("fires before") > 2.0);
-    assert_eq!(finding.after, None, "cleared after the fix");
-    // An op that didn't land: the finding reads the same on both clips.
-    let (_, finding) = ab_report(
-        &job,
-        &[],
-        doctor::Instrument::Guitar,
-        doctor::StimulusKind::Synthetic,
-        &ab_side_of(Some(-18.0), Some(low_mid_profile(gate + 3.0))),
-        &ab_side_of(Some(-18.0), Some(low_mid_profile(gate + 3.0))),
-    );
-    let finding = finding.expect("both sides profiled");
-    assert_eq!(finding.before, finding.after);
-    // An unprofiled side (no onset, no tail) → no check rather than a guess.
-    let (_, finding) = ab_report(
-        &job,
-        &[],
-        doctor::Instrument::Guitar,
-        doctor::StimulusKind::Synthetic,
-        &ab_side_of(Some(-18.0), Some(low_mid_profile(gate + 3.0))),
-        &ab_side_of(Some(-18.0), None),
-    );
-    assert!(finding.is_none());
-}
-
-#[test]
-fn ab_side_plays_the_processed_stereo_pair() {
-    // A 4-channel TMP-shaped capture: wide L/R content plus a loud dry channel.
-    let n = 48_000;
-    let mut interleaved = Vec::with_capacity(n * 4);
-    for i in 0..n {
-        let t = i as f32 / 48_000.0;
-        let l = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
-        interleaved.extend_from_slice(&[l, -l, 0.9, 0.0]);
-    }
-    let cap = crate::audio::Capture {
-        interleaved,
-        channels: 4,
-        sample_rate: 48_000,
-    };
-    let stim = DoctorStim::new(vec![0.0; 48_000]);
-    let side = ab_side(&cap, &stim, doctor::Instrument::Guitar, 800).expect("side");
-    let b64 = side
-        .clip
-        .strip_prefix("data:audio/wav;base64,")
-        .expect("data url");
-    let wav = base64_decode_for_test(b64);
-    let reader = hound::WavReader::new(std::io::Cursor::new(wav)).expect("wav");
-    assert_eq!(
-        reader.spec().channels,
-        2,
-        "the audition keeps the stereo pair"
-    );
-    // L and R cancel in the analysis mixdown; the audition must not.
-    let samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
-    assert!(samples.iter().any(|x| x.abs() > 0.2));
-    assert!(side.lufs.is_some());
-}
-
-fn base64_decode_for_test(s: &str) -> Vec<u8> {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::new();
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for c in s.bytes().filter(|&c| c != b'=') {
-        let v = ALPHABET.iter().position(|&a| a == c).expect("base64") as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    out
-}
-
-impl AbSide {
-    fn with_clip(mut self, clip: &str) -> Self {
-        self.clip = clip.to_string();
-        self
-    }
-}
-
-/// The cached BEFORE side's clip for `key`, if any.
-fn cached_clip(key: &BeforeKey) -> Option<String> {
-    before_cache_get(key).map(|side| side.clip)
 }

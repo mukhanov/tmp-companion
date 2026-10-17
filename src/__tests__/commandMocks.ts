@@ -36,6 +36,7 @@ import type {
   ActiveGraph,
   BackupPresetRow,
   BackupReadResult,
+  BatchLevelRun,
   CalibrateResult,
   FootswitchLevelResult,
   LevelResult,
@@ -107,6 +108,7 @@ export const makeLevelResult = (
   clamp_kind: null,
   trade: null,
   base_boost: null,
+  reamp_still_on: false,
   ...over,
 });
 
@@ -130,8 +132,16 @@ export const makeFootswitchLevelResult = (
   method: "baked",
   persist_mismatch: null,
   clamp_kind: null,
+  reamp_still_on: false,
   ...over,
 });
+
+/** A batched leveling command's return: `rows`, with the run-end re-amp OFF read back
+ *  unless `over` says otherwise. */
+export const makeBatchRun = <R>(
+  rows: R[] = [],
+  over: Partial<Omit<BatchLevelRun<R>, "rows">> = {},
+): BatchLevelRun<R> => ({ rows, reampStillOn: false, ...over });
 
 /** An empty signal graph. */
 export const makeActiveGraph = (
@@ -165,6 +175,8 @@ export const makeBackupPresetRow = (
   base_handles: [],
   scene_overrides: [],
   fs_scene_contexts: [],
+  scene_drives: [],
+  rebalanceable: false,
   ...over,
 });
 
@@ -202,7 +214,7 @@ export const makeSetupOption = (
   presetName: "Preset",
   isBase: true,
   sceneSlot: null,
-  sceneName: "Base Preset",
+  sceneName: "Main sound",
   tag: "BASE",
   hasScenes: true,
   ...over,
@@ -320,19 +332,16 @@ export const DEFAULT_HANDLERS: Handlers = {
       saved: job.save,
     }),
   cancel_preset_leveling: none,
-  level_scenes_apply_batched: () => [],
+  level_scenes_apply_batched: () => makeBatchRun(),
   cancel_scene_leveling: none,
   list_scene_level_handles: () => [],
   list_footswitch_scene_contexts: () => [],
-  level_footswitches_apply: () => [],
+  level_footswitches_apply: () => makeBatchRun(),
   cancel_footswitch_leveling: none,
 
   // doctor
   doctor_check: () => ({ presets: [], stopped: false }),
   cancel_doctor_check: none,
-  doctor_apply: () => ({ beforeClip: "", afterClip: "" }),
-  doctor_save: none,
-  doctor_discard: none,
 
   // profiles / store / support
   get_store: () => makeStore(),
@@ -341,6 +350,7 @@ export const DEFAULT_HANDLERS: Handlers = {
   set_playback_level: none,
   set_playback_channels: none,
   set_auto_install_updates: none,
+  set_preset_instrument: none,
   calibrate_profile: () => makeCalibrateResult(),
   list_pickup_topologies: () => [],
   save_support_bundle: () => ({ path: "/tmp/support-bundle.tar" }),
@@ -362,8 +372,18 @@ export const DEFAULT_HANDLERS: Handlers = {
   remove_setlist: () => [],
   remove_setlist_song: () => [],
   move_setlist_song: () => [],
-  create_song_full: () => ({ songs: [], members: null, bpm_warning: null }),
-  update_song_full: () => ({ songs: [], members: null, bpm_warning: null }),
+  create_song_full: () => ({
+    songs: [],
+    members: null,
+    duplicate_name: false,
+    bpm_warning: null,
+  }),
+  update_song_full: () => ({
+    songs: [],
+    members: null,
+    duplicate_name: false,
+    bpm_warning: null,
+  }),
   add_setlist_songs: () => [],
 };
 
